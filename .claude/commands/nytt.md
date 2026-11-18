@@ -10,6 +10,7 @@ New meeting transcript since the last time you looked (empty means nothing new):
 
 The user's request: $ARGUMENTS
 
-Use ONLY the new transcript text above to answer the request. Do not rely on
-earlier transcript text, and do not read transcript files yourself. If the new
-text is empty, reply just "inget nytt". Answer in the user's language and keep it short.
+Answer using the new text above together with transcript excerpts already in
+this conversation. Do not read transcript files yourself (that would resend
+everything). If the new text is empty and there is no request, reply just
+"inget nytt". Answer in the user's language and keep it short.
