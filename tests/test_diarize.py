@@ -161,6 +161,18 @@ def test_stitch_does_not_add_a_dropped_speaker_to_the_count():
     assert chosen[100].tolist() == [True, False]  # the unlinked one has no cluster to appear in
 
 
+def test_speech_probability_decides_speech_and_the_summed_activity_decides_overlap():
+    soft = np.zeros((1, seg.NUM_FRAMES, 3), dtype=np.float32)
+    soft[0, 0:200, 0] = 0.45  # weak speech: P(speech) 0.45
+    speech = np.zeros((1, seg.NUM_FRAMES), dtype=np.float32)
+    speech[0, 0:200] = 0.45
+    stats = dz.StreamStats("mic", 160_000, 148, soft, soft > 0.5, speech=speech)
+    assign = {(0, 0): 0}
+    strict = dz.stitch_stream(stats, assign, 1, dz.DiarizeParams(min_speech=0.5, min_act=0.1))
+    loose = dz.stitch_stream(stats, assign, 1, dz.DiarizeParams(min_speech=0.4, min_act=0.1))
+    assert not strict[100, 0] and loose[100, 0]
+
+
 def test_activity_turns_convert_frames_to_seconds():
     chosen = np.zeros((300, 2), dtype=bool)
     chosen[100:200, 1] = True

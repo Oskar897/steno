@@ -66,23 +66,34 @@ def language_phrase(code: str) -> str:
     return LANGUAGE_NAMES.get(code, code)
 
 
-def build_command(cfg: LlmConfig, system_prompt: str) -> list[str]:
+def build_command(cfg: LlmConfig, prompt_file: Path) -> list[str]:
+    """The ``claude -p`` command line.
+
+    The instructions go in a file (a multi-line argument breaks through ``claude.cmd``
+    shims on Windows). ``--setting-sources ""`` and ``--strict-mcp-config`` keep the user's
+    own CLAUDE.md, hooks and MCP servers out of the call: the run is deterministic, cheap
+    (about 1k instead of 15k tokens of overhead) and nothing but the transcript is sent.
+    """
     exe = shutil.which(cfg.command) or cfg.command
     cmd = [exe, "-p", "--model", cfg.model, "--output-format", "json", "--tools", "",
            "--no-session-persistence", "--disable-slash-commands",
-           "--system-prompt", system_prompt]
+           "--setting-sources", "", "--strict-mcp-config",
+           "--system-prompt-file", str(prompt_file)]
     if cfg.effort:
         cmd += ["--effort", cfg.effort]
     return cmd
 
 
 def run_claude(
-    system_prompt: str, user_text: str, cfg: LlmConfig, runner: Runner = subprocess.run
+    system_prompt: str, user_text: str, cfg: LlmConfig, runner: Runner | None = None
 ) -> str:
     """One ``claude -p`` call: instructions as system prompt, the transcript on stdin."""
-    cmd = build_command(cfg, system_prompt)
+    runner = runner or subprocess.run  # looked up late so tests can forbid the real call
     try:
         with tempfile.TemporaryDirectory(prefix="steno-llm-") as empty:
+            prompt_file = Path(empty) / "system-prompt.md"
+            prompt_file.write_text(system_prompt, encoding="utf-8")
+            cmd = build_command(cfg, prompt_file)
             proc = runner(
                 cmd, input=user_text, capture_output=True, text=True, encoding="utf-8",
                 timeout=cfg.timeout_s, cwd=empty, check=False,
@@ -181,7 +192,7 @@ def parse_clock(value: Any) -> float | None:
 
 
 def summarize(
-    session_dir: Path, cfg: LlmConfig, runner: Runner = subprocess.run
+    session_dir: Path, cfg: LlmConfig, runner: Runner | None = None
 ) -> tuple[Path, str]:
     """Write ``summary.md``; returns its path and the transcript kind that was used."""
     segments, kind = load_transcript(session_dir)
@@ -224,7 +235,7 @@ def filter_todos(
     """
     bodies = [normalise(s.text) for s in segments]
     starts: list[int] = []
-    joined = ""
+    joined = " "
     for body in bodies:
         starts.append(len(joined))
         joined += body + " "
@@ -239,8 +250,9 @@ def filter_todos(
         if not task:
             dropped.append({"reason": "empty task"})
             continue
-        pos = joined.find(quote) if quote else -1
-        if pos < 0:
+        # whole words only: " <quote> " inside the space-delimited transcript
+        pos = joined.find(f" {quote} ") + 1 if quote else 0
+        if pos <= 0:
             dropped.append({"reason": "evidence not in transcript", "task": task})
             continue
         index = max(i for i, st in enumerate(starts) if st <= pos)
@@ -293,7 +305,7 @@ def extract_todos(
     cfg: LlmConfig,
     *,
     person: str | None = None,
-    runner: Runner = subprocess.run,
+    runner: Runner | None = None,
 ) -> tuple[list[TodoItem], int, str]:
     """Run the extraction, validate against the transcript, write ``todo.md``/``todo.json``.
 
@@ -380,7 +392,7 @@ def apply_edits(
 
 
 def llm_fix(
-    segments: list[Segment], cfg: LlmConfig, runner: Runner = subprocess.run
+    segments: list[Segment], cfg: LlmConfig, runner: Runner | None = None
 ) -> tuple[list[Segment], dict[str, Any]]:
     """Ask the model for obvious misrecognition fixes in batches and apply the safe ones.
 

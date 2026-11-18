@@ -257,5 +257,38 @@ def test_format_dataset_table_combines_sets_per_model():
         {"run": "b", "model": "b", "error": "boom"},
     ]
     table = bench.format_dataset_table(rows)
-    assert "| a | 10.0% | 5.0% | 50.0% | 25.0% | 0.300 | 0.400 | 800 | 2.0 |" in table
+    assert "| a | 10.0% | 5.0% | 50.0% | 25.0% | 0.300 | 0.400 | 800 | 2.0 |  |" in table
     assert "FAILED: boom" in table
+
+
+def test_expand_sets_language_override_only_for_whisper():
+    jobs = [{"name": "en", "language": "en", "audio": ["x.wav"], "refs": ["a"]}]
+    whisper = bench.expand_sets(bench.MODELS["kb-whisper-small"], jobs, True, "auto")
+    sherpa = bench.expand_sets(bench.MODELS["parakeet-tdt-0.6b-v3"], jobs, True, "auto")
+    assert whisper[0]["language"] == "auto"
+    assert whisper[0]["expected_language"] == "en"
+    assert sherpa[0]["language"] == "auto"
+
+
+def test_language_match_share():
+    assert bench.language_match(["en", "sv", "en", "en"], "en") == 0.75
+    assert bench.language_match(None, "en") is None
+    assert bench.language_match(["en"], None) is None
+
+
+def test_format_dataset_table_notes_language_detection():
+    rows = [
+        {
+            "run": "a:auto[en]",
+            "model": "a:auto",
+            "set": "en",
+            "wer": 0.2,
+            "cer": 0.1,
+            "rtf": 0.3,
+            "peak_rss_mb": 800.0,
+            "load_s": 2.0,
+            "language_match": 0.9,
+            "error": None,
+        }
+    ]
+    assert "en language detected correctly in 90%" in bench.format_dataset_table(rows)

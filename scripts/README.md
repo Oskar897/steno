@@ -43,6 +43,8 @@ picked with a fixed seed (a smaller `--n` is a prefix of a larger one). The audi
 
 * Whisper models get the dataset's language forced (`sv` / `en`); parakeet and qwen3 detect it.
   The English set shows how much a Swedish fine-tune degrades on English speech.
+  `--language auto` lets Whisper detect the language instead (run label gets `:auto`, the
+  note column shows how often it detected the set's language) to judge code-switch handling.
 * Each utterance is transcribed separately; WER/CER are corpus-level (errors summed over
   utterances / reference length) after `normalize_text`. RTF = summed transcription time
   (incl. VAD) / summed audio duration; model load and a 5 s warm-up are excluded.

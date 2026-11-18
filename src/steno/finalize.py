@@ -563,7 +563,9 @@ def finalize_session(
     for s in out:
         seconds_by_id[s.speaker_id or ""] = seconds_by_id.get(s.speaker_id or "", 0.0) + (
             s.t_end - s.t_start)
-    speakers = [(c.speaker_id, c.name, seconds_by_id.get(c.speaker_id, 0.0)) for c in names]
+    unique = {c.speaker_id: c for c in names}  # clusters sharing one person count once
+    speakers = [(c.speaker_id, c.name, seconds_by_id.get(c.speaker_id, 0.0))
+                for c in unique.values()]
     speakers = [t for t in speakers if t[2] > 0]
     result = FinalizeResult(
         len(out), len(live), redone, len(flagged), sorted(speakers, key=lambda t: -t[2]),

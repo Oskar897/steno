@@ -61,7 +61,8 @@ class DiarizeParams:
     min_on_s: float = 0.1  # shorter speaker turns are dropped ...
     min_off_s: float = 0.15  # ... and shorter gaps inside one speaker's turn are filled
     minor_points: int = 4  # clusters of at most this many local speakers are reassigned
-    count_bias: float = 0.5  # speakers per frame = floor(summed activity + bias); 0.5 = round
+    min_speech: float = 0.4  # aggregated speech probability a frame needs to get a speaker
+    count_bias: float = 0.5  # a 2nd speaker needs summed activity >= 2 - bias (0.5: 1.5)
 
 
 @dataclass
@@ -83,6 +84,7 @@ class StreamStats:
     soft: np.ndarray  # (K, 589, 3) float32, activity probability of each local speaker
     hard: np.ndarray  # (K, 589, 3) bool, speakers of the most likely powerset class
     embs: list[LocalEmb] = field(default_factory=list)
+    speech: np.ndarray | None = None  # (K, 589) float32, P(any speaker); None: derived from soft
 
     @property
     def n_windows(self) -> int:
@@ -162,7 +164,8 @@ def extract_stream(
     seg: SegmentationResult = segmenter.run(
         audio, step, (lambda d, n: progress("segmentation", d, n)) if progress else None
     )
-    stats = StreamStats(stream, len(audio), step, seg.soft(), seg.hard())
+    stats = StreamStats(stream, len(audio), step, seg.soft(), seg.hard(),
+                        speech=seg.speech())
     n_frames = seg.n_frames
     for k in range(stats.n_windows):
         base = k * step
@@ -246,9 +249,18 @@ def stitch_stream(
         np.maximum(per_cluster[k, :, c], stats.soft[k, :, s], out=per_cluster[k, :, c])
     num, den = aggregate_windows(per_cluster, stats.step_frames, n_frames)
     act = num / np.maximum(den, 1e-9)
-    total = stats.soft.sum(axis=-1, keepdims=True)  # all local speakers, linked or not
+    # Speech or not comes from P(any speaker); a second simultaneous speaker from the summed
+    # activity of all local speakers (linked or not), so that a spurious extra speaker does
+    # not turn a clean frame into overlap.
+    total = stats.soft.sum(axis=-1, keepdims=True)
     cnum, cden = aggregate_windows(total, stats.step_frames, n_frames)
-    count = np.floor(cnum / np.maximum(cden, 1e-9) + params.count_bias).astype(int)[:, 0]
+    expected = (cnum / np.maximum(cden, 1e-9))[:, 0]
+    speech = stats.speech if stats.speech is not None else np.minimum(stats.soft.sum(-1), 1.0)
+    snum, sden = aggregate_windows(speech[..., None], stats.step_frames, n_frames)
+    p_speech = (snum / np.maximum(sden, 1e-9))[:, 0]
+    count = (p_speech >= params.min_speech).astype(int) + (
+        (p_speech >= params.min_speech) & (expected >= 2.0 - params.count_bias)
+    ).astype(int)
     rank = np.argsort(np.argsort(-act, axis=1), axis=1)
     chosen = (rank < count[:, None]) & (act >= params.min_act)
     return chosen

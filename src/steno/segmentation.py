@@ -226,6 +226,10 @@ class SegmentationResult:
     def hard(self) -> np.ndarray:
         return powerset_hard(self.probs)
 
+    def speech(self) -> np.ndarray:
+        """``(K, 589)`` probability that at least one speaker is active."""
+        return (1.0 - self.probs[..., 0]).astype(np.float32)
+
 
 class PyannoteSegmenter:
     """onnxruntime session for pyannote segmentation-3.0 (CPU)."""

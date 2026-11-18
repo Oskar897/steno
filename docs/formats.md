@@ -139,7 +139,9 @@ coincides with live lines named by the user (`steno name`) takes that name and k
 Both send transcript *text* (never audio) to the Claude Code CLI (`claude -p`, the user's
 own login, no API key) and are described by prompts in `src/steno/prompts/`.
 
-`summary.md`: Markdown with an overview, decisions and open questions, in `[llm] language`.
+`summary.md`: Markdown with an overview, decisions and open questions, headings and text in
+`[llm] language` (Swedish: Översikt, Beslut, Öppna frågor). Personal follow-up tasks belong in
+the to-do list, not under decisions.
 
 `todo.json` (and the same content as `todo.md`, grouped by owner): a JSON array of
 
@@ -151,8 +153,9 @@ own login, no API key) and are described by prompts in `src/steno/prompts/`.
 `owner` is a speaker name or `"TBD"`, `due` a string or `null`, `t` seconds since session start
 (taken from the line that contains the quote). Only explicit commitments are listed, extracted
 from the transcript and never from the summary; an item whose `evidence_quote` does not
-occur verbatim in the transcript (compared case-, punctuation- and whitespace-insensitively)
-is discarded. `steno todo --person NAME` writes only that person's items.
+occur verbatim in the transcript (whole words, compared case-, punctuation- and
+whitespace-insensitively) is discarded. `steno todo --person NAME` writes only that person's items (and so replaces a full list; run
+it without `--person` to get everyone's again).
 
 ## Speaker label layer
 

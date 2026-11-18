@@ -171,7 +171,7 @@ def parse_fleurs_tsv(text: str) -> list[dict]:
     num_samples, gender. Returns id/file/text/seconds (16 kHz samples -> seconds)."""
     rows = []
     for line in text.splitlines():
-        cols = line.split("	")
+        cols = line.split("\t")
         if len(cols) < 6 or not cols[5].isdigit():
             continue
         rows.append(
@@ -423,6 +423,8 @@ def _worker_whisper(
                 "set": st["name"],
                 "language": st["language"],
                 "detected_language": dominant(langs) if st["language"] == "auto" else None,
+                "detected_languages": langs if st["language"] == "auto" else None,
+                "expected_language": st.get("expected_language"),
                 "audio_s": sum(len(a) for a in audios) / SAMPLE_RATE,
                 "transcribe_s": elapsed,
                 "peak_rss_mb": rss.peak_mb(),
@@ -498,6 +500,8 @@ def _worker_sherpa(
                 "set": st["name"],
                 "language": "auto",
                 "detected_language": None,
+                "detected_languages": None,
+                "expected_language": st.get("expected_language"),
                 "audio_s": sum(len(a) for a in audios) / SAMPLE_RATE,
                 "transcribe_s": elapsed,
                 "peak_rss_mb": rss.peak_mb(),
@@ -613,6 +617,13 @@ def run_model_subprocess(
     return json.loads(result_file.read_text(encoding="utf-8"))
 
 
+def language_match(detected: list[str | None] | None, expected: str | None) -> float | None:
+    """Share of utterances whose detected language equals the expected one (auto runs only)."""
+    if not detected or not expected:
+        return None
+    return sum(1 for d in detected if d == expected) / len(detected)
+
+
 def build_rows(
     raw: dict, label: str, beam: int | None, references: dict[str, list[str]] | None
 ) -> tuple[list[dict], dict]:
@@ -633,6 +644,9 @@ def build_rows(
             "beam": beam,
             "language": run["language"],
             "detected_language": run["detected_language"],
+            "language_match": language_match(
+                run.get("detected_languages"), run.get("expected_language")
+            ),
             "n_utterances": len(hypotheses),
             "audio_s": run["audio_s"],
             "download_s": raw["download_s"],
@@ -656,15 +670,16 @@ def format_dataset_table(rows: list[dict]) -> str:
     """One line per model/beam: error rates per dataset set (sv, en), RTF, RSS, load time."""
     labels = list(dict.fromkeys(r["model"] for r in rows))
     header = (
-        "| model | sv WER | sv CER | en WER | en CER | RTF sv | RTF en | peak RSS MB | load s |\n"
-        "|---|---|---|---|---|---|---|---|---|\n"
+        "| model | sv WER | sv CER | en WER | en CER | RTF sv | RTF en | peak RSS MB "
+        "| load s | note |\n"
+        "|---|---|---|---|---|---|---|---|---|---|\n"
     )
     lines = []
     for label in labels:
         mine = [r for r in rows if r["model"] == label]
         if any(r.get("error") for r in mine):
             err = next(r["error"] for r in mine if r.get("error"))
-            lines.append(f"| {label} | FAILED: {err} | | | | | | | |")
+            lines.append(f"| {label} | FAILED: {err} | | | | | | | | |")
             continue
         by_set = {r["set"]: r for r in mine}
 
@@ -678,9 +693,15 @@ def format_dataset_table(rows: list[dict]) -> str:
 
         rss = max(r["peak_rss_mb"] for r in mine)
         load = mine[0]["load_s"]
+        notes = [
+            f"{r['set']} language detected correctly in {r['language_match'] * 100:.0f}%"
+            for r in mine
+            if r.get("language_match") is not None
+        ]
         lines.append(
             f"| {label} | {pct('sv', 'wer')} | {pct('sv', 'cer')} | {pct('en', 'wer')} "
-            f"| {pct('en', 'cer')} | {rtf('sv')} | {rtf('en')} | {rss:.0f} | {load:.1f} |"
+            f"| {pct('en', 'cer')} | {rtf('sv')} | {rtf('en')} | {rss:.0f} | {load:.1f} "
+            f"| {'; '.join(notes)} |"
         )
     return header + "\n".join(lines)
 
@@ -719,13 +740,20 @@ def synthetic_audio(path: Path, seconds: float = 5.0) -> None:
     sf.write(str(path), sig.astype("float32"), SAMPLE_RATE)
 
 
-def expand_sets(spec: ModelSpec, jobs: list[dict], dataset_mode: bool) -> list[dict]:
+def expand_sets(
+    spec: ModelSpec, jobs: list[dict], dataset_mode: bool, language: str | None = None
+) -> list[dict]:
     """Worker input for one model. Dataset sets carry their own language (whisper only; other
-    engines detect it). Single-file jobs are repeated per language the model should be tried
-    with (e.g. sv and auto)."""
+    engines detect it); `language` overrides it, "auto" = let Whisper detect. Single-file jobs
+    are repeated per language the model should be tried with (e.g. sv and auto)."""
     if dataset_mode:
         return [
-            {**j, "language": j["language"] if spec.kind == "whisper" else "auto"} for j in jobs
+            {
+                **j,
+                "expected_language": j["language"],
+                "language": (language or j["language"]) if spec.kind == "whisper" else "auto",
+            }
+            for j in jobs
         ]
     return [{**job, "name": lang, "language": lang} for job in jobs for lang in spec.languages]
 
@@ -736,6 +764,7 @@ def benchmark(
     threads: int,
     out_dir: Path,
     dataset_mode: bool = False,
+    language: str | None = None,
 ) -> int:
     """Run each (model, beam) over all `jobs`; write results.json after every model.
 
@@ -766,8 +795,10 @@ def benchmark(
     with tempfile.TemporaryDirectory(prefix="steno-bench-") as tmp:
         for key, beam in models:
             label = run_label(key, beam)
+            if language and MODELS[key].kind == "whisper":
+                label += f":{language}"
             print(f"\n=== {label} ===", flush=True)
-            sets = expand_sets(MODELS[key], jobs, dataset_mode)
+            sets = expand_sets(MODELS[key], jobs, dataset_mode, language)
             refs = {s["name"]: s["refs"] for s in sets if s.get("refs") is not None}
             raw = run_model_subprocess(key, beam or BEAM_SIZE, sets, threads, Path(tmp), label)
             new_rows, hyps = build_rows(raw, label, beam, refs or None)
@@ -807,6 +838,11 @@ def main(argv: list[str] | None = None) -> int:
         "--models",
         default=",".join(MODELS),
         help=f"comma-separated subset of: {', '.join(MODELS)}; append @N for beam size N",
+    )
+    p.add_argument(
+        "--language",
+        help="dataset mode: force this language for every Whisper set ('auto' = detect), "
+        "default is each set's own language",
     )
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--out", type=Path, help="output dir (default: <data_dir>/benchmarks/<ts>)")
@@ -857,7 +893,9 @@ def main(argv: list[str] | None = None) -> int:
                     "refs": [i["text"] for i in items],
                 }
             )
-        return benchmark(jobs, models, args.threads, out_dir, dataset_mode=True)
+        return benchmark(
+            jobs, models, args.threads, out_dir, dataset_mode=True, language=args.language
+        )
 
     if not args.audio:
         p.error("--audio or --dataset is required (or use --self-test)")

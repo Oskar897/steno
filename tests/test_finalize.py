@@ -315,6 +315,7 @@ def test_finalize_session_end_to_end(tmp_path):
     assert ghost.speaker == "Me" and ghost.speaker_id == "U"
     assert [stage for stage, *_ in progress if stage.startswith("embedding")]
     assert {name for _, name, _ in res.speakers} >= {"Alice", "Speaker 2"}
+    assert len({sid for sid, _, _ in res.speakers}) == len(res.speakers)  # one row per person
 
 
 def test_finalize_full_asr_redoes_every_line_with_audio(tmp_path):

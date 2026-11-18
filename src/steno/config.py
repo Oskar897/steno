@@ -116,7 +116,7 @@ class PostConfig:
     """`steno finalize`: the offline pass over the kept audio after a meeting."""
 
     auto: bool = False  # run finalize automatically when `steno record` stops
-    asr_model: str = "KBLab/kb-whisper-small"  # re-transcription model (live default for now)
+    asr_model: str = "KBLab/kb-whisper-medium"  # re-transcription (FLEURS sv WER 6.2 vs 8.9)
     asr_beam_size: int = 5
     asr_min_logprob: float = -0.7  # live lines below this average log-probability are redone
     asr_max_compression: float = 2.4  # ... and lines whose text compresses better than 1/this
@@ -133,7 +133,7 @@ class LlmConfig:
 
     command: str = "claude"  # the Claude Code executable
     model: str = "haiku"  # alias or full model name
-    effort: str = "low"  # low, medium, high, xhigh, max; "" = CLI default
+    effort: str = "medium"  # low, medium, high, xhigh, max; "" = CLI default
     language: str = "sv"  # output language; "auto" = the language of the meeting
     timeout_s: int = 300
     fix_max_edit: float = 0.3  # `finalize --llm-fix`: largest accepted edit (share of the line)

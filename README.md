@@ -62,7 +62,7 @@ are uncalibrated defaults; tune them on your own microphone and rooms.
 ```powershell
 uv run steno record --keep-audio            # keep the audio, it is what finalize works on
 uv run steno finalize                       # better speakers + repaired text -> final.jsonl / final.md
-uv run steno finalize --speakers 3          # ... with a known number of speakers
+uv run steno finalize --speakers 3          # ... with a known number of speakers (see below)
 uv run steno show --final                   # print it (`steno show` prints the live transcript)
 uv run steno summary                        # overview, decisions, open questions -> summary.md
 uv run steno todo --person Alice            # explicit commitments only -> todo.md / todo.json
@@ -74,14 +74,22 @@ can get two speakers), transcribes low-confidence live lines again (`--full-asr`
 `[post] asr_model` picks the model), and assigns each word to the speaker turn it overlaps
 most. Names given with `steno name` are locked and carried over. The live transcript is never
 changed; `[post] auto = true` runs finalize when `steno record` stops (Ctrl+C skips it).
-Needs `uv sync --extra asr --extra speakers --extra audio`; the 6 MB segmentation model is
-downloaded on first use. On the 3 x 10 min AMI far-field test it halves the live DER, see
+The speaker count is estimated; a quiet participant who only says a few short words can be
+missed (finalize then prints a hint): pass `--speakers N` when you know how many people took
+part. Needs `uv sync --extra asr --extra speakers --extra audio`; the 6 MB segmentation model is
+downloaded on first use. On the 3 x 10 min AMI far-field test (one distant mic, 0.25 s collar,
+overlap counted) the diarization error rate falls from 31 % (live) to 18 % (finalize), 13 %
+when overlapping speech is not scored; the diarization part takes about 0.4-0.9 min per
+10 min of audio on a laptop CPU (`[post] seg_step_s = 1.25` is a little more accurate and twice
+as slow), re-transcribing every line with `--full-asr` several minutes more. See
 [scripts/eval_diarization.py](scripts/eval_diarization.py) (`--system steno-finalize`).
 
 `summary`, `todo` and `finalize --llm-fix` call the Claude Code CLI (`claude -p`, your own
 login, no API key in Steno): only the transcript *text* goes to Claude, on stdin, with all
 tools disabled; audio and voiceprints never leave the machine. `[llm]` sets the model
-(default the Haiku alias), effort and output language (default Swedish). To-do items must
+(default the Haiku alias), effort (default medium) and output language (default Swedish).
+The CLI runs in an empty temporary directory with `--setting-sources ""`, so your own
+CLAUDE.md, hooks and MCP servers are not part of the call. To-do items must
 carry a quote that occurs word for word in the transcript, otherwise they are dropped.
 `--llm-fix` is off by default: Claude proposes small `{old, new}` corrections that are
 applied only when `old` is in the line and the edit is small. In Claude Code the slash

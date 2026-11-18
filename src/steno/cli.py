@@ -399,6 +399,10 @@ def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fi
           f"{res.seconds:.0f} s for {res.audio_s / 60:.1f} min of audio.")
     for sid, name, secs in res.speakers:
         print(f"  {name:<20} {sid:<12} {secs:6.0f} s")
+    if len(res.speakers) == 1 and speakers is None:
+        print("  Only one speaker found. A quiet participant with short interjections can be "
+              "missed; if you know how many people took part, run `steno finalize --speakers N`.",
+              file=sys.stderr)
     if res.llm_fix is not None:
         fix = res.llm_fix
         print(f"  llm-fix: {fix.get('applied', 0)} of {fix.get('proposed', 0)} edit(s) applied, "

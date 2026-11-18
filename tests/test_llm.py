@@ -32,9 +32,13 @@ class Recorder:
         self.reply, self.returncode, self.stderr = reply, returncode, stderr
         self.as_json, self.raises = as_json, raises
         self.calls: list[tuple[list[str], dict]] = []
+        self.system_prompts: list[str] = []
 
     def __call__(self, cmd, **kw):
         self.calls.append((cmd, kw))
+        if "--system-prompt-file" in cmd:  # the temp dir is gone after the call: read it now
+            path = Path(cmd[cmd.index("--system-prompt-file") + 1])
+            self.system_prompts.append(path.read_text(encoding="utf-8"))
         if self.raises:
             raise self.raises
         out = json.dumps({"type": "result", "is_error": False, "result": self.reply})
@@ -56,8 +60,11 @@ def test_transcript_goes_on_stdin_and_never_into_argv():
     assert cmd[1:3] == ["-p", "--model"] and cmd[3] == "haiku"
     assert ["--tools", ""] == cmd[cmd.index("--tools") : cmd.index("--tools") + 2]  # no tools
     assert "--no-session-persistence" in cmd
-    assert cmd[cmd.index("--system-prompt") + 1] == "SYSTEM PROMPT"
-    assert cmd[cmd.index("--effort") + 1] == "low"
+    assert rec.system_prompts == ["SYSTEM PROMPT"]
+    # the user's own CLAUDE.md, hooks and MCP servers stay out of the call
+    assert ["--setting-sources", ""] == cmd[cmd.index("--setting-sources") :][:2]
+    assert "--strict-mcp-config" in cmd
+    assert cmd[cmd.index("--effort") + 1] == "medium"
     assert kw["timeout"] == CFG.timeout_s
     assert Path(kw["cwd"]).name.startswith("steno-llm-")  # an empty temp dir, not the project
 
@@ -170,6 +177,14 @@ def test_quote_may_span_two_lines_and_a_missing_owner_becomes_tbd():
     )
     assert len(kept) == 1 and kept[0].owner == "TBD" and kept[0].due is None
     assert kept[0].t == 10.0 and dropped == []
+
+
+def test_evidence_must_match_whole_words():
+    # "skickar rapp" is inside "skickar rapporten" but is not a quote of it
+    kept, dropped = llm.filter_todos([item(evidence_quote="skickar rapp")], SEGMENTS)
+    assert kept == [] and dropped[0]["reason"] == "evidence not in transcript"
+    kept, _ = llm.filter_todos([item(evidence_quote="rapporten till er")], SEGMENTS)
+    assert len(kept) == 1
 
 
 def test_confidence_is_clamped_and_defaults_when_garbage():
