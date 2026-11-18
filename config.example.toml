@@ -16,6 +16,10 @@ compute_type = "int8"
 language = "sv"                    # "sv", "en" or "auto"
 cpu_threads = 6
 beam_size = 1
+# Whisper initial_prompt, passed to every faster-whisper call (live and finalize); "" = none.
+# A natural Swedish meeting text that spells English terms in English nudges the model to
+# keep them that way. Keep it generic. For English-only meetings set it to "".
+initial_prompt = "Hej allihopa, välkomna till veckomötet. Vi började med vår thesis och sen fixade vi några bugs i pipelinen. Jag testade scriptet på servern och committade ändringen på GitHub. Efter lunch har vi en workshop, så ta med laptopen och en bra paper."
 
 [vad]
 threshold = 0.4              # lower = more speech kept (0.5 before the far-field tests)
@@ -83,11 +87,23 @@ enroll_outlier_sigma = 2.0
 
 [post]
 # `steno finalize`: offline pass over the kept audio (record with --keep-audio) that
-# re-diarizes with pyannote segmentation-3.0 + CAM++ + Steno's clustering, re-transcribes
-# low-confidence lines and writes final.jsonl / final.md next to the live transcript.
+# re-diarizes with pyannote segmentation-3.0 + CAM++ + Steno's clustering, transcribes again
+# and writes final.jsonl / final.md next to the live transcript.
 auto = false                 # true: run it when `steno record` stops (Ctrl+C skips it)
-asr_model = "KBLab/kb-whisper-medium"  # re-transcription model; ~30% fewer Swedish word errors than small, ~RTF 1
-asr_beam_size = 5
+# Re-transcription:
+#   "longform"  each kept stream once as a whole with asr_model (own Silero VAD, batched 30 s
+#               windows, [asr] language and initial_prompt); the words replace the live text
+#               and go to the final speaker turns. Mic words that are only the remote side
+#               leaking into the mic stay dropped (the live echo decisions are respected).
+#   "selective" only live lines with low confidence, one clip at a time (--full-asr: all).
+#               Per-clip decoding pads every clip to 30 s, so use a smaller asr_model here,
+#               e.g. "KBLab/kb-whisper-medium".
+#   "off"       keep the live words.
+asr_mode = "longform"
+asr_model = "deepdml/faster-whisper-large-v3-turbo-ct2"  # ~1.6 GB; on a 166 s Swedish+English test: WER 19 % vs 22 % (kb-whisper-small), English terms 77 % vs 49 %
+asr_beam_size = 5            # selective mode
+longform_beam_size = 1
+longform_batch_size = 4      # 30 s windows decoded together
 asr_min_logprob = -0.7       # live lines below this average log-probability are redone
 asr_max_compression = 2.4    # ... and so are repetitive lines (hallucination loops)
 threads = 4

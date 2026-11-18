@@ -1,0 +1,27 @@
+# Code-switching eval prompts (Swedish with English terms, as spoken at a university).
+# One sentence per line; lines starting with # are ignored. Read with scripts/record_eval.py.
+Vi måste pusha den här branchen innan deadline på fredag.
+Har du kollat på pull requesten som jag skickade i går?
+Jag tror att vår approach är för komplex, vi borde köra en enklare baseline först.
+Kan du dela din screen så att vi ser dashboarden?
+Det är ett känt issue i frameworket, så vi får göra en workaround.
+Vår supervisor sa att literature reviewn behöver fler peer reviewed sources.
+Jag fixar unit testerna i kväll och sen kan vi merga till main.
+Modellen overfittar, så vi borde testa dropout och early stopping.
+Sprint planningen flyttas till torsdag efter lunch.
+Vi kör ett standup varje morgon klockan nio på Teams.
+Datasetet är för litet, kan vi använda data augmentation?
+Jag har bokat ett grupprum på biblioteket mellan tre och fem.
+Presentationen ska vara max tio minuter plus Q and A.
+Kolla om API:et returnerar rätt status code när token är expired.
+Vi behöver en tydligare research question innan vi skriver methodology delen.
+Frontenden är klar men backenden kraschar när databasen är tom.
+Ska vi ta en kort break och sen fortsätta med retrospektiven?
+Hennes feedback var att vårt abstract är för långt och lite vagt.
+Deploya inte till production innan vi har kört alla integration tests.
+Jag la upp slidesen på Canvas, ni kan kommentera direkt i dokumentet.
+Let's go through the action items before we wrap up the meeting.
+I think the main bottleneck is the latency of the speech recognition model.
+Could you send me the link to the repository after the meeting?
+Okej, så sammanfattningsvis: Elsa skriver introduktionen och Viktor gör analysen.
+Mötet är slut, tack så mycket allihopa och trevlig helg.

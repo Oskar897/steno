@@ -9,7 +9,7 @@ import time
 from dataclasses import replace
 
 from steno import labels, transcript
-from steno.config import Config, ConfigError, load_config
+from steno.config import ASR_MODES, Config, ConfigError, load_config
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -66,9 +66,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="'latest' (default) or a session id (needs --keep-audio)")
     p.add_argument("--speakers", type=int, metavar="N",
                    help="force exactly N speakers instead of estimating the count")
+    p.add_argument("--asr-mode", choices=ASR_MODES,
+                   help="re-transcription (overrides [post] asr_mode): longform = each kept "
+                        "stream once as a whole with [post] asr_model (default); selective = "
+                        "only low-confidence live lines, one by one; off = keep the live words")
     p.add_argument("--full-asr", action="store_true",
-                   help="transcribe every line again with [post] asr_model, not only the "
-                        "low-confidence ones")
+                   help="with --asr-mode selective: transcribe every live line again, not only "
+                        "the low-confidence ones (longform transcribes everything anyway)")
     p.add_argument("--llm-fix", action="store_true",
                    help="let Claude propose small corrections of obvious misrecognitions "
                         "(sends the transcript text to the Claude CLI)")
@@ -393,7 +397,8 @@ def _progress_printer():
     return show
 
 
-def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fix=False) -> int:
+def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fix=False,
+              asr_mode=None) -> int:
     from steno import finalize, llm
     from steno.segmentation import SegmentationError
     from steno.speakers import SpeakerError
@@ -402,13 +407,25 @@ def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fi
     try:
         res = finalize.finalize_session(
             session_dir, cfg, _store(), num_speakers=speakers, full_asr=full_asr,
-            post_edit=post_edit, progress=_progress_printer())
+            asr_mode=asr_mode, post_edit=post_edit, progress=_progress_printer())
     except (finalize.FinalizeError, SpeakerError, SegmentationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if res.asr_mode == "longform" and res.longform is not None:
+        lf = res.longform
+        asr = f"longform ASR: {lf.words} words in {lf.seconds:.0f} s"
+        if lf.echo_dropped:
+            asr += f", {lf.echo_dropped} mic word(s) dropped as echo"
+    elif res.asr_mode == "selective":
+        asr = f"{res.redone}/{res.flagged} line(s) transcribed again"
+    else:
+        asr = "live words kept"
     print(f"Finalized {session_dir.name}: {res.segments} lines (live: {res.live_segments}), "
-          f"{len(res.speakers)} speaker(s); {res.redone}/{res.flagged} line(s) transcribed again; "
+          f"{len(res.speakers)} speaker(s); {asr}; "
           f"{res.seconds:.0f} s for {res.audio_s / 60:.1f} min of audio.")
+    if res.longform is not None and res.longform.fallback:
+        print("  kept the live text of: " + ", ".join(res.longform.fallback)
+              + " (long-form ASR failed or found no speech; see the log)", file=sys.stderr)
     for sid, name, secs in res.speakers:
         print(f"  {name:<20} {sid:<12} {secs:6.0f} s")
     if len(res.speakers) == 1 and speakers is None:
@@ -429,7 +446,7 @@ def cmd_finalize(args: argparse.Namespace, cfg: Config) -> int:
         return 1
     try:
         return _finalize(session_dir, cfg, speakers=args.speakers, full_asr=args.full_asr,
-                         llm_fix=args.llm_fix)
+                         llm_fix=args.llm_fix, asr_mode=args.asr_mode)
     except KeyboardInterrupt:
         print("\nInterrupted; nothing was written.", file=sys.stderr)
         return 130

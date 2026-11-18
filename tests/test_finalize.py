@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime
 
 import numpy as np
@@ -19,6 +20,8 @@ from .synth import FakeEmbedder, silence, timeline
 from .test_diarize import TRUTH, FakeSegmenter
 
 A, B = 220.0, 330.0
+# The classic per-line repair: these tests predate (and still cover) ``asr_mode = "selective"``.
+SEL = replace(Config(), post=replace(Config().post, asr_mode="selective"))
 
 
 def words(*items):
@@ -289,7 +292,7 @@ def test_finalize_session_end_to_end(tmp_path):
     before = (session / "transcript.jsonl").read_bytes()
     fake = FakeTranscriber()
     progress = []
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=deps(fake),
+    res = fz.finalize_session(session, SEL, ProfileStore(), deps=deps(fake),
                               progress=lambda *a: progress.append(a))
     assert (session / "transcript.jsonl").read_bytes() == before  # live JSONL never touched
     final = fz.read_final(session)
@@ -321,7 +324,7 @@ def test_finalize_session_end_to_end(tmp_path):
 def test_finalize_full_asr_redoes_every_line_with_audio(tmp_path):
     session = make_session(tmp_path)
     fake = FakeTranscriber()
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=deps(fake), full_asr=True)
+    res = fz.finalize_session(session, SEL, ProfileStore(), deps=deps(fake), full_asr=True)
     assert res.flagged == 4 and len(fake.calls) == 4  # every live line has audio
     assert all(c >= fz.MIN_REASR_S for c in fake.calls)
 
@@ -330,7 +333,7 @@ def test_finalize_without_kept_audio_fails_cleanly(tmp_path):
     session = make_session(tmp_path)
     (session / "audio-mic.flac").unlink()
     with pytest.raises(fz.FinalizeError, match="keep-audio"):
-        fz.finalize_session(session, Config(), ProfileStore(), deps=deps())
+        fz.finalize_session(session, SEL, ProfileStore(), deps=deps())
     assert not fz.has_final(session)
 
 
@@ -341,7 +344,7 @@ def test_finalize_post_edit_hook_runs_on_the_final_lines(tmp_path):
         out = [Segment(**{**s.__dict__, "text": s.text.replace("alfa", "ALFA")}) for s in segments]
         return out, {"applied": 1, "proposed": 1, "rejected": []}
 
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=deps(), post_edit=edit)
+    res = fz.finalize_session(session, SEL, ProfileStore(), deps=deps(), post_edit=edit)
     assert res.llm_fix == {"applied": 1, "proposed": 1, "rejected": []}
     assert any("ALFA" in s.text for s in fz.read_final(session))
     assert "alfa" in (session / "transcript.jsonl").read_text(encoding="utf-8")  # live untouched
@@ -350,12 +353,12 @@ def test_finalize_post_edit_hook_runs_on_the_final_lines(tmp_path):
 def test_finalize_rejects_a_bad_speaker_count(tmp_path):
     session = make_session(tmp_path)
     with pytest.raises(fz.FinalizeError):
-        fz.finalize_session(session, Config(), ProfileStore(), deps=deps(), num_speakers=0)
+        fz.finalize_session(session, SEL, ProfileStore(), deps=deps(), num_speakers=0)
 
 
 def test_read_final_roundtrips_words_and_flags(tmp_path):
     session = make_session(tmp_path)
-    fz.finalize_session(session, Config(), ProfileStore(), deps=deps(FakeTranscriber()))
+    fz.finalize_session(session, SEL, ProfileStore(), deps=deps(FakeTranscriber()))
     final = fz.read_final(session)
     with_words = [s for s in final if s.words]
     assert with_words and all(len(w) == 3 for s in with_words for w in s.words)
@@ -363,8 +366,6 @@ def test_read_final_roundtrips_words_and_flags(tmp_path):
 
 
 def test_diarize_params_follow_the_post_config_and_zero_disables_the_split_test():
-    from dataclasses import replace
-
     cfg = Config()
     p = fz.diarize_params(cfg)
     assert p.split_cos == cfg.post.split_cos and p.split_min_s == cfg.post.split_min_s

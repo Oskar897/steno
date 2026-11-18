@@ -9,11 +9,19 @@ Usage:
     uv run python scripts/benchmark_asr.py --dataset fleurs --n 60 --n-en 30
     uv run python scripts/benchmark_asr.py --models kb-whisper-small,kb-whisper-small@5 ...
     uv run python scripts/benchmark_asr.py --self-test
+    uv run python scripts/benchmark_asr.py --dataset local:codeswitch --llm-fix \
+        --models kb-whisper-small,kb-whisper-small+prompt,whisper-large-v3-turbo:auto
+
+Model spec grammar: `key[@beam][:language][+prompt][+hot]`, e.g. `whisper-large-v3-turbo:sv+prompt`
+(`:language` = sv | en | auto, `+prompt` = Whisper `initial_prompt`, `+hot` = faster-whisper
+`hotwords`; Whisper models only).
 
 Settings that affect the numbers (also stored in results.json):
     * Whisper models: beam_size=1 unless `model@N` is given (greedy, for speed),
       vad_filter=True, condition_on_previous_text=False, int8 compute type.
     * RTF = transcription wall time / audio duration (load and download excluded).
+    * `--dataset local:<name>` scores your own recordings (<data_dir>/eval/<name>/refs.tsv +
+      NN.wav) and adds an "English-term accuracy" column (see `score_english_terms`).
     * kb-whisper CTranslate2 weights live in `model.bin` on the `main` branch.
       The `standard`/`subtitle`/`strict` tags only contain safetensors (no CT2).
 """
@@ -39,6 +47,8 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from steno.config import DEFAULT_INITIAL_PROMPT
 
 SAMPLE_RATE = 16_000
 BEAM_SIZE = 1
@@ -147,6 +157,237 @@ def parse_model_arg(text: str) -> tuple[str, int | None]:
 
 def run_label(key: str, beam: int | None) -> str:
     return key if beam is None else f"{key}@{beam}"
+
+
+# Generic, deliberately NOT taken from scripts/codeswitch_sentences.txt (no leakage into the eval):
+# the same prompt Steno uses by default (steno.config.DEFAULT_INITIAL_PROMPT), so the benchmark
+# measures what the product does.
+INITIAL_PROMPT = DEFAULT_INITIAL_PROMPT
+# faster-whisper `hotwords`: prepended to the decoder context as a bare word list.
+HOTWORDS = "thesis pipeline GitHub Docker Python bug commit workshop laptop server paper"
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    """One strategy to benchmark: model + decoding options."""
+
+    key: str
+    beam: int | None = None
+    language: str | None = None  # "sv" | "en" | "auto"...; None = the dataset's own language
+    prompt: bool = False  # Whisper initial_prompt
+    hotwords: bool = False  # faster-whisper hotwords
+
+    @property
+    def label(self) -> str:
+        label = run_label(self.key, self.beam)
+        if self.language:
+            label += f":{self.language}"
+        if self.prompt:
+            label += "+prompt"
+        if self.hotwords:
+            label += "+hot"
+        return label
+
+
+def parse_run_spec(text: str) -> RunSpec:
+    """'whisper-large-v3-turbo@5:sv+prompt' -> RunSpec; order is key[@beam][:lang][+flag]..."""
+    base, *flags = text.strip().split("+")
+    unknown = [f for f in flags if f not in ("prompt", "hot")]
+    if unknown:
+        raise ValueError(f"unknown option +{unknown[0]} in {text!r} (use +prompt or +hot)")
+    base, colon, language = base.partition(":")
+    if colon and not re.fullmatch(r"auto|[a-z]{2,3}", language):
+        raise ValueError(f"invalid language in {text!r}")
+    key, beam = parse_model_arg(base)
+    return RunSpec(key, beam, language or None, "prompt" in flags, "hot" in flags)
+
+
+# --------------------------------------------------------------------------- #
+# Local datasets: <data_dir>/eval/<name>/refs.tsv + NN.wav (see scripts/record_eval.py)
+# --------------------------------------------------------------------------- #
+
+
+def parse_refs_tsv(text: str) -> list[tuple[str, str]]:
+    """refs.tsv lines `ID<TAB>reference` -> [(id, reference)] in file order. Blank lines,
+    `#` comments and lines without a reference are skipped."""
+    rows = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        ident, _, ref = line.partition("\t")
+        ident, ref = ident.strip(), ref.strip()
+        if ident and ref:
+            rows.append((ident, ref))
+    return rows
+
+
+def load_local_dataset(name: str, root: Path) -> tuple[list[dict], list[str]]:
+    """Items {"id", "audio", "text"} for every refs.tsv row that has root/<name>/<id>.wav, and
+    the ids whose wav is missing (recording may be in progress)."""
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError(f"invalid local dataset name {name!r}")
+    ds_dir = root / name
+    tsv = ds_dir / "refs.tsv"
+    if not tsv.is_file():
+        raise FileNotFoundError(f"{tsv} not found")
+    items, missing = [], []
+    for ident, ref in parse_refs_tsv(tsv.read_text(encoding="utf-8")):
+        wav = ds_dir / f"{safe_filename(ident)}.wav"
+        if wav.is_file():
+            items.append({"id": ident, "audio": str(wav), "text": ref})
+        else:
+            missing.append(ident)
+    return items, missing
+
+
+# --------------------------------------------------------------------------- #
+# English-term accuracy (code-switching metric)
+#
+# Heuristic, documented:
+#  * Tokens: lowercase, apostrophes dropped, "&" -> "and", a colon inside a word is joined
+#    ("API:et" -> "apiet"), other punctuation splits; å/ä/ö/digits kept.
+#  * In a reference sentence with >= 3 unambiguous English function words (EN_STOPWORDS) the
+#    whole sentence is English: every token is a unit that must appear exactly in the hypothesis
+#    (bucket "en").
+#  * Otherwise the units are the ENGLISH_TERMS entries found in it (bucket "cs"). An entry is a
+#    token or a multi-word phrase; "a|b" lists accepted spellings of one token. The last token may
+#    carry a Swedish suffix (SV_SUFFIXES: "branchen", "API:et", "merga", "testerna"); the same
+#    leniency applies to the hypothesis, so "branches"/"branchen" both count as "branch"
+#    but a phonetic "brantch" does not.
+#  * A unit is a hit when the hypothesis has a matching, not yet used, token span (a repeated
+#    unit must be present as often). Accuracy = hits / units, summed over the corpus.
+# --------------------------------------------------------------------------- #
+
+SV_SUFFIXES = frozenset(
+    "n en et t s es er ar or a ad d de ade at as na erna arna orna ens ets ns ed ted "
+    "ing ning ningen ningar ande".split()
+)
+
+# Curated: tech / university terms of the kind a Swedish student leaves in English.
+# fmt: off
+ENGLISH_TERMS: tuple[str, ...] = (
+    "pull request", "unit test", "integration test", "status code", "research question",
+    "literature review", "peer review", "data augmentation", "early stopping",
+    "sprint planning", "action item", "speech recognition", "q and a", "code review",
+    "push", "branch", "deadline", "approach", "baseline", "screen", "dashboard", "issue",
+    "framework", "workaround", "supervisor", "source", "merg|merge", "main",
+    "overfit|overfitt", "dropout", "standup", "team", "dataset", "api", "token", "expire",
+    "methodology", "frontend", "backend", "break", "feedback", "abstract", "deploy",
+    "production", "slides", "canvas", "bottleneck", "latency", "repository",
+    "commit", "pipeline", "thesis", "bug", "docker", "github", "laptop", "workshop",
+    "paper", "feature", "server", "script", "cloud", "meeting", "link",
+)
+# fmt: on
+EN_STOPWORDS = frozenset(
+    "the of to and we you is are that this with could would should me my our it before after "
+    "through think send go up lets for on at have".split()
+)
+MIN_EN_STOPWORDS = 3
+
+_Unit = tuple[tuple[str, ...], ...]  # one tuple of accepted spellings per token
+
+
+def term_tokens(text: str) -> list[str]:
+    text = unicodedata.normalize("NFC", text).lower()
+    text = re.sub(r"['’‘`]", "", text)
+    text = text.replace("&", " and ")
+    text = re.sub(r"(?<=\w):(?=\w)", "", text)  # "api:et" -> "apiet"
+    text = "".join(" " if unicodedata.category(ch)[0] in "PS" else ch for ch in text)
+    return text.split()
+
+
+def compile_lexicon(entries: tuple[str, ...] = ENGLISH_TERMS) -> list[_Unit]:
+    """Entries -> units, longest phrases first (so 'pull request' wins over a shorter match)."""
+    units = [
+        tuple(tuple(tok.split("|")) for tok in e.lower().split()) for e in entries if e.strip()
+    ]
+    return sorted(units, key=len, reverse=True)
+
+
+_LEXICON = compile_lexicon()
+
+
+def _token_matches(token: str, spellings: tuple[str, ...], suffix_ok: bool) -> bool:
+    return any(
+        token == s or (suffix_ok and token.startswith(s) and token[len(s) :] in SV_SUFFIXES)
+        for s in spellings
+    )
+
+
+def _unit_at(tokens: list[str], i: int, unit: _Unit, lenient: bool) -> bool:
+    if i + len(unit) > len(tokens):
+        return False
+    last = len(unit) - 1
+    return all(
+        _token_matches(tokens[i + j], alts, lenient and j == last) for j, alts in enumerate(unit)
+    )
+
+
+def is_english_sentence(tokens: list[str]) -> bool:
+    return sum(t in EN_STOPWORDS for t in tokens) >= MIN_EN_STOPWORDS
+
+
+def english_units(reference: str, lexicon: list[_Unit] | None = None) -> tuple[str, list[_Unit]]:
+    """(bucket, units) of a reference: "en" = whole English sentence, else "cs" lexicon terms."""
+    tokens = term_tokens(reference)
+    if is_english_sentence(tokens):
+        return "en", [((t,),) for t in tokens]
+    lexicon = _LEXICON if lexicon is None else lexicon
+    found: list[_Unit] = []
+    i = 0
+    while i < len(tokens):
+        for unit in lexicon:
+            if _unit_at(tokens, i, unit, True):
+                found.append(unit)
+                i += len(unit)
+                break
+        else:
+            i += 1
+    return "cs", found
+
+
+def score_english_terms(
+    reference: str, hypothesis: str, lexicon: list[_Unit] | None = None
+) -> dict[str, tuple[int, int]]:
+    """{"cs": (hits, total), "en": (hits, total)} for one utterance (see section comment)."""
+    bucket, units = english_units(reference, lexicon)
+    hyp = term_tokens(hypothesis)
+    used = [False] * len(hyp)
+    hits = 0
+    for unit in units:
+        for i in range(len(hyp) - len(unit) + 1):
+            if not any(used[i : i + len(unit)]) and _unit_at(hyp, i, unit, bucket == "cs"):
+                used[i : i + len(unit)] = [True] * len(unit)
+                hits += 1
+                break
+    out = {"cs": (0, 0), "en": (0, 0)}
+    out[bucket] = (hits, len(units))
+    return out
+
+
+def english_term_accuracy(references: list[str], hypotheses: list[str]) -> dict:
+    """Corpus totals: eng_acc over all units, eng_acc_cs / eng_acc_en per bucket (None = no
+    units), plus the unit counts."""
+    if len(references) != len(hypotheses):
+        raise ValueError("references and hypotheses differ in length")
+    tot = {"cs": [0, 0], "en": [0, 0]}
+    for ref, hyp in zip(references, hypotheses, strict=True):
+        for bucket, (hit, total) in score_english_terms(ref, hyp).items():
+            tot[bucket][0] += hit
+            tot[bucket][1] += total
+
+    def acc(hit: int, total: int) -> float | None:
+        return hit / total if total else None
+
+    hit_all, n_all = tot["cs"][0] + tot["en"][0], tot["cs"][1] + tot["en"][1]
+    return {
+        "eng_acc": acc(hit_all, n_all),
+        "eng_acc_cs": acc(*tot["cs"]),
+        "eng_acc_en": acc(*tot["en"]),
+        "eng_n": n_all,
+        "eng_n_cs": tot["cs"][1],
+        "eng_n_en": tot["en"][1],
+    }
 
 
 def select_fleurs_rows(
@@ -395,13 +636,15 @@ def _worker_whisper(
     model = WhisperModel(local, device="cpu", compute_type="int8", cpu_threads=threads)
     load_s = time.perf_counter() - t0
 
-    def transcribe(audio, lang):
+    def transcribe(audio, st):
         segments, info = model.transcribe(
             audio,
-            language=None if lang == "auto" else lang,
+            language=None if st["language"] == "auto" else st["language"],
             beam_size=beam,
             vad_filter=True,
             condition_on_previous_text=False,
+            initial_prompt=st.get("initial_prompt"),
+            hotwords=st.get("hotwords"),
         )
         return " ".join(s.text.strip() for s in segments).strip(), info.language
 
@@ -409,12 +652,12 @@ def _worker_whisper(
     for st in sets:
         audios = [load_audio(p) for p in st["audio"]]
         if audios:
-            transcribe(_warmup_audio(audios), st["language"])
+            transcribe(_warmup_audio(audios), st)
         rss.reset()
         hyps, langs = [], []
         t0 = time.perf_counter()
         for audio in audios:
-            text, detected = transcribe(audio, st["language"])
+            text, detected = transcribe(audio, st)
             hyps.append(text)
             langs.append(detected)
         elapsed = time.perf_counter() - t0
@@ -624,12 +867,24 @@ def language_match(detected: list[str | None] | None, expected: str | None) -> f
     return sum(1 for d in detected if d == expected) / len(detected)
 
 
+def score_row(row: dict, refs: list[str], hypotheses: list[str], terms: bool = False) -> None:
+    """Fill WER/CER (and with `terms` the English-term accuracy fields) of a row in place."""
+    row["wer"], row["cer"] = corpus_error_rates(refs, hypotheses)
+    if terms:
+        row.update(english_term_accuracy(refs, hypotheses))
+
+
 def build_rows(
-    raw: dict, label: str, beam: int | None, references: dict[str, list[str]] | None
+    raw: dict,
+    label: str,
+    beam: int | None,
+    references: dict[str, list[str]] | None,
+    terms: bool = False,
 ) -> tuple[list[dict], dict]:
     """Turn a worker result into table rows; also return {run_name: [hypotheses]}.
 
-    `references` maps set name -> reference texts (same order as the set's audio)."""
+    `references` maps set name -> reference texts (same order as the set's audio). With
+    `terms` the rows also carry the English-term accuracy (code-switching sets)."""
     if "error" in raw:
         return [{"run": label, "model": label, "error": raw["error"]}], {}
     rows, hyps = [], {}
@@ -661,9 +916,66 @@ def build_rows(
         }
         refs = (references or {}).get(run["set"])
         if refs is not None:
-            row["wer"], row["cer"] = corpus_error_rates(refs, hypotheses)
+            score_row(row, refs, hypotheses, terms)
         rows.append(row)
     return rows, hyps
+
+
+# --------------------------------------------------------------------------- #
+# LLM post-correction (Steno's own diff-only fix through the Claude CLI)
+# --------------------------------------------------------------------------- #
+
+
+def llm_fix_texts(texts: list[str], runner=None) -> tuple[list[str], dict]:
+    """Run `steno.llm.llm_fix` (prompts/fix.md, `finalize --llm-fix`) over utterance texts with
+    the default [llm] settings (haiku, effort medium). Returns (fixed texts, fix report).
+    Only the hypothesis texts are sent, one `[n] text` line each."""
+    from steno.config import LlmConfig
+    from steno.llm import llm_fix
+    from steno.transcript import Segment
+
+    segments = [
+        Segment(
+            seq=i,
+            t_start=float(i),
+            t_end=i + 1.0,
+            wall="",
+            source="mic",
+            speaker="S",
+            text=t,
+            lang="sv",
+        )
+        for i, t in enumerate(texts, 1)
+    ]
+    fixed, report = llm_fix(segments, LlmConfig(), runner)
+    return [seg.text for seg in fixed], report
+
+
+def fix_row(
+    base: dict,
+    hypotheses: list[str],
+    refs: list[str],
+    fixer=llm_fix_texts,
+    terms: bool = False,
+) -> tuple[dict, list[str]]:
+    """Row for `<base>+fix`: the base hypotheses after the LLM fix. RTF includes the fix call
+    (a post-pass, so it is not comparable with the live limit); `fix_s` is the call alone."""
+    t0 = time.perf_counter()
+    fixed, report = fixer(hypotheses)
+    fix_s = time.perf_counter() - t0
+    row = {k: v for k, v in base.items() if k not in ("wer", "cer")}
+    row.update(
+        run=f"{base['model']}+fix[{base['set']}]",
+        model=f"{base['model']}+fix",
+        fix_s=fix_s,
+        fix_proposed=report.get("proposed"),
+        fix_applied=report.get("applied"),
+        fix_failed_batches=report.get("failed_batches"),
+        rtf=real_time_factor(base["transcribe_s"] + fix_s, base["audio_s"]),
+        words=sum(len(h.split()) for h in fixed),
+    )
+    score_row(row, refs, fixed, terms)
+    return row, fixed
 
 
 def format_dataset_table(rows: list[dict]) -> str:
@@ -706,6 +1018,40 @@ def format_dataset_table(rows: list[dict]) -> str:
     return header + "\n".join(lines)
 
 
+def format_local_table(rows: list[dict]) -> str:
+    """One line per strategy: WER, CER, English-term accuracy (all / in Swedish sentences /
+    in English sentences), RTF, RSS and a note."""
+    header = (
+        "| strategy | WER | CER | EN-term acc | in sv sentences | in en sentences | RTF "
+        "| peak RSS MB | note |\n"
+        "|---|---|---|---|---|---|---|---|---|\n"
+    )
+
+    def pct(r: dict, field: str) -> str:
+        return "-" if r.get(field) is None else f"{r[field] * 100:.1f}%"
+
+    lines = []
+    for r in rows:
+        if r.get("error"):
+            lines.append(f"| {r['model']} | FAILED: {r['error']} | | | | | | | |")
+            continue
+        notes = []
+        if r.get("language_match") is not None:
+            notes.append(f"language detected correctly in {r['language_match'] * 100:.0f}%")
+        if r.get("fix_s") is not None:
+            notes.append(
+                f"claude fix {r['fix_s']:.1f} s, {r['fix_applied']}/{r['fix_proposed']} edits "
+                f"applied, RTF incl. fix"
+                + (", a batch failed" if r.get("fix_failed_batches") else "")
+            )
+        lines.append(
+            f"| {r['model']} | {pct(r, 'wer')} | {pct(r, 'cer')} | {pct(r, 'eng_acc')} "
+            f"| {pct(r, 'eng_acc_cs')} | {pct(r, 'eng_acc_en')} | {_fmt(r['rtf'], '.3f')} "
+            f"| {_fmt(r.get('peak_rss_mb'), '.0f')} | {'; '.join(notes)} |"
+        )
+    return header + "\n".join(lines)
+
+
 def environment_info(threads: int) -> dict:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -741,39 +1087,65 @@ def synthetic_audio(path: Path, seconds: float = 5.0) -> None:
 
 
 def expand_sets(
-    spec: ModelSpec, jobs: list[dict], dataset_mode: bool, language: str | None = None
+    spec: ModelSpec,
+    jobs: list[dict],
+    dataset_mode: bool,
+    language: str | None = None,
+    *,
+    prompt: str | None = None,
+    hotwords: str | None = None,
 ) -> list[dict]:
     """Worker input for one model. Dataset sets carry their own language (whisper only; other
     engines detect it); `language` overrides it, "auto" = let Whisper detect. Single-file jobs
-    are repeated per language the model should be tried with (e.g. sv and auto)."""
+    are repeated per language the model should be tried with (e.g. sv and auto).
+    `prompt` / `hotwords` (Whisper only) become the sets' `initial_prompt` / `hotwords`."""
+    extra = {}
+    if spec.kind == "whisper":
+        if prompt:
+            extra["initial_prompt"] = prompt
+        if hotwords:
+            extra["hotwords"] = hotwords
     if dataset_mode:
         return [
             {
                 **j,
+                **extra,
                 "expected_language": j["language"],
                 "language": (language or j["language"]) if spec.kind == "whisper" else "auto",
             }
             for j in jobs
         ]
-    return [{**job, "name": lang, "language": lang} for job in jobs for lang in spec.languages]
+    return [
+        {**job, **extra, "name": lang, "language": lang} for job in jobs for lang in spec.languages
+    ]
 
 
 def benchmark(
     jobs: list[dict],
-    models: list[tuple[str, int | None]],
+    models: list[RunSpec],
     threads: int,
     out_dir: Path,
     dataset_mode: bool = False,
     language: str | None = None,
+    *,
+    local: bool = False,
+    fix_labels: frozenset[str] = frozenset(),
+    prompt: str = INITIAL_PROMPT,
+    hotwords: str = HOTWORDS,
 ) -> int:
-    """Run each (model, beam) over all `jobs`; write results.json after every model.
+    """Run each strategy over all `jobs`; write results.json after every model.
 
-    A job is {"name", "language", "audio": [paths], "refs": [str] | None}."""
+    A job is {"name", "language", "audio": [paths], "refs": [str] | None}. `local` = own
+    recordings (implies dataset mode): adds English-term accuracy. Strategies whose label is in
+    `fix_labels` also get a `<label>+fix` row (LLM post-correction of their hypotheses)."""
     out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_mode = dataset_mode or local
     rows: list[dict] = []
 
     def scored_rows() -> list[dict]:
-        # recommendation in dataset mode is based on the Swedish set only
+        # recommendation in FLEURS mode is based on the Swedish set only
+        if local:  # live recommendation: LLM-fix rows are a post-pass
+            return [r for r in rows if r.get("fix_s") is None]
         return [r for r in rows if r.get("set") == "sv"] if dataset_mode else rows
 
     def write_results() -> None:
@@ -783,44 +1155,93 @@ def benchmark(
                 {
                     "environment": environment_info(threads),
                     "sets": {j["name"]: len(j["audio"]) for j in jobs},
+                    "initial_prompt": prompt,
+                    "hotwords": hotwords,
                     "rows": sort_rows(rows),
                     "recommendation": best["run"] if best else None,
                     "recommendation_reason": why,
                 },
                 indent=2,
+                ensure_ascii=False,
             ),
             encoding="utf-8",
         )
 
+    def save_hyps(hyps: dict[str, list[str]]) -> None:
+        for name, texts in hyps.items():
+            (out_dir / f"{safe_filename(name)}.txt").write_text(
+                "\n".join(texts) + "\n", encoding="utf-8"
+            )
+
     with tempfile.TemporaryDirectory(prefix="steno-bench-") as tmp:
-        for key, beam in models:
-            label = run_label(key, beam)
-            if language and MODELS[key].kind == "whisper":
-                label += f":{language}"
+        for spec in models:
+            key, beam = spec.key, spec.beam
+            is_whisper = MODELS[key].kind == "whisper"
+            spec = RunSpec(
+                key,
+                beam,
+                (spec.language or language) if is_whisper else None,
+                spec.prompt,
+                spec.hotwords,
+            )
+            label = spec.label
             print(f"\n=== {label} ===", flush=True)
-            sets = expand_sets(MODELS[key], jobs, dataset_mode, language)
+            sets = expand_sets(
+                MODELS[key],
+                jobs,
+                dataset_mode,
+                spec.language,
+                prompt=prompt if spec.prompt else None,
+                hotwords=hotwords if spec.hotwords else None,
+            )
             refs = {s["name"]: s["refs"] for s in sets if s.get("refs") is not None}
             raw = run_model_subprocess(key, beam or BEAM_SIZE, sets, threads, Path(tmp), label)
-            new_rows, hyps = build_rows(raw, label, beam, refs or None)
+            new_rows, hyps = build_rows(raw, label, beam, refs or None, terms=local)
+            if label in fix_labels:
+                for base in [r for r in new_rows if not r.get("error")]:
+                    print(f"  llm fix on {base['run']} (claude CLI) ...", flush=True)
+                    row, fixed = fix_row(base, hyps[base["run"]], refs[base["set"]], terms=local)
+                    new_rows.append(row)
+                    hyps[row["run"]] = fixed
             rows.extend(new_rows)
-            for name, texts in hyps.items():
-                (out_dir / f"{safe_filename(name)}.txt").write_text(
-                    "\n".join(texts) + "\n", encoding="utf-8"
-                )
+            save_hyps(hyps)
             write_results()
             for r in new_rows:
                 if r.get("error"):
                     print(f"  FAILED: {r['error']}", flush=True)
                 else:
                     wer = "-" if r["wer"] is None else f"{r['wer'] * 100:.1f}%"
-                    print(f"  {r['set']}: WER {wer}  RTF {r['rtf']:.3f}", flush=True)
+                    eng = "" if r.get("eng_acc") is None else f"  EN {r['eng_acc'] * 100:.0f}%"
+                    print(f"  {r['model']}: WER {wer}{eng}  RTF {r['rtf']:.3f}", flush=True)
 
     rows = sort_rows(rows)
+    if local:
+        table = format_local_table(rows)
+    else:
+        table = format_dataset_table(rows) if dataset_mode else format_table(rows)
+    print("\n" + table)
     best, why = recommend(scored_rows())
-    print("\n" + (format_dataset_table(rows) if dataset_mode else format_table(rows)))
     print(f"\nRecommendation: {best['run'] if best else 'none'}  ({why})")
+    if local:
+        post = [r for r in rows if r.get("fix_s") is not None and r.get("wer") is not None]
+        if post:
+            top = min(post, key=lambda r: r["wer"])
+            print(f"Best post-pass (LLM fix): {top['model']}  WER {top['wer'] * 100:.1f}%")
     print(f"Results written to: {out_dir}")
     return 0 if rows and all(r.get("error") is None for r in rows) else 1
+
+
+def resolve_fix_labels(requested: list[str] | None, specs: list[RunSpec]) -> frozenset[str]:
+    """`--llm-fix` without values = the first strategy (put the base kb-whisper run first)."""
+    if requested is None:
+        return frozenset()
+    labels = [sp.label for sp in specs]
+    if not requested:
+        return frozenset(labels[:1])
+    unknown = [r for r in requested if r not in labels]
+    if unknown:
+        raise ValueError(f"--llm-fix: no such strategy in --models: {', '.join(unknown)}")
+    return frozenset(requested)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -829,20 +1250,33 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reference", type=Path, help="reference transcript (UTF-8 text)")
     p.add_argument(
         "--dataset",
-        choices=["fleurs", "fleurs-sv", "fleurs-en"],
-        help="FLEURS test subset (CC-BY-4.0) instead of --audio; 'fleurs' = sv and en",
+        help="FLEURS test subset (CC-BY-4.0) instead of --audio: fleurs ('fleurs' = sv and en), "
+        "fleurs-sv, fleurs-en; or local:<name> = <data_dir>/eval/<name>/refs.tsv + NN.wav "
+        "(code-switching set from scripts/record_eval.py; missing wavs are skipped)",
     )
     p.add_argument("--n", type=int, default=60, help="utterances from fleurs-sv (default 60)")
     p.add_argument("--n-en", type=int, default=30, help="utterances from fleurs-en (default 30)")
     p.add_argument(
         "--models",
         default=",".join(MODELS),
-        help=f"comma-separated subset of: {', '.join(MODELS)}; append @N for beam size N",
+        help="comma-separated strategies, each key[@beam][:lang][+prompt][+hot] with key in: "
+        f"{', '.join(MODELS)}",
     )
     p.add_argument(
         "--language",
         help="dataset mode: force this language for every Whisper set ('auto' = detect), "
-        "default is each set's own language",
+        "default is each set's own language (a `:lang` in --models wins)",
+    )
+    p.add_argument("--prompt-text", default=INITIAL_PROMPT, help="text used by +prompt")
+    p.add_argument("--hotwords-text", default=HOTWORDS, help="words used by +hot")
+    p.add_argument(
+        "--llm-fix",
+        nargs="*",
+        metavar="STRATEGY",
+        help="also score the LLM post-correction (steno.llm.llm_fix via the claude CLI, haiku, "
+        "effort medium) of these strategies' hypotheses (labels as printed, e.g. "
+        "kb-whisper-small+prompt); no value = the first strategy in --models. "
+        "Sends hypothesis text only.",
     )
     p.add_argument("--threads", type=int, default=6)
     p.add_argument("--out", type=Path, help="output dir (default: <data_dir>/benchmarks/<ts>)")
@@ -866,20 +1300,49 @@ def main(argv: list[str] | None = None) -> int:
             wav = Path(tmp) / "synthetic.wav"
             synthetic_audio(wav)
             jobs = [{"name": "file", "language": "auto", "audio": [str(wav)], "refs": None}]
-            rc = benchmark(jobs, [(SELF_TEST_MODEL, None)], args.threads, out_dir)
+            rc = benchmark(jobs, [RunSpec(SELF_TEST_MODEL)], args.threads, out_dir)
         print("SELF-TEST " + ("OK" if rc == 0 else "FAILED"))
         return rc
 
     try:
-        models = [parse_model_arg(k) for k in args.models.split(",") if k.strip()]
+        specs = [parse_run_spec(k) for k in args.models.split(",") if k.strip()]
+        fix_labels = resolve_fix_labels(args.llm_fix, specs)
     except ValueError as exc:
         p.error(str(exc))
-    unknown = [k for k, _ in models if k not in MODELS]
+    unknown = [sp.key for sp in specs if sp.key not in MODELS]
     if unknown:
         p.error(f"unknown model(s): {', '.join(unknown)}; choose from {', '.join(MODELS)}")
+    for sp in specs:
+        if MODELS[sp.key].kind != "whisper" and (sp.prompt or sp.hotwords or sp.language):
+            p.error(f"{sp.label}: +prompt, +hot and :lang only apply to Whisper models")
     out_dir = args.out or data_dir() / "benchmarks" / stamp
+    opts = {"prompt": args.prompt_text, "hotwords": args.hotwords_text, "fix_labels": fix_labels}
+
+    if args.dataset and args.dataset.startswith("local:"):
+        name = args.dataset.removeprefix("local:")
+        try:
+            items, missing = load_local_dataset(name, data_dir() / "eval")
+        except (ValueError, FileNotFoundError) as exc:
+            p.error(str(exc))
+        if not items:
+            p.error(f"no recordings found for local:{name}")
+        note = f", {len(missing)} not recorded yet (skipped)" if missing else ""
+        print(f"local:{name}: {len(items)} recordings{note}")
+        jobs = [
+            {
+                "name": "local",
+                "language": "sv",
+                "audio": [i["audio"] for i in items],
+                "refs": [i["text"] for i in items],
+            }
+        ]
+        return benchmark(
+            jobs, specs, args.threads, out_dir, language=args.language, local=True, **opts
+        )
 
     if args.dataset:
+        if args.dataset not in ("fleurs", "fleurs-sv", "fleurs-en"):
+            p.error("--dataset must be fleurs, fleurs-sv, fleurs-en or local:<name>")
         keys = ["fleurs-sv", "fleurs-en"] if args.dataset == "fleurs" else [args.dataset]
         root = data_dir() / "eval" / "asr"
         jobs = []
@@ -894,7 +1357,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         return benchmark(
-            jobs, models, args.threads, out_dir, dataset_mode=True, language=args.language
+            jobs, specs, args.threads, out_dir, dataset_mode=True, language=args.language, **opts
         )
 
     if not args.audio:
@@ -910,7 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
             "refs": None if ref is None else [ref],
         }
     ]
-    return benchmark(jobs, models, args.threads, out_dir)
+    return benchmark(jobs, specs, args.threads, out_dir, **opts)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,17 @@ class AsrResult:
     avg_logprob: float | None = None  # duration-weighted mean over the model's segments
 
 
+@dataclass(frozen=True)
+class LongSegment:
+    """One model segment of a long-form transcription (times: seconds in the audio)."""
+
+    start: float
+    end: float
+    text: str
+    words: list[Word]
+    avg_logprob: float | None = None
+
+
 def weighted_logprob(items: list[tuple[float, float]]) -> float | None:
     """Mean of ``(avg_logprob, duration)`` pairs weighted by duration; None without items."""
     if not items:
@@ -72,6 +83,7 @@ class WhisperTranscriber:
         cpu_threads: int = 6,
         language: str = "sv",
         beam_size: int = 1,
+        initial_prompt: str | None = None,
     ):
         self.name = model
         self._model_id = model
@@ -79,6 +91,7 @@ class WhisperTranscriber:
         self._cpu_threads = cpu_threads
         self._language = None if language == "auto" else language
         self._beam_size = beam_size
+        self._prompt = initial_prompt or None
         self._model = None
         self._pipeline = None
 
@@ -107,6 +120,7 @@ class WhisperTranscriber:
             beam_size=self._beam_size,
             vad_filter=False,  # utterances are already VAD-segmented
             condition_on_previous_text=False,
+            initial_prompt=self._prompt,
             without_timestamps=True,
         )
         text = " ".join(s.text.strip() for s in segments).strip()
@@ -137,6 +151,7 @@ class WhisperTranscriber:
             clip_timestamps=[{"start": 0.0, "end": len(samples) / 16000}],
             batch_size=1,
             condition_on_previous_text=False,
+            initial_prompt=self._prompt,
         )
         segments = list(segments)
         text = " ".join(s.text.strip() for s in segments).strip()
@@ -156,6 +171,54 @@ class WhisperTranscriber:
         return AsrResult(text, info.language or (self._language or ""), words, logprob)
 
 
+    def transcribe_longform(
+        self,
+        audio: np.ndarray,
+        *,
+        batch_size: int = 4,
+        beam_size: int | None = None,
+        progress: Callable[[float, float], None] | None = None,
+    ) -> tuple[list[LongSegment], str]:
+        """Transcribe a whole recording in one go: ``(segments, language)``.
+
+        Uses faster-whisper's batched pipeline with its Silero VAD, so silence is skipped and
+        30 s windows are decoded ``batch_size`` at a time (much faster per audio second than
+        clip-by-clip decoding, and the model sees whole sentences instead of cut ones).
+        ``progress(seconds_done, seconds_total)`` is called after every segment.
+        """
+        self.load()
+        assert self._pipeline is not None
+        samples = np.asarray(audio, dtype=np.float32)
+        total = len(samples) / SAMPLE_RATE
+        segments, info = self._pipeline.transcribe(
+            samples,
+            language=self._language,
+            beam_size=beam_size or self._beam_size,
+            word_timestamps=True,
+            vad_filter=True,
+            batch_size=batch_size,
+            condition_on_previous_text=False,
+            initial_prompt=self._prompt,
+        )
+        out: list[LongSegment] = []
+        for s in segments:
+            words = [
+                Word(float(w.start), float(w.end), w.word.strip())
+                for w in (s.words or [])
+                if w.word.strip()
+            ]
+            lp = getattr(s, "avg_logprob", None)
+            out.append(
+                LongSegment(float(s.start), float(s.end), s.text.strip(), words,
+                            None if lp is None else float(lp))
+            )
+            if progress is not None:
+                progress(min(float(s.end), total), total)
+        if progress is not None:
+            progress(total, total)
+        return out, info.language or (self._language or "")
+
+
 def _make_faster_whisper(cfg: AsrConfig) -> Transcriber:
     return WhisperTranscriber(
         cfg.model,
@@ -163,6 +226,7 @@ def _make_faster_whisper(cfg: AsrConfig) -> Transcriber:
         cpu_threads=cfg.cpu_threads,
         language=cfg.language,
         beam_size=cfg.beam_size,
+        initial_prompt=cfg.initial_prompt,
     )
 
 

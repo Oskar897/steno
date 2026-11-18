@@ -121,9 +121,32 @@ layer keep working on it. `steno show --final` prints the final transcript, `ste
   timestamps have no `words`.
 
 `final.json`: plain JSON with `created`, `segments`, `live_segments`, `speakers`
-(`id`, `name`, `seconds`, `locked`), `asr_model`, `asr_redone` / `asr_flagged` (lines
-transcribed again / considered), `full_asr`, `num_speakers`, `llm_fix` (counts and the
-rejected edits, which contain transcript text) and timings. No biometric data.
+(`id`, `name`, `seconds`, `locked`), `asr_mode` (`longform`, `selective` or `off`),
+`asr_model` (`null` when `off`), `asr_redone` / `asr_flagged` (selective: lines transcribed
+again / considered; longform: `asr_redone` = long-form lines before speaker splitting),
+`full_asr` (selective mode only), `longform` (`null` unless longform: `lines`, `words`,
+`echo_words_dropped`, `streams_kept_live`, `seconds`), `num_speakers`, `llm_fix` (counts and
+the rejected edits, which contain transcript text) and timings. No biometric data.
+
+Where the words come from (`[post] asr_mode`): in `longform` (default) every kept stream
+(`audio-mic.flac`, `audio-loopback.flac`, positions shifted by `stream_origins`) is
+transcribed once as a whole with `[post] asr_model`, `[asr] language` and `[asr]
+initial_prompt`; words replace the live text and nothing of the live words survives, only
+the live *lines* are used for two things: (1) the label of words that no diarization turn
+covers (`speaker_id` `U`), and (2) the echo rule below. A stream with no kept audio, one whose
+long-form pass fails, or one in which the model finds no speech although the live pass did
+keeps its live lines (`streams_kept_live`). In `selective` only low-confidence live lines are
+transcribed again (`--full-asr`: all); in `off` the live words are kept.
+
+Echo rule (longform, sessions with both streams and `[echo] enabled`): the live engine drops
+mic utterances that are the loopback audio leaking into the mic and records nothing about
+them, so a whole-file transcription of the mic stream would write the remote side's words a
+second time as "Me". A mic word is therefore kept when its midpoint lies within 0.4 s of a
+live mic line (the live pass judged that speech real, even if the remote was talking) or when
+no loopback speech is going on at that time (the union of the live loopback lines and the new
+loopback words); otherwise it is dropped and the line is cut around it. Consequence: speech
+the live pass dropped as echo stays dropped, and mic speech that overlaps the remote side but
+that the live VAD missed completely is lost too.
 
 How the final labels come about: pyannote segmentation-3.0 finds up to three local speakers
 (two at a time) in every 10 s window; CAM++ embeddings of each local speaker's solo speech are

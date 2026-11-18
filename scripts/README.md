@@ -56,6 +56,32 @@ picked with a fixed seed (a smaller `--n` is a prefix of a larger one). The audi
 * No public Swedish-English code-switching test set with audio was found; check your own
   recordings with `--audio`/`--reference` for that.
 
+### Code-switching strategies (`--dataset local:<name>`)
+
+Compares ways to handle Swedish speech with English terms on your own recordings
+(`scripts/record_eval.py` writes `<data_dir>/eval/<name>/refs.tsv` and `NN.wav`; recordings that
+are missing are skipped).
+
+```
+uv run python scripts/benchmark_asr.py --dataset local:codeswitch --llm-fix \
+    --models kb-whisper-small,kb-whisper-small+prompt,kb-whisper-medium+prompt,whisper-large-v3-turbo:auto,whisper-large-v3-turbo:sv+prompt
+```
+
+* Strategy grammar: `key[@beam][:lang][+prompt][+hot]`. `:lang` forces sv/en/auto (turbo's
+  language detection); `+prompt` passes a generic Swedish meeting text with English terms
+  (`INITIAL_PROMPT`, not copied from the eval sentences; override with `--prompt-text`);
+  `+hot` passes faster-whisper `hotwords` (`--hotwords-text`). The texts used are stored in
+  `results.json`.
+* `--llm-fix [STRATEGY...]` adds a `<strategy>+fix` row: that strategy's hypotheses go through
+  Steno's `llm_fix` (prompts/fix.md, haiku, effort medium) via the real `claude` CLI. Default
+  strategy = the first in `--models`. Only hypothesis text is sent. Its RTF includes the CLI call,
+  so it is a post-pass figure, excluded from the live recommendation.
+* Columns: WER, CER, **EN-term acc** (share of English units in the references found in the
+  hypothesis; split into terms inside Swedish sentences and whole English sentences), RTF.
+  Heuristic (see the comment above `ENGLISH_TERMS`): a curated term list where Swedish suffixes
+  are accepted ("branchen", "API:et", "testerna"); a sentence with >= 3 English function words is
+  English and all its tokens must match exactly.
+
 ## eval_diarization.py
 
 Objective, repeatable diarization evaluation (who spoke when) for a single laptop

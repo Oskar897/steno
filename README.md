@@ -70,9 +70,14 @@ uv run steno todo --person Alice            # explicit commitments only -> todo.
 
 `finalize` re-diarizes the kept audio (pyannote segmentation-3.0 windows linked by CAM++
 embeddings, Steno's spectral clustering, enrolled people matched by voice; overlapping speech
-can get two speakers), transcribes low-confidence live lines again (`--full-asr`: every line;
-`[post] asr_model` picks the model), and assigns each word to the speaker turn it overlaps
-most. Names given with `steno name` are locked and carried over. The live transcript is never
+can get two speakers), transcribes the audio again and assigns each word to the speaker turn
+it overlaps most. `[post] asr_mode` (or `--asr-mode`) picks how: `longform` (default) runs each
+kept stream through `[post] asr_model` (large-v3-turbo, ~1.6 GB download) once as a whole,
+`selective` re-transcribes only low-confidence live lines one by one (`--full-asr`: every
+line; use a smaller model such as `KBLab/kb-whisper-medium`, per-clip decoding with turbo is
+slow), `off` keeps the live words. Mic words that are only the remote side leaking into the
+microphone stay dropped, see `docs/formats.md`. `[asr] initial_prompt` (a generic Swedish
+text with English terms) is passed to the live model and to finalize. Names given with `steno name` are locked and carried over. The live transcript is never
 changed; `[post] auto = true` runs finalize when `steno record` stops (Ctrl+C skips it).
 The speaker count is estimated; a quiet participant who only says a few short words can be
 missed (finalize then prints a hint): pass `--speakers N` when you know how many people took
@@ -81,7 +86,8 @@ downloaded on first use. On the 3 x 10 min AMI far-field test (one distant mic, 
 overlap counted) the diarization error rate falls from 31 % (live) to 18 % (finalize), 13 %
 when overlapping speech is not scored; the diarization part takes about 0.4-0.9 min per
 10 min of audio on a laptop CPU (`[post] seg_step_s = 1.25` is a little more accurate and twice
-as slow), re-transcribing every line with `--full-asr` several minutes more. See
+as slow); long-form ASR with turbo adds roughly 0.3 x the audio length per stream on a laptop
+CPU, selective re-transcription of every line (`--full-asr`) several minutes more. See
 [scripts/eval_diarization.py](scripts/eval_diarization.py) (`--system steno-finalize`).
 
 `summary`, `todo` and `finalize --llm-fix` call the Claude Code CLI (`claude -p`, your own

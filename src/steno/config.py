@@ -24,6 +24,18 @@ log = logging.getLogger(__name__)
 CONFIG_NAME = "config.toml"
 EXAMPLE_NAME = "config.example.toml"
 
+# Whisper ``initial_prompt`` used by default: natural Swedish meeting text that spells English
+# tech/university terms in English (with Swedish suffixes, "pipelinen"), the pattern the model
+# should continue. Generic on purpose; never copy sentences from an evaluation set into it.
+DEFAULT_INITIAL_PROMPT = (
+    "Hej allihopa, välkomna till veckomötet. Vi började med vår thesis och sen fixade vi "
+    "några bugs i pipelinen. Jag testade scriptet på servern och committade ändringen på "
+    "GitHub. Efter lunch har vi en workshop, så ta med laptopen och en bra paper."
+)
+
+#: ``[post] asr_mode`` values, see ``PostConfig``.
+ASR_MODES = ("longform", "selective", "off")
+
 
 class ConfigError(ValueError):
     """Raised for an unreadable or invalid configuration file."""
@@ -47,6 +59,9 @@ class AsrConfig:
     language: str = "sv"  # "sv", "en" or "auto"
     cpu_threads: int = 6
     beam_size: int = 1
+    # Whisper initial_prompt (context the decoder continues from); "" = none. Used by live
+    # transcription and by finalize.
+    initial_prompt: str = DEFAULT_INITIAL_PROMPT
 
 
 @dataclass(frozen=True)
@@ -116,8 +131,17 @@ class PostConfig:
     """`steno finalize`: the offline pass over the kept audio after a meeting."""
 
     auto: bool = False  # run finalize automatically when `steno record` stops
-    asr_model: str = "KBLab/kb-whisper-medium"  # re-transcription (FLEURS sv WER 6.2 vs 8.9)
-    asr_beam_size: int = 5
+    # Re-transcription: "longform" = each kept stream is transcribed once as a whole and the
+    # words are assigned to the final turns; "selective" = only low-confidence live lines are
+    # transcribed again, one by one; "off" = keep the live words.
+    asr_mode: str = "longform"
+    # Model of the re-transcription. Whole-recording decoding (longform) is where a large
+    # model is affordable; per-line decoding ("selective") pads every clip to 30 s, so pick a
+    # smaller model for it (e.g. KBLab/kb-whisper-medium).
+    asr_model: str = "deepdml/faster-whisper-large-v3-turbo-ct2"
+    asr_beam_size: int = 5  # selective mode
+    longform_beam_size: int = 1
+    longform_batch_size: int = 4  # 30 s windows decoded together
     asr_min_logprob: float = -0.7  # live lines below this average log-probability are redone
     asr_max_compression: float = 2.4  # ... and lines whose text compresses better than 1/this
     threads: int = 4  # segmentation and speaker-embedding threads
@@ -208,6 +232,12 @@ def config_from_dict(data: dict[str, Any]) -> Config:
     cfg = replace(cfg, **updates)
     if cfg.asr.language not in {"sv", "en", "auto"} and len(cfg.asr.language) != 2:
         raise ConfigError(f"[asr] language: unsupported value {cfg.asr.language!r}")
+    if cfg.post.asr_mode not in ASR_MODES:
+        raise ConfigError(
+            f"[post] asr_mode: expected one of {', '.join(ASR_MODES)}, got {cfg.post.asr_mode!r}"
+        )
+    if cfg.post.longform_batch_size < 1 or cfg.post.longform_beam_size < 1:
+        raise ConfigError("[post] longform_batch_size and longform_beam_size must be at least 1")
     return cfg
 
 

@@ -7,9 +7,16 @@ there is time to do better, and this module does:
 1. **Diarization** of every kept stream (``steno.diarize``: pyannote segmentation-3.0
    windows linked by CAM++ embeddings, clustered with Steno's spectral clustering and
    matched to enrolled profiles).
-2. **ASR repair**: live lines with a low average log-probability or a repetitive text (and
-   every line with ``--full-asr``) are transcribed again with ``[post] asr_model``; the new
-   text replaces the old only when it is not worse.
+2. **ASR**, by ``[post] asr_mode``:
+
+   - ``longform`` (default): every kept stream is transcribed once as a whole with
+     ``[post] asr_model`` (a large model is affordable that way: whole-recording decoding runs
+     in batches of 30 s windows and sees whole sentences, where line-by-line decoding pads
+     every clip to 30 s). The live lines are replaced by the new words; see "Echo" below.
+   - ``selective``: live lines with a low average log-probability or a repetitive text (and
+     every line with ``--full-asr``) are transcribed again one by one; the new text replaces
+     the old only when it is not worse.
+   - ``off``: the live words are kept.
 3. **Words to speakers** (the WhisperX rule): each word goes to the speaker turn it overlaps
    most, consecutive words of one speaker become a line. Sessions recorded before word
    timestamps were stored get approximate word times (spread over the line by length).
@@ -19,6 +26,15 @@ there is time to do better, and this module does:
    (``S<n>``, ``P:<profile id>``) are a new namespace, separate from the live ids.
 5. Output, all new files (``transcript.jsonl`` is never touched): ``final.jsonl`` (schema v1
    with ``final: true``), ``final.md``, ``final.json`` (speakers, parameters, counts).
+
+Echo (longform only). The live pipeline drops microphone utterances that are just the
+loopback audio leaking into the mic and writes nothing about them, so a whole-file
+transcription of ``audio-mic.flac`` would bring that text back as duplicates of the remote
+side. The rule (``drop_echo_words``): a mic word is kept when it lies inside a live mic line
+(+- ``ECHO_PAD_S``; the live pass judged that speech real) or when no loopback speech is
+going on at that time; otherwise (it overlaps loopback speech and the live pass kept no mic
+line there) it is dropped. Loopback speech is the union of the live loopback lines and the
+new loopback words. Applies only when the session has both streams and ``[echo]`` is enabled.
 
 Heavy collaborators (models, audio decoding, the ASR backend) are injected through
 ``Deps`` so the logic can be tested with synthetic fakes.
@@ -38,8 +54,8 @@ from typing import Any
 import numpy as np
 
 from steno import __version__, labels, transcript
-from steno.asr import AsrResult
-from steno.config import Config
+from steno.asr import AsrResult, LongSegment
+from steno.config import ASR_MODES, Config
 from steno.diarize import (
     DiarizationResult,
     DiarizeParams,
@@ -63,6 +79,7 @@ MIN_REASR_S = 0.6  # shorter live lines are not worth transcribing again
 REASR_PAD_S = 0.1
 MAX_MERGED_S = 20.0  # joined same-speaker lines never get longer than this
 NAME_MIN_S = 2.0  # seconds of overlap a cluster needs before it inherits a live name
+ECHO_PAD_S = 0.4  # a mic word this close to a live mic line still counts as inside it
 
 Progress = Callable[[str, int, int], None]
 
@@ -253,6 +270,202 @@ def merge_lines(
     return out
 
 
+# --------------------------------------------------------------------------- longform ASR
+
+
+def merge_spans(
+    spans: Sequence[tuple[float, float]], pad: float = 0.0
+) -> list[tuple[float, float]]:
+    """Sorted, merged ``(start, end)`` spans, each widened by ``pad`` on both sides."""
+    out: list[tuple[float, float]] = []
+    for a, b in sorted((a - pad, b + pad) for a, b in spans if b >= a):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _inside(t: float, spans: Sequence[tuple[float, float]]) -> bool:
+    return any(a <= t <= b for a, b in spans)
+
+
+def drop_echo_words(
+    words: Sequence[Word],
+    live_mic: Sequence[tuple[float, float]],
+    loopback: Sequence[tuple[float, float]],
+    pad: float = ECHO_PAD_S,
+) -> tuple[list[Word], list[Word]]:
+    """Split mic words into ``(kept, echo)`` (see "Echo" in the module docstring).
+
+    ``live_mic`` / ``loopback`` are the time spans of the live mic lines and of the loopback
+    speech. A word is judged by its midpoint.
+    """
+    inside_live = merge_spans(live_mic, pad)
+    loud = merge_spans(loopback)
+    kept: list[Word] = []
+    echo: list[Word] = []
+    for w in words:
+        mid = (w.start + w.end) / 2
+        if _inside(mid, inside_live) or not _inside(mid, loud):
+            kept.append(w)
+        else:
+            echo.append(w)
+    return kept, echo
+
+
+def split_long_words(words: Sequence[Word], max_s: float = MAX_MERGED_S) -> list[list[Word]]:
+    """Cut a word run longer than ``max_s`` at its longest pauses (recursively)."""
+    if len(words) < 2 or words[-1].end - words[0].start <= max_s:
+        return [list(words)] if words else []
+    i = max(range(len(words) - 1), key=lambda k: words[k + 1].start - words[k].end)
+    return split_long_words(words[: i + 1], max_s) + split_long_words(words[i + 1 :], max_s)
+
+
+def segments_to_lines(
+    segments: Sequence[LongSegment], source: str, lang: str, offset: float,
+    max_compression: float = 2.4,
+) -> list[Line]:
+    """Long-form model segments -> ``Line`` objects in session time (``seq`` still 0).
+
+    Looping segments (hallucinations) and segments without words are dropped.
+    """
+    out: list[Line] = []
+    for seg in segments:
+        text = " ".join(w.text for w in seg.words)
+        if not seg.words or not text.strip(" .,!?-…"):
+            continue
+        if len(text) >= 24 and compression_ratio(text) > max_compression:
+            log.warning("Dropped a looping long-form segment at %.1fs on %s", seg.start, source)
+            continue
+        shifted = [Word(w.start + offset, w.end + offset, w.text) for w in seg.words]
+        for part in split_long_words(shifted):
+            out.append(
+                Line(0, source, part[0].start, part[-1].end, " ".join(w.text for w in part),
+                     lang, part, seg.avg_logprob, redone=True)
+            )
+    return out
+
+
+def nearest_live_seq(line: Line, live: Sequence[Line], reach_s: float = 2.0) -> int:
+    """``seq`` of the live line (same stream) overlapping ``line`` most, else the closest one
+    within ``reach_s``, else 0. Only used to find a label for words no final turn explains."""
+    best, best_key = 0, (-1.0, -np.inf)
+    for other in live:
+        if other.source != line.source:
+            continue
+        ov = min(line.t_end, other.t_end) - max(line.t_start, other.t_start)
+        gap = max(other.t_start - line.t_end, line.t_start - other.t_end, 0.0)
+        if ov <= 0 and gap > reach_s:
+            continue
+        key = (max(ov, 0.0), -gap)
+        if key > best_key:
+            best, best_key = other.seq, key
+    return best
+
+
+def restrict_line(line: Line, kept: Sequence[Word]) -> list[Line]:
+    """``line`` reduced to the ``kept`` words, cut where words were removed in the middle."""
+    own = line.words or []
+    if len(kept) == len(own):
+        return [line]
+    pos = {id(w): i for i, w in enumerate(own)}
+    runs: list[list[Word]] = []
+    for w in kept:
+        if runs and pos[id(w)] == pos[id(runs[-1][-1])] + 1:
+            runs[-1].append(w)
+        else:
+            runs.append([w])
+    return [
+        replace(line, t_start=r[0].start, t_end=r[-1].end, text=" ".join(w.text for w in r),
+                words=r)
+        for r in runs
+    ]
+
+
+@dataclass
+class LongformReport:
+    lines: int = 0
+    words: int = 0
+    echo_dropped: int = 0  # mic words removed by the echo rule
+    fallback: list[str] = field(default_factory=list)  # streams that kept their live lines
+    seconds: float = 0.0
+
+
+def longform_lines(
+    audio: dict[str, np.ndarray],
+    origins: dict[str, float],
+    live: Sequence[Line],
+    transcriber: Any,
+    *,
+    batch_size: int,
+    beam_size: int,
+    max_compression: float = 2.4,
+    echo_enabled: bool = True,
+    progress: Progress | None = None,
+) -> tuple[list[Line], LongformReport]:
+    """Transcribe every kept stream once and return the lines that replace the live ones.
+
+    Streams without kept audio keep their live lines; so does a stream the long-form pass
+    could not transcribe (error) or found no speech in while the live pass did (the live
+    lines are then the better bet). Loopback goes first: its words (with the live loopback
+    lines) tell the echo rule when the remote side was talking.
+    """
+    report = LongformReport()
+    t_begin = time.perf_counter()
+    fn = getattr(transcriber, "transcribe_longform", None)
+    if fn is None:
+        raise FinalizeError(
+            'this ASR backend has no long-form mode; set [post] asr_mode = "selective" or "off"'
+        )
+    live_by: dict[str, list[Line]] = {}
+    for ln in live:
+        live_by.setdefault(ln.source, []).append(ln)
+    result: dict[str, list[Line]] = {}
+    for name in sorted(audio, key=lambda n: (n != "loopback", n)):
+        label = f"transcribing {name} (s)"
+
+        def tick(done: float, total: float, label: str = label) -> None:
+            _say(progress, label, int(done), int(total))
+
+        _say(progress, label, 0, int(len(audio[name]) / SAMPLE_RATE))
+        try:
+            segs, lang = fn(audio[name], batch_size=batch_size, beam_size=beam_size,
+                            progress=tick)
+        except Exception:
+            log.exception("Long-form transcription of %s failed; keeping its live lines", name)
+            report.fallback.append(name)
+            continue
+        new = segments_to_lines(segs, name, lang, origins.get(name, 0.0), max_compression)
+        if not new and live_by.get(name):
+            log.warning("Long-form pass found no speech on %s; keeping its live lines", name)
+            report.fallback.append(name)
+            continue
+        result[name] = new
+    if echo_enabled and {"mic", "loopback"} <= set(audio) and "mic" in result:
+        loop_spans = [(ln.t_start, ln.t_end) for ln in result.get("loopback", [])]
+        loop_spans += [(ln.t_start, ln.t_end) for ln in live_by.get("loopback", [])]
+        live_mic = [(ln.t_start, ln.t_end) for ln in live_by.get("mic", [])]
+        mic: list[Line] = []
+        for ln in result["mic"]:
+            kept, echo = drop_echo_words(ln.words or [], live_mic, loop_spans)
+            report.echo_dropped += len(echo)
+            mic.extend(restrict_line(ln, kept))
+        result["mic"] = mic
+    out: list[Line] = []
+    for name in sorted({ln.source for ln in live} | set(result)):
+        if name in result:
+            for ln in result[name]:
+                out.append(replace(ln, seq=nearest_live_seq(ln, live_by.get(name, []))))
+                report.lines += 1
+                report.words += len(ln.words or [])
+        else:
+            out.extend(live_by.get(name, []))
+    out.sort(key=lambda ln: (ln.t_start, ln.t_end))
+    report.seconds = time.perf_counter() - t_begin
+    return out, report
+
+
 # --------------------------------------------------------------------------- names
 
 
@@ -384,6 +597,8 @@ class FinalizeResult:
     audio_s: float = 0.0
     llm_fix: dict[str, Any] | None = None
     diar_seconds: float = 0.0
+    asr_mode: str = "selective"
+    longform: LongformReport | None = None
 
 
 def load_flac(path: Path) -> np.ndarray:
@@ -427,12 +642,20 @@ def finalize_session(
     *,
     num_speakers: int | None = None,
     full_asr: bool = False,
+    asr_mode: str | None = None,
     deps: Deps | None = None,
     post_edit: Callable[[list[Segment]], tuple[list[Segment], dict[str, Any]]] | None = None,
     progress: Progress | None = None,
 ) -> FinalizeResult:
-    """Run the whole pass for one session and write ``final.*`` (see the module docstring)."""
+    """Run the whole pass for one session and write ``final.*`` (see the module docstring).
+
+    ``asr_mode`` overrides ``[post] asr_mode``. ``full_asr`` only matters in ``selective``
+    mode (every live line is transcribed again); ``longform`` transcribes everything anyway.
+    """
     t_begin = time.perf_counter()
+    mode = asr_mode or cfg.post.asr_mode
+    if mode not in ASR_MODES:
+        raise FinalizeError(f"unknown ASR mode {mode!r}; use one of: {', '.join(ASR_MODES)}")
     session_dir = Path(session_dir)
     deps = deps or Deps()
     if num_speakers is not None and num_speakers < 1:
@@ -485,18 +708,29 @@ def finalize_session(
     diar = replace(diar, turns=shifted)
     names = name_final_clusters(diar, live_names(session_dir, live))
 
-    # 2. ASR repair --------------------------------------------------------------------
+    # 2. ASR ---------------------------------------------------------------------------
     lines = [Line.from_segment(s) for s in live]
     flagged = [
         i for i, ln in enumerate(lines)
-        if ln.source in audio and (ln.t_end - ln.t_start) >= MIN_REASR_S
+        if mode == "selective" and ln.source in audio and (ln.t_end - ln.t_start) >= MIN_REASR_S
         and (full_asr or is_low_confidence(ln, cfg.post.asr_min_logprob,
                                            cfg.post.asr_max_compression))
     ]
     redone = 0
-    if flagged:
+    report: LongformReport | None = None
+    if mode == "longform":
+        transcriber = (deps.transcriber_factory or _default_transcriber(cfg, longform=True))()
+        _load(transcriber, cfg.post.asr_model)
+        lines, report = longform_lines(
+            audio, origins, lines, transcriber,
+            batch_size=cfg.post.longform_batch_size, beam_size=cfg.post.longform_beam_size,
+            max_compression=cfg.post.asr_max_compression, echo_enabled=cfg.echo.enabled,
+            progress=progress,
+        )
+        redone = report.lines
+    elif flagged:
         transcriber = (deps.transcriber_factory or _default_transcriber(cfg))()
-        transcriber.load()
+        _load(transcriber, cfg.post.asr_model)
         for n, i in enumerate(flagged):
             _say(progress, "transcribing", n, len(flagged))
             ln = lines[i]
@@ -570,20 +804,33 @@ def finalize_session(
     speakers = [t for t in speakers if t[2] > 0]
     result = FinalizeResult(
         len(out), len(live), redone, len(flagged), sorted(speakers, key=lambda t: -t[2]),
-        time.perf_counter() - t_begin, audio_s, fix_report, diar_seconds,
+        time.perf_counter() - t_begin, audio_s, fix_report, diar_seconds, mode, report,
     )
     _write_outputs(session_dir, out, names, result, cfg, num_speakers, full_asr)
     return result
 
 
-def _default_transcriber(cfg: Config):
+def _default_transcriber(cfg: Config, *, longform: bool = False):
+    """The ``[post] asr_model`` backend with the ``[asr]`` language and initial prompt."""
+
     def make():
         from steno.asr import create_transcriber
 
-        return create_transcriber(replace(cfg.asr, model=cfg.post.asr_model,
-                                          beam_size=cfg.post.asr_beam_size))
+        beam = cfg.post.longform_beam_size if longform else cfg.post.asr_beam_size
+        return create_transcriber(replace(cfg.asr, model=cfg.post.asr_model, beam_size=beam))
 
     return make
+
+
+def _load(transcriber, model: str) -> None:
+    try:
+        transcriber.load()
+    except Exception as exc:
+        log.exception("Could not load ASR model %s", model)
+        raise FinalizeError(
+            f"could not load the ASR model {model!r} ({type(exc).__name__}: {exc}); "
+            "check [post] asr_model, or use `--asr-mode off`"
+        ) from exc
 
 
 def _transcribe_clip(transcriber, clip: np.ndarray, beam_size: int) -> AsrResult:
@@ -631,10 +878,18 @@ def _write_outputs(
             for sid, name, sec in result.speakers
         ],
         "diarization": "pyannote-segmentation-3.0 + CAM++ + spectral clustering",
-        "asr_model": cfg.post.asr_model,
+        "asr_mode": result.asr_mode,
+        "asr_model": None if result.asr_mode == "off" else cfg.post.asr_model,
         "asr_redone": result.redone,
         "asr_flagged": result.flagged,
-        "full_asr": full_asr,
+        "full_asr": full_asr and result.asr_mode == "selective",
+        "longform": None if result.longform is None else {
+            "lines": result.longform.lines,
+            "words": result.longform.words,
+            "echo_words_dropped": result.longform.echo_dropped,
+            "streams_kept_live": result.longform.fallback,
+            "seconds": round(result.longform.seconds, 1),
+        },
         "num_speakers": num_speakers,
         "llm_fix": result.llm_fix,
         "seconds": round(result.seconds, 1),
