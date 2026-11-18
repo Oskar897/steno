@@ -80,3 +80,28 @@ refine_minor_windows = 4     # clusters this small are reassigned to the nearest
 enroll_window_s = 2.5
 enroll_hop_s = 1.0
 enroll_outlier_sigma = 2.0
+
+[post]
+# `steno finalize`: offline pass over the kept audio (record with --keep-audio) that
+# re-diarizes with pyannote segmentation-3.0 + CAM++ + Steno's clustering, re-transcribes
+# low-confidence lines and writes final.jsonl / final.md next to the live transcript.
+auto = false                 # true: run it when `steno record` stops (Ctrl+C skips it)
+asr_model = "KBLab/kb-whisper-medium"  # re-transcription model; ~30% fewer Swedish word errors than small, ~RTF 1
+asr_beam_size = 5
+asr_min_logprob = -0.7       # live lines below this average log-probability are redone
+asr_max_compression = 2.4    # ... and so are repetitive lines (hallucination loops)
+threads = 4
+seg_step_s = 2.5             # one 10 s segmentation window every 2.5 s (5 s: faster, worse)
+seg_min_clean_s = 1.0        # solo speech a local speaker needs to take part in clustering
+minor_points = 4             # speaker clusters this small are folded into the nearest one
+merge_gap_s = 1.0            # same-speaker lines closer than this are joined
+
+[llm]
+# `steno summary` / `steno todo` / `steno finalize --llm-fix` call the Claude Code CLI
+# (`claude -p`, your own login, no API key here). Only text is sent, never audio.
+command = "claude"
+model = "haiku"              # alias or full model name
+effort = "medium"             # low, medium, high, xhigh, max; "" = CLI default
+language = "sv"              # output language; "auto" = the language of the meeting
+timeout_s = 300
+fix_max_edit = 0.3           # --llm-fix: largest accepted correction (share of the line)

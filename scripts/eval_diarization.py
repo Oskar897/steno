@@ -19,6 +19,11 @@ Systems (``--system a,b``)
                          resolved), with a fake transcriber so it runs fast.
     steno-refine         the same session, then ``steno refine`` (offline
                          agglomerative re-clustering) and its labels overlay.
+    steno-finalize       the diarization half of `steno finalize` on the audio alone:
+                         pyannote segmentation-3.0 windows + CAM++ embeddings per local
+                         speaker, Steno's spectral clustering and overlap-aware stitching
+                         (``steno.diarize``). Speaker count estimated; the ``-oracle``
+                         variant is told the true count. Tune with ``--set post.<key>=...``.
     sherpa-offline       sherpa-onnx OfflineSpeakerDiarization (pyannote
                          segmentation-3.0 + CAM++), speaker count estimated
                          (``--cluster-threshold``, or fixed with ``--num-speakers N``).
@@ -47,14 +52,13 @@ import platform
 import shutil
 import struct
 import sys
-import tarfile
 import tempfile
 import time
 import urllib.request
 import wave
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import numpy as np
 
@@ -71,14 +75,10 @@ AMI_RTTM_URL = (
     "https://raw.githubusercontent.com/pyannote/AMI-diarization-setup/main/"
     "only_words/rttms/test/{id}.rttm"
 )
-SEG_URL = (
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/"
-    "sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+DEFAULT_SYSTEMS = (
+    "steno-live,steno-refine,steno-finalize,steno-finalize-oracle,"
+    "sherpa-offline,sherpa-offline-oracle"
 )
-SEG_DIRNAME = "sherpa-onnx-pyannote-segmentation-3-0"
-SEG_FILES = {"model.onnx", "model.int8.onnx", "LICENSE", "README.md"}
-
-DEFAULT_SYSTEMS = "steno-live,steno-refine,sherpa-offline,sherpa-offline-oracle"
 DEFAULT_MINUTES = 10.0
 
 
@@ -172,35 +172,10 @@ def download_ami(meetings: tuple[str, ...], minutes: float) -> None:
 
 
 def ensure_segmentation_model() -> Path:
-    """pyannote segmentation-3.0 (sherpa-onnx export) in the models dir; returns model.onnx.
+    """pyannote segmentation-3.0 (sherpa-onnx export) in the real models dir (downloaded once)."""
+    from steno import segmentation
 
-    Members are extracted by basename: ``tarfile.extractall(filter="data")`` fails with
-    OutsideDestinationError when the data dir sits under an MSIX-virtualised path.
-    """
-    dest = models_root() / SEG_DIRNAME
-    model = dest / "model.onnx"
-    if model.is_file() and model.stat().st_size > 0:
-        return model
-    dest.mkdir(parents=True, exist_ok=True)
-    print("downloading pyannote segmentation-3.0 model", file=sys.stderr)
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / "seg.tar.bz2"
-        archive.write_bytes(_http_get(SEG_URL))
-        with tarfile.open(archive, "r:bz2") as tar:
-            for member in tar:
-                name = PurePosixPath(member.name).name
-                if not member.isfile() or name not in SEG_FILES:
-                    continue
-                src = tar.extractfile(member)
-                if src is None:
-                    continue
-                part = dest / (name + ".part")
-                with part.open("wb") as fh:
-                    shutil.copyfileobj(src, fh)
-                os.replace(part, dest / name)
-    if not model.is_file():
-        raise EvalError("segmentation archive did not contain model.onnx")
-    return model
+    return segmentation.ensure_model(models_root() / segmentation.SEG_DIRNAME)
 
 
 # --------------------------------------------------------------------------- cases
@@ -280,6 +255,7 @@ class Context:
     cfg: object  # steno.config.Config
     work: Path  # scratch dir for sessions
     live_cache: dict[str, tuple[Path, float]] = field(default_factory=dict)
+    models: dict = field(default_factory=dict)  # loaded segmenter/embedder, reused per case
 
 
 class FakeTranscriber:
@@ -363,6 +339,42 @@ def sys_steno_refine(case: Case, ctx: Context) -> Hypothesis:
     return Hypothesis(_segments_to_turns(copy), seconds, "live + refine")
 
 
+def _finalize_diarization(case: Case, ctx: Context, num_speakers: int | None) -> Hypothesis:
+    from steno.diarize import diarize
+    from steno.finalize import diarize_params
+    from steno.segmentation import PyannoteSegmenter
+    from steno.speakers import create_embedder
+
+    cfg = ctx.cfg
+    if "segmenter" not in ctx.models:  # model loading stays outside the timing
+        embedder = create_embedder(
+            replace(cfg.speakers, num_threads=cfg.post.threads)  # type: ignore[attr-defined]
+        )
+        embedder.load()
+        segmenter = PyannoteSegmenter(ensure_segmentation_model(), cfg.post.threads)  # type: ignore[attr-defined]
+        segmenter.load()
+        ctx.models.update(embedder=embedder, segmenter=segmenter)
+    t0 = time.perf_counter()
+    result = diarize(
+        {"mic": case.audio}, ctx.models["segmenter"], ctx.models["embedder"],
+        cfg.speakers,  # type: ignore[attr-defined]
+        diarize_params(cfg),  # type: ignore[arg-type]
+        num_speakers=num_speakers,
+    )
+    seconds = time.perf_counter() - t0
+    turns = [(a, b, spk) for a, b, spk, _ in result.labelled()]
+    note = f"num_speakers={num_speakers}" if num_speakers else f"{len(result.speaker_ids)} found"
+    return Hypothesis(turns, seconds, note)
+
+
+def sys_steno_finalize(case: Case, ctx: Context) -> Hypothesis:
+    return _finalize_diarization(case, ctx, None)
+
+
+def sys_steno_finalize_oracle(case: Case, ctx: Context) -> Hypothesis:
+    return _finalize_diarization(case, ctx, case.n_ref_speakers)
+
+
 def _sherpa(case: Case, ctx: Context, num_speakers: int) -> Hypothesis:
     import sherpa_onnx
 
@@ -412,6 +424,8 @@ def sys_sherpa_oracle(case: Case, ctx: Context) -> Hypothesis:
 SYSTEMS = {
     "steno-live": sys_steno_live,
     "steno-refine": sys_steno_refine,
+    "steno-finalize": sys_steno_finalize,
+    "steno-finalize-oracle": sys_steno_finalize_oracle,
     "sherpa-offline": sys_sherpa_offline,
     "sherpa-offline-oracle": sys_sherpa_oracle,
 }
@@ -446,8 +460,6 @@ def isolated_data_dir(cfg):
 def apply_overrides(cfg, overrides: list[str]):
     """Apply ``section.key=value`` strings (TOML scalars) on top of a Config."""
     import tomllib
-    from dataclasses import replace
-
     for item in overrides:
         key, sep, raw = item.partition("=")
         section, dot, name = key.strip().partition(".")
@@ -672,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         "settings": settings,
         "steno_speakers_config": asdict(cfg.speakers),
         "steno_vad_config": asdict(cfg.vad),
+        "steno_post_config": asdict(cfg.post),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "results": report,

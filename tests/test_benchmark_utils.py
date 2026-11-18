@@ -131,3 +131,164 @@ def test_models_registry_sane():
     assert bench.SELF_TEST_MODEL in bench.MODELS
     assert bench.MODELS["kb-whisper-small"].languages == ("sv", "auto")
     assert bench.MODELS["whisper-large-v3-turbo"].languages == ("sv",)
+
+
+def test_models_registry_has_new_candidates():
+    for key in ("kb-whisper-medium", "kb-whisper-large", "qwen3-asr-0.6b"):
+        assert key in bench.MODELS
+    assert bench.MODELS["qwen3-asr-0.6b"].kind == "sherpa-qwen3"
+
+
+def test_corpus_error_rates_sums_errors_over_utterances():
+    refs = ["a b c d", "e f"]
+    hyps = ["a b c d", "x"]  # 2 errors (1 sub + 1 del) over 6 reference words
+    wer, cer = bench.corpus_error_rates(refs, hyps)
+    assert wer == pytest.approx(2 / 6)
+    assert 0 < cer < 1
+
+
+def test_corpus_error_rates_empty_hypothesis_and_empty_reference():
+    wer, _ = bench.corpus_error_rates(["a b", "?!"], ["", "x"])
+    assert wer == 1.0  # empty reference dropped, empty hypothesis = all deleted
+    with pytest.raises(ValueError):
+        bench.corpus_error_rates(["?!"], ["x"])
+    with pytest.raises(ValueError):
+        bench.corpus_error_rates(["a"], [])
+
+
+def test_parse_model_arg():
+    assert bench.parse_model_arg("kb-whisper-small") == ("kb-whisper-small", None)
+    assert bench.parse_model_arg(" kb-whisper-small@5 ") == ("kb-whisper-small", 5)
+    assert bench.run_label("m", 5) == "m@5"
+    assert bench.run_label("m", None) == "m"
+    for bad in ("m@", "m@x", "m@0"):
+        with pytest.raises(ValueError):
+            bench.parse_model_arg(bad)
+
+
+_TSV = (
+    "1\ta.wav\tHej där.\thej där\tx\t80000\tMALE\n"  # 5.0 s
+    "2\tb.wav\tHej  där!\thej där\tx\t96000\tFEMALE\n"  # duplicate sentence
+    "3\tc.wav\tEtt annat.\tett annat\tx\t16000\tMALE\n"  # 1 s: too short
+    "4\td.wav\tTredje.\ttredje\tx\t160000\tMALE\n"  # 10 s
+    "bad line\n"
+)
+
+
+def test_parse_fleurs_tsv_skips_malformed_lines():
+    rows = bench.parse_fleurs_tsv(_TSV)
+    assert [r["id"] for r in rows] == ["1", "2", "3", "4"]
+    assert rows[0]["seconds"] == 5.0
+    assert rows[0]["text"] == "Hej där."
+
+
+def test_select_fleurs_rows_dedupes_filters_and_is_reproducible():
+    rows = bench.parse_fleurs_tsv(_TSV)
+    picked = bench.select_fleurs_rows(rows, 10)
+    assert sorted(r["id"] for r in picked) == ["1", "4"]  # dup + too short removed
+    assert picked == bench.select_fleurs_rows(rows, 10)
+    many = [
+        {"id": str(i), "file": f"{i}.wav", "text": f"sentence {i}", "seconds": 8.0}
+        for i in range(50)
+    ]
+    big, small = bench.select_fleurs_rows(many, 20), bench.select_fleurs_rows(many, 10)
+    assert big[:10] == small  # n=10 is a prefix of n=20
+
+
+def test_dominant_language():
+    assert bench.dominant(["sv", "en", "sv", None]) == "sv"
+    assert bench.dominant([None]) is None
+
+
+def test_expand_sets_dataset_mode_forces_language_only_for_whisper():
+    jobs = [{"name": "en", "language": "en", "audio": ["x.wav"], "refs": ["a"]}]
+    whisper = bench.expand_sets(bench.MODELS["kb-whisper-small"], jobs, True)
+    sherpa = bench.expand_sets(bench.MODELS["parakeet-tdt-0.6b-v3"], jobs, True)
+    assert whisper[0]["language"] == "en"
+    assert sherpa[0]["language"] == "auto"
+
+
+def test_expand_sets_single_file_tries_each_language():
+    jobs = [{"name": "file", "language": "auto", "audio": ["x.wav"], "refs": None}]
+    sets = bench.expand_sets(bench.MODELS["kb-whisper-small"], jobs, False)
+    assert [s["name"] for s in sets] == ["sv", "auto"]
+
+
+def test_build_rows_scores_each_set_against_its_references():
+    raw = {
+        "download_s": 0.0,
+        "load_s": 1.0,
+        "runs": [
+            {
+                "set": "sv",
+                "language": "sv",
+                "detected_language": None,
+                "audio_s": 10.0,
+                "transcribe_s": 2.0,
+                "peak_rss_mb": 300.0,
+                "hypotheses": ["hej där", "ett två"],
+            }
+        ],
+    }
+    rows, hyps = bench.build_rows(raw, "m@5", 5, {"sv": ["hej där", "ett tre"]})
+    assert hyps == {"m@5[sv]": ["hej där", "ett två"]}
+    assert rows[0]["rtf"] == pytest.approx(0.2)
+    assert rows[0]["wer"] == pytest.approx(1 / 4)
+    assert rows[0]["beam"] == 5
+
+
+def test_format_dataset_table_combines_sets_per_model():
+    def row(model, set_name, wer, rtf):
+        return {
+            "run": f"{model}[{set_name}]",
+            "model": model,
+            "set": set_name,
+            "wer": wer,
+            "cer": wer / 2,
+            "rtf": rtf,
+            "peak_rss_mb": 800.0,
+            "load_s": 2.0,
+            "error": None,
+        }
+
+    rows = [
+        row("a", "sv", 0.1, 0.3),
+        row("a", "en", 0.5, 0.4),
+        {"run": "b", "model": "b", "error": "boom"},
+    ]
+    table = bench.format_dataset_table(rows)
+    assert "| a | 10.0% | 5.0% | 50.0% | 25.0% | 0.300 | 0.400 | 800 | 2.0 |  |" in table
+    assert "FAILED: boom" in table
+
+
+def test_expand_sets_language_override_only_for_whisper():
+    jobs = [{"name": "en", "language": "en", "audio": ["x.wav"], "refs": ["a"]}]
+    whisper = bench.expand_sets(bench.MODELS["kb-whisper-small"], jobs, True, "auto")
+    sherpa = bench.expand_sets(bench.MODELS["parakeet-tdt-0.6b-v3"], jobs, True, "auto")
+    assert whisper[0]["language"] == "auto"
+    assert whisper[0]["expected_language"] == "en"
+    assert sherpa[0]["language"] == "auto"
+
+
+def test_language_match_share():
+    assert bench.language_match(["en", "sv", "en", "en"], "en") == 0.75
+    assert bench.language_match(None, "en") is None
+    assert bench.language_match(["en"], None) is None
+
+
+def test_format_dataset_table_notes_language_detection():
+    rows = [
+        {
+            "run": "a:auto[en]",
+            "model": "a:auto",
+            "set": "en",
+            "wer": 0.2,
+            "cer": 0.1,
+            "rtf": 0.3,
+            "peak_rss_mb": 800.0,
+            "load_s": 2.0,
+            "language_match": 0.9,
+            "error": None,
+        }
+    ]
+    assert "en language detected correctly in 90%" in bench.format_dataset_table(rows)

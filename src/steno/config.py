@@ -112,12 +112,42 @@ class SpeakersConfig:
 
 
 @dataclass(frozen=True)
+class PostConfig:
+    """`steno finalize`: the offline pass over the kept audio after a meeting."""
+
+    auto: bool = False  # run finalize automatically when `steno record` stops
+    asr_model: str = "KBLab/kb-whisper-medium"  # re-transcription (FLEURS sv WER 6.2 vs 8.9)
+    asr_beam_size: int = 5
+    asr_min_logprob: float = -0.7  # live lines below this average log-probability are redone
+    asr_max_compression: float = 2.4  # ... and lines whose text compresses better than 1/this
+    threads: int = 4  # segmentation and speaker-embedding threads
+    seg_step_s: float = 2.5  # a 10 s segmentation window every this many seconds
+    seg_min_clean_s: float = 1.0  # solo speech a local speaker needs to take part in clustering
+    minor_points: int = 4  # speaker clusters this small are folded into the nearest one
+    merge_gap_s: float = 1.0  # same-speaker lines closer than this are joined in final.jsonl
+
+
+@dataclass(frozen=True)
+class LlmConfig:
+    """Summary / to-do through the Claude Code CLI (text only; audio never leaves)."""
+
+    command: str = "claude"  # the Claude Code executable
+    model: str = "haiku"  # alias or full model name
+    effort: str = "medium"  # low, medium, high, xhigh, max; "" = CLI default
+    language: str = "sv"  # output language; "auto" = the language of the meeting
+    timeout_s: int = 300
+    fix_max_edit: float = 0.3  # `finalize --llm-fix`: largest accepted edit (share of the line)
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     echo: EchoConfig = field(default_factory=EchoConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
+    post: PostConfig = field(default_factory=PostConfig)
+    llm: LlmConfig = field(default_factory=LlmConfig)
 
 
 def repo_root() -> Path | None:

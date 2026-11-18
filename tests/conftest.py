@@ -17,3 +17,17 @@ def steno_data_dir(tmp_path, monkeypatch):
     data = tmp_path / "data"
     monkeypatch.setenv("STENO_DATA_DIR", str(data))
     return data
+
+
+@pytest.fixture(autouse=True)
+def no_claude_cli(monkeypatch):
+    """The real Claude CLI must never run from a test (tests inject a fake runner)."""
+    import subprocess
+
+    from steno import llm
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a test tried to run the real Claude CLI")
+
+    monkeypatch.setattr(llm.subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "run", forbidden)
