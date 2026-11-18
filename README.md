@@ -21,7 +21,7 @@ recognition, built to work alongside [Claude Code](https://claude.com/claude-cod
 2. Speaker recognition: enrol voices, recognise them next time, name unknowns
 3. Post-meeting finalize (better speakers and text), summary and to-do list via Claude
    (small, fast model)
-4. Desktop app UI
+4. Desktop app UI (first version: local web UI, `steno ui`)
 
 ## Development
 
@@ -94,6 +94,25 @@ carry a quote that occurs word for word in the transcript, otherwise they are dr
 `--llm-fix` is off by default: Claude proposes small `{old, new}` corrections that are
 applied only when `old` is in the line and the edit is small. In Claude Code the slash
 commands `/sammanfatta` and `/todo` run these and show the result.
+
+## Desktop-style UI (`steno ui`)
+
+```powershell
+uv run steno ui                # starts a local server and opens your browser
+uv run steno ui --no-browser   # only print the address (add --port N to fix the port)
+```
+
+Record (same sources and config as `steno record`, optional *Keep audio*), watch the live
+transcript, name speakers (optionally saving the voice to a profile), open past sessions, run
+Finalize / Summary / To-do as background jobs, and manage enrolled people. Same data as the CLI:
+it reads and writes the session folders in `%USERPROFILE%\.steno`.
+
+The UI is plain static HTML/CSS/JS in `src/steno/ui/static/` (no build step, no CDN, no web
+fonts) served by a stdlib HTTP server with Server-Sent Events, so it can later be wrapped in a
+desktop shell. It listens on 127.0.0.1 only; the address printed at start carries a random
+per-launch token that every API call must send, and requests with a foreign `Host`/`Origin`
+header are refused. Summary and To-do show what is sent: transcript text only, never audio or
+voiceprints. Press Ctrl+C in the terminal to quit (a running recording is stopped and saved).
 
 ## License
 

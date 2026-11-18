@@ -360,3 +360,13 @@ def test_read_final_roundtrips_words_and_flags(tmp_path):
     with_words = [s for s in final if s.words]
     assert with_words and all(len(w) == 3 for s in with_words for w in s.words)
     assert transcript.read_segments(session)[0].final is None  # the live file has no flag
+
+
+def test_diarize_params_follow_the_post_config_and_zero_disables_the_split_test():
+    from dataclasses import replace
+
+    cfg = Config()
+    p = fz.diarize_params(cfg)
+    assert p.split_cos == cfg.post.split_cos and p.split_min_s == cfg.post.split_min_s
+    off = fz.diarize_params(replace(cfg, post=replace(cfg.post, split_cos=0.0)))
+    assert off.split_cos is None

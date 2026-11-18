@@ -63,6 +63,8 @@ class DiarizeParams:
     minor_points: int = 4  # clusters of at most this many local speakers are reassigned
     min_speech: float = 0.4  # aggregated speech probability a frame needs to get a speaker
     count_bias: float = 0.5  # a 2nd speaker needs summed activity >= 2 - bias (0.5: 1.5)
+    split_cos: float | None = 0.78  # estimate of 1: accept a 2-way split when the centroid cosine
+    split_min_s: float = 20.0  # ... is at most this and the minority has this much solo speech
 
 
 @dataclass
@@ -345,6 +347,9 @@ def resolve(
     # near-duplicates; the p-pruned graph needs neighbours beyond them (2x) or it breaks
     # into chains of consecutive windows and the eigengap counts far too many speakers.
     overlap = NUM_FRAMES / max(stats[0].step_frames, 1)
+    # Seconds of distinct speech behind each embedding: its audio length / the number of windows
+    # that see the same speech.
+    seconds = np.array([e.dur for e in points]) / max(overlap, 1.0)
     labels = cluster_embeddings(
         emb,
         num_speakers=num_speakers,
@@ -354,6 +359,9 @@ def resolve(
         min_spectral=cfg.refine_min_spectral,
         ahc_threshold=cfg.refine_threshold,
         minor_size=params.minor_points,
+        weights=seconds,
+        split_max_cos=params.split_cos,
+        split_min_weight=params.split_min_s,
     )
     n_clusters = int(labels.max()) + 1
     centroids = np.vstack([l2_normalize(emb[labels == c].mean(axis=0)) for c in range(n_clusters)])

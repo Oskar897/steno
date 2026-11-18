@@ -124,6 +124,9 @@ class PostConfig:
     seg_step_s: float = 2.5  # a 10 s segmentation window every this many seconds
     seg_min_clean_s: float = 1.0  # solo speech a local speaker needs to take part in clustering
     minor_points: int = 4  # speaker clusters this small are folded into the nearest one
+    split_cos: float = 0.78  # one speaker estimated: accept a 2-way split when the cluster
+    # centroids' cosine is at most this (0 = never split) ...
+    split_min_s: float = 20.0  # ... and the smaller cluster has this many seconds of solo speech
     merge_gap_s: float = 1.0  # same-speaker lines closer than this are joined in final.jsonl
 
 

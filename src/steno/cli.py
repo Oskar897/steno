@@ -86,6 +86,12 @@ def _build_parser() -> argparse.ArgumentParser:
     who.add_argument("--person", metavar="NAME", help="only this person's tasks")
     who.add_argument("--all", action="store_true", help="everyone's tasks, grouped (default)")
 
+    p = sub.add_parser("ui", help="open the local web UI (record, transcripts, speakers, people)")
+    p.add_argument("--port", type=int, default=0,
+                   help="port on 127.0.0.1 (default: a random free one)")
+    p.add_argument("--no-browser", action="store_true",
+                   help="only print the address, do not open a browser")
+
     p = sub.add_parser("transcribe-file", help="transcribe an audio file into a new session")
     p.add_argument("audio")
     p.add_argument("--source", choices=["mic", "loopback"], default="loopback",
@@ -218,6 +224,12 @@ def cmd_transcribe_file(args: argparse.Namespace, cfg: Config) -> int:
         return 1
     forced = {args.source: args.speaker} if args.speaker else None
     return _run_engine(cfg, [ArraySource(args.source, audio)], forced, finite=True)
+
+
+def cmd_ui(args: argparse.Namespace, cfg: Config) -> int:
+    from steno.ui.server import run_ui
+
+    return run_ui(cfg, port=args.port, open_browser=not args.no_browser)
 
 
 def cmd_new(args: argparse.Namespace) -> int:
@@ -514,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_summary(args, cfg)
         if args.command == "todo":
             return cmd_todo(args, cfg)
+        if args.command == "ui":
+            return cmd_ui(args, cfg)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

@@ -128,7 +128,10 @@ rejected edits, which contain transcript text) and timings. No biometric data.
 How the final labels come about: pyannote segmentation-3.0 finds up to three local speakers
 (two at a time) in every 10 s window; CAM++ embeddings of each local speaker's solo speech are
 clustered with Steno's spectral clustering (speaker count from the eigengap, or
-`--speakers N`); local speakers are linked to the clusters (two that overlap in time never
+`--speakers N`). When the eigengap says one speaker, a 2-way split is still tested: it is
+kept if the smaller cluster has >= `post.split_min_s` seconds of solo speech and the cosine
+between the two centroids is <= `post.split_cos` (one dominant speaker plus a quiet one is
+otherwise counted as one). Local speakers are linked to the clusters (two that overlap in time never
 share one), stitched over the overlapping windows, and the clusters are matched to enrolled
 profiles. Each ASR word goes to the speaker turn it overlaps most. A cluster whose time
 coincides with live lines named by the user (`steno name`) takes that name and keeps it

@@ -400,7 +400,8 @@ def load_flac(path: Path) -> np.ndarray:
 def diarize_params(cfg: Config) -> DiarizeParams:
     p = cfg.post
     return DiarizeParams(
-        step_s=p.seg_step_s, min_clean_s=p.seg_min_clean_s, minor_points=p.minor_points
+        step_s=p.seg_step_s, min_clean_s=p.seg_min_clean_s, minor_points=p.minor_points,
+        split_cos=p.split_cos if p.split_cos > 0 else None, split_min_s=p.split_min_s,
     )
 
 

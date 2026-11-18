@@ -94,6 +94,9 @@ threads = 4
 seg_step_s = 2.5             # one 10 s segmentation window every 2.5 s (5 s: faster, worse)
 seg_min_clean_s = 1.0        # solo speech a local speaker needs to take part in clustering
 minor_points = 4             # speaker clusters this small are folded into the nearest one
+split_cos = 0.78             # clustering found one speaker: still accept a 2-way split when the two
+                             # centroids' cosine is at most this (0 = never) ...
+split_min_s = 20.0           # ... and the smaller cluster has this many seconds of solo speech
 merge_gap_s = 1.0            # same-speaker lines closer than this are joined
 
 [llm]

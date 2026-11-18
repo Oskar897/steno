@@ -10,6 +10,14 @@ Used by ``steno refine``. Follows the recipe of 3D-Speaker for CAM++ embeddings:
 3. *minor clusters* (a few windows only) are not trusted as people: their windows are
    reassigned to the nearest major cluster.
 
+The eigengap cannot tell "one speaker" from "one dominant speaker plus a quiet one with
+short interjections" (a ranking by the gap alone returns 1 for both; NME-SC has the same
+bias). When it returns 1 the *split test* (``accept_split``) therefore tries a 2-way split
+and keeps it only if the minority cluster has enough speech (``split_min_weight``) and its
+centroid is far enough from the majority's (cosine <= ``split_max_cos``). A single
+speaker's embeddings split into halves whose centroids stay close (cosine ~0.85-0.92 on
+AMI far-field speech), two people's do not (<= 0.7 in the cases measured).
+
 With fewer than ``min_spectral`` embeddings the graph is too small to be meaningful and
 average-linkage agglomerative clustering with a similarity threshold is used instead.
 """
@@ -45,6 +53,32 @@ def eigengap_count(eigenvalues: np.ndarray, min_speakers: int, max_speakers: int
         return max(1, min(lo, len(lam)))
     gaps = np.diff(lam[lo - 1 : hi + 1])  # gap after eigenvalue k, k = lo .. hi
     return int(np.argmax(gaps)) + lo
+
+
+def accept_split(
+    x: np.ndarray,
+    labels: np.ndarray,
+    *,
+    weights: np.ndarray | None = None,
+    max_cos: float,
+    min_weight: float,
+) -> bool:
+    """Is a 2-way split of unit rows ``x`` two speakers rather than one speaker's two halves?
+
+    True when the smaller cluster (by total ``weights``, default 1 per row) holds at least
+    ``min_weight`` and the cosine between the two cluster centroids is at most ``max_cos``.
+    """
+    labels = np.asarray(labels)
+    w = np.ones(len(x)) if weights is None else np.asarray(weights, dtype=np.float64)
+    if len(x) < 2 or len(np.unique(labels)) != 2:
+        return False
+    in0 = labels == np.unique(labels)[0]
+    minority = in0 if w[in0].sum() <= w[~in0].sum() else ~in0
+    if w[minority].sum() < min_weight:
+        return False
+    ca, cb = x[minority].mean(axis=0), x[~minority].mean(axis=0)
+    cos = float(ca @ cb / max(np.linalg.norm(ca) * np.linalg.norm(cb), 1e-12))
+    return cos <= max_cos
 
 
 def kmeans(x: np.ndarray, k: int, n_init: int = 10, iters: int = 100, seed: int = 0) -> np.ndarray:
@@ -89,8 +123,15 @@ def spectral_cluster(
     pval: float = 0.012,
     min_pnum: int = 6,
     seed: int = 0,
+    weights: np.ndarray | None = None,
+    split_max_cos: float | None = None,
+    split_min_weight: float = 0.0,
 ) -> tuple[np.ndarray, int]:
-    """Spectral clustering with eigengap speaker-count estimation. Returns ``(labels, k)``."""
+    """Spectral clustering with eigengap speaker-count estimation. Returns ``(labels, k)``.
+
+    With ``split_max_cos`` set, an estimate of 1 is checked by the split test (see the
+    module docstring; ``weights`` are the speech seconds of the rows).
+    """
     x = _unit_rows(emb)
     n = len(x)
     if n == 0:
@@ -107,6 +148,11 @@ def spectral_cluster(
         k = max(1, min(num_speakers, n))
     else:
         k = eigengap_count(vals, min_speakers, min(max_speakers, n - 1))
+    if k == 1 and num_speakers is None and split_max_cos is not None and n >= 4:
+        two = kmeans(vecs[:, :2], 2, seed=seed)
+        if accept_split(x, two, weights=weights, max_cos=split_max_cos,
+                        min_weight=split_min_weight):
+            return two, 2
     if k == 1:
         return np.zeros(n, dtype=int), 1
     return kmeans(vecs[:, :k], k, seed=seed), k
@@ -172,12 +218,17 @@ def cluster_embeddings(
     minor_size: int = 4,
     max_points: int = 2500,
     seed: int = 0,
+    weights: np.ndarray | None = None,
+    split_max_cos: float | None = None,
+    split_min_weight: float = 0.0,
 ) -> np.ndarray:
     """Full offline recipe: spectral (or AHC when few points) + minor-cluster reassignment.
 
     More than ``max_points`` embeddings are clustered on an even subsample and the rest
     joins the nearest centroid (the eigendecomposition is cubic in the point count).
-    Labels are numbered by first appearance.
+    Labels are numbered by first appearance. ``split_max_cos`` / ``split_min_weight`` /
+    ``weights`` enable the single-speaker split test of ``spectral_cluster`` (only used on
+    the spectral path, with an automatic speaker count).
     """
     emb = np.asarray(emb, dtype=np.float32)
     n = len(emb)
@@ -189,6 +240,9 @@ def cluster_embeddings(
     else:
         sub = np.unique(np.linspace(0, n - 1, max_points).astype(int))
     xs = x[sub]
+    ws = None if weights is None else np.asarray(weights, dtype=np.float64)[sub]
+    if ws is not None and len(sub) < n:
+        ws = ws * (n / len(sub))  # the subsample stands for all points
     if len(xs) < min_spectral and num_speakers is None:
         labels = agglomerative_threshold(xs, ahc_threshold)
     elif len(xs) < min_spectral:
@@ -196,7 +250,8 @@ def cluster_embeddings(
     else:
         labels, _ = spectral_cluster(
             xs, num_speakers=num_speakers, max_speakers=max_speakers, pval=pval,
-            min_pnum=min_pnum, seed=seed,
+            min_pnum=min_pnum, seed=seed, weights=ws, split_max_cos=split_max_cos,
+            split_min_weight=split_min_weight,
         )
     labels = reassign_minor(xs, labels, minor_size, keep=num_speakers)
     if len(sub) < n:
