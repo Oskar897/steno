@@ -122,7 +122,7 @@ def test_summary_reports_llm_errors_without_a_traceback(monkeypatch, capsys):
 def test_finalize_without_audio_fails_cleanly(capsys):
     w = make_session()
     w.close()
-    assert cli.main(["finalize"]) == 1
+    assert cli.main(["finalize", "--thorough"]) == 1
     assert "keep-audio" in capsys.readouterr().err
     assert not (w.dir / "final.jsonl").exists()
 

@@ -36,12 +36,16 @@ def default_engine_factory(cfg: Config, keep_audio: bool, mic: bool, loopback: b
     """Same wiring as ``steno record`` (``steno.cli._run_engine``)."""
     from steno.asr import create_transcriber
     from steno.audio import create_capture_sources
+    from steno.refine import create_refine_models
     from steno.speakers import create_embedder
 
     transcriber = create_transcriber(cfg.asr)
     embedder = create_embedder(cfg.speakers) if cfg.speakers.enabled else None
     sources = create_capture_sources(mic=mic, loopback=loopback)
-    return Engine(cfg, transcriber, sources, embedder=embedder, keep_audio=keep_audio)
+    refine = create_refine_models(cfg)
+    return Engine(cfg, transcriber, sources, embedder=embedder, keep_audio=keep_audio,
+                  refine_transcriber=refine.transcriber, refine_fallback=refine.fallback,
+                  refine_diarizer=refine.diarizer)
 
 
 # --------------------------------------------------------------------------- level meter
@@ -117,6 +121,7 @@ class Recorder:
         self.segments = 0
         self._engine: Engine | None = None
         self._unsubscribe: Callable[[], None] | None = None
+        self._unsubscribe_rev: Callable[[], None] | None = None
         self._t0: float | None = None
         self._levels: dict[str, _Level] = {}
         self._stop_thread: threading.Thread | None = None
@@ -185,12 +190,12 @@ class Recorder:
             engine.sources = [_TappedSource(s, self._on_chunk) for s in engine.sources]
             self._engine = engine  # segment callbacks need it from the first line on
             self._unsubscribe = engine.subscribe(self._on_segment)
+            if hasattr(engine, "subscribe_revisions"):
+                self._unsubscribe_rev = engine.subscribe_revisions(self._on_revision)
             session_dir = engine.start()  # loads the models: can take a while
         except Exception as exc:
             log.exception("Could not start recording")
-            if self._unsubscribe is not None:
-                self._unsubscribe()
-                self._unsubscribe = None
+            self._drop_subscriptions()
             with self._lock:
                 self.state = "error"
                 self.error = str(exc).strip() or type(exc).__name__
@@ -225,9 +230,7 @@ class Recorder:
         except Exception as exc:
             log.exception("Error while stopping the recording")
             error = str(exc).strip() or type(exc).__name__
-        if self._unsubscribe is not None:
-            self._unsubscribe()
-            self._unsubscribe = None
+        self._drop_subscriptions()
         session, keep = self.session_id, self.keep_audio
         with self._lock:
             self.state = "error" if error else "idle"
@@ -282,6 +285,19 @@ class Recorder:
         self.segments += 1
         session = engine.session_id if engine is not None else self.session_id
         self._bus.publish("segment", {"session": session, "segment": segment_dict(shown)})
+
+    def _on_revision(self, seg: Segment) -> None:
+        """A refined line: same ``seq``, better text. The page swaps the text in place."""
+        engine = self._engine
+        session = engine.session_id if engine is not None else self.session_id
+        self._bus.publish("revision", {"session": session, "seq": seg.seq, "text": seg.text})
+
+    def _drop_subscriptions(self) -> None:
+        for name in ("_unsubscribe", "_unsubscribe_rev"):
+            fn = getattr(self, name)
+            if fn is not None:
+                fn()
+                setattr(self, name, None)
 
     def _publish_status(self) -> None:
         self._bus.publish("status", {"recorder": self.snapshot()})

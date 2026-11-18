@@ -107,9 +107,10 @@
     </section>
 
     <section class="panel" id="panel-llm" hidden>
-      <h2 class="eyebrow">Summary / To-do</h2>
+      <h2 class="eyebrow">Clean up / Summary / To-do</h2>
       <p class="sent" id="llm-sent"></p>
       <div class="row">
+        <button class="btn" id="btn-clean" type="button">Clean up</button>
         <button class="btn" id="btn-summary" type="button">Summary</button>
         <button class="btn" id="btn-todo" type="button">To-do</button>
       </div>
@@ -118,7 +119,8 @@
         <datalist id="todo-people"></datalist>
         <button class="btn" id="btn-todo-person" type="button">To-do for person</button>
       </div>
-      <p class="note">A per-person to-do replaces the saved to-do list; run "To-do" again for everyone.</p>
+      <p class="note" id="clean-info"></p>
+      <p class="note">Clean up asks Claude for small corrections of misheard words and punctuation in the text and saves them as a separate clean transcript; the original is never changed. Summary and To-do use the clean text when it is up to date. A per-person to-do replaces the saved to-do list; run "To-do" again for everyone.</p>
     </section>
 
     <section class="panel" id="panel-job" hidden>
@@ -136,7 +138,7 @@
 
     <section class="panel" id="panel-info">
       <h2 class="eyebrow">Privacy</h2>
-      <p class="note">Recording, transcription and speaker recognition run on this computer. Only when you press Summary or To-do, the transcript <em>text</em> is sent to Claude. Never audio, never voiceprints.</p>
+      <p class="note">Recording, transcription and speaker recognition run on this computer. Only when you press Clean up, Summary or To-do, the transcript <em>text</em> is sent to Claude. Never audio, never voiceprints.</p>
     </section>
   </aside>
 

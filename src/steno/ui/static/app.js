@@ -275,6 +275,15 @@ function appendSegment(seg) {
   else { S.unseen += 1; renderJump(); }
 }
 
+function reviseSegment(seq, text) {
+  if (!S.open || S.open.view !== "live") return;
+  const seg = S.open.segments.find((x) => x.seq === seq);
+  if (!seg || seg.text === text) return;
+  seg.text = text;
+  const p = document.querySelector(`#transcript .seg[data-seq="${seq}"] p`);
+  if (p) p.textContent = text;
+}
+
 function bumpSpeaker(seg) {
   const list = S.open.speakers;
   let e = list.find((x) => x.id === seg.speaker_id && x.name === seg.speaker);
@@ -444,15 +453,22 @@ async function submitName(ev) {
 function llmNotice() {
   const cfg = S.status.config || {};
   const src = S.open ? S.open.llm_source : "live";
-  return `Sent to Claude (${cfg.llm_model || "claude"}, via your own Claude Code login): only the ${src} transcript text. Never audio, never voice data.`;
+  const clean = S.open ? S.open.clean_source : "live";
+  return `Sent to Claude (${cfg.llm_model || "claude"}, via your own Claude Code login): only transcript text, never audio, never voice data. Clean up sends the ${clean} text; Summary and To-do send the ${src} text.`;
 }
-function renderLlm() { $("llm-sent").textContent = llmNotice(); updateButtons(); }
+function cleanInfo() {
+  const c = S.open && S.open.clean;
+  if (!c) return "";
+  const stale = c.fresh ? "" : " The text has changed since; run Clean up again to use it.";
+  return `Last clean-up (${c.source} text): ${c.applied} of ${c.proposed} edit(s) applied to ${c.changed_lines} line(s), ${c.rejected} rejected.${stale}`;
+}
+function renderLlm() { $("llm-sent").textContent = llmNotice(); $("clean-info").textContent = cleanInfo(); updateButtons(); }
 
 function updateButtons() {
   const busy = !!S.status.job;
   const d = S.open;
   const hint = busy ? "Another job is running" : "";
-  for (const id of ["btn-summary", "btn-todo", "btn-todo-person"]) {
+  for (const id of ["btn-clean", "btn-summary", "btn-todo", "btn-todo-person"]) {
     const b = $(id); b.disabled = busy || !d; b.title = hint;
   }
   const fin = $("fin-run");
@@ -644,6 +660,8 @@ function handleEvent(name, data) {
   } else if (name === "segment") {
     if (data.session === S.openId && !S.loading) appendSegment(data.segment);
     else if (data.session === S.loading) S.buffer.push(data.segment);
+  } else if (name === "revision") {
+    if (data.session === S.openId && !S.loading) reviseSegment(data.seq, data.text);
   } else if (name === "job") {
     onJob(data);
   } else if (name === "names") {
@@ -743,6 +761,7 @@ function init() {
     if (b && S.open && b.dataset.v !== S.open.view) guarded(() => openSession(S.open.id, { view: b.dataset.v }));
   });
   $("fin-run").addEventListener("click", runFinalize);
+  $("btn-clean").addEventListener("click", () => startJob("clean"));
   $("btn-summary").addEventListener("click", () => startJob("summary"));
   $("btn-todo").addEventListener("click", () => startJob("todo"));
   $("btn-todo-person").addEventListener("click", () => {

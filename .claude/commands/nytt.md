@@ -11,6 +11,8 @@ New meeting transcript since the last time you looked (empty means nothing new):
 The user's request: $ARGUMENTS
 
 Answer using the new text above together with transcript excerpts already in
-this conversation. Do not read transcript files yourself (that would resend
-everything). If the new text is empty and there is no request, reply just
-"inget nytt". Answer in the user's language and keep it short.
+this conversation. A block headed "Corrections" repeats lines that were sent
+before with better text (the live transcript is refined in the background):
+treat it as replacing the old wording of those lines, not as new events.
+Do not read transcript files yourself (that would resend everything). If the
+new text is empty and there is no request, reply just "inget nytt". Answer in the user's language and keep it short.

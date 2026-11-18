@@ -48,7 +48,7 @@ def clean_name(value: Any, what: str = "name") -> str:
 
 
 def default_runners(cfg: Config, store_factory: Callable[[], ProfileStore]) -> dict[str, Runner]:
-    """Finalize / summary / to-do exactly as the CLI runs them."""
+    """Finalize / clean-up / summary / to-do exactly as the CLI runs them."""
 
     def run_finalize(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
         from steno import finalize
@@ -60,6 +60,12 @@ def default_runners(cfg: Config, store_factory: Callable[[], ProfileStore]) -> d
         if len(res.speakers) == 1 and params.get("speakers") is None:
             text += " (only one found; set the number of speakers if you know it)"
         return text
+
+    def run_clean(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
+        from steno import clean
+
+        res = clean.clean_session(session_dir, cfg.llm, progress=progress)
+        return f"{clean.summary_line(res.meta)} ({res.meta['source']} text)"
 
     def run_summary(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
         from steno import llm
@@ -76,7 +82,8 @@ def default_runners(cfg: Config, store_factory: Callable[[], ProfileStore]) -> d
             session_dir, cfg.llm, person=params.get("person"))
         return f"{len(items)} to-do item(s) ({kind} transcript), {dropped} dropped without evidence"
 
-    return {"finalize": run_finalize, "summary": run_summary, "todo": run_todo}
+    return {"finalize": run_finalize, "clean": run_clean, "summary": run_summary,
+            "todo": run_todo}
 
 
 class UiApp:
@@ -179,6 +186,7 @@ class UiApp:
                 "sources": info.sources,
                 "recording": info.id == live,
                 "has_final": (d / "final.jsonl").is_file(),
+                "has_clean": (d / "clean.jsonl").is_file(),
                 "has_summary": (d / "summary.md").is_file(),
                 "has_todo": (d / "todo.md").is_file(),
                 "has_audio": any(d.glob("audio-*.flac")),
@@ -186,7 +194,7 @@ class UiApp:
         return {"sessions": out}
 
     def session(self, session_id: str, view: str | None = None) -> dict[str, Any]:
-        from steno import finalize, llm
+        from steno import clean, finalize, llm
 
         d = self._session_dir(session_id)
         info = transcript.load_session_info(d)
@@ -200,8 +208,9 @@ class UiApp:
             segments = finalize.read_final(d)
             kind = "final"
         else:
-            segments = labels.resolve_segments(d, transcript.read_segments(d))
+            segments = labels.resolve_segments(d, transcript.read_best(d))
             kind = "live"
+        clean_info = clean.status(d)
         return {
             "id": info.id,
             "started_at": info.started_at,
@@ -216,8 +225,11 @@ class UiApp:
             "speakers": self._speakers(d, segments, kind),
             "summary": _read_text(d / llm.SUMMARY_NAME),
             "todo": _read_text(d / llm.TODO_MD_NAME),
-            # which transcript the summary / to-do buttons would send (text only)
-            "llm_source": "final" if has_final else "live",
+            # which text the clean-up sends, and which one summary / to-do would send (text only)
+            "clean_source": "final" if has_final else "live",
+            "clean": clean_info,
+            "llm_source": "clean" if clean_info and clean_info["fresh"] else (
+                "final" if has_final else "live"),
         }
 
     @staticmethod

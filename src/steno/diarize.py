@@ -151,6 +151,42 @@ def local_masks(hard: np.ndarray, valid: int) -> list[tuple[int, np.ndarray, np.
     return [(s, h[:, s], h[:, s] & single) for s in range(NUM_LOCAL) if h[:, s].any()]
 
 
+def window_embeddings(
+    k: int,
+    hard: np.ndarray,
+    audio: np.ndarray,
+    base: int,
+    valid: int,
+    params: DiarizeParams,
+    embedder: Embedder,
+) -> list[LocalEmb]:
+    """CAM++ embeddings of the local speakers of segmentation window ``k``.
+
+    ``hard`` is the window's ``(589, 3)`` activity, ``valid`` the number of its frames that lie
+    inside the recording, ``audio`` any array in which the window's frame ``i`` sits at global
+    frame ``base + i`` (the whole stream with ``base = k * step``, or the window's own audio
+    with ``base = 0``). Shared by ``extract_stream`` and the live diarizer.
+    """
+    out: list[LocalEmb] = []
+    for s, active, clean in local_masks(hard, valid):
+        if clean.sum() * FRAME_S >= params.min_clean_s:
+            mask, is_clean = clean, True
+        elif active.sum() * FRAME_S >= params.min_weak_s:
+            mask, is_clean = active, False
+        else:
+            continue
+        wave = frames_audio(audio, base, mask, params.max_embed_s)
+        if len(wave) < params.min_weak_s * SAMPLE_RATE:
+            continue
+        try:
+            vec = embedder.embed(wave)
+        except Exception:
+            log.debug("embedding failed for window %d speaker %d", k, s, exc_info=True)
+            continue
+        out.append(LocalEmb(k, s, vec, len(wave) / SAMPLE_RATE, is_clean))
+    return out
+
+
 def extract_stream(
     stream: str,
     audio: np.ndarray,
@@ -174,22 +210,8 @@ def extract_stream(
         valid = min(NUM_FRAMES, n_frames - base)
         if valid <= 0:
             break
-        for s, active, clean in local_masks(stats.hard[k], valid):
-            if clean.sum() * FRAME_S >= params.min_clean_s:
-                mask, is_clean = clean, True
-            elif active.sum() * FRAME_S >= params.min_weak_s:
-                mask, is_clean = active, False
-            else:
-                continue
-            wave = frames_audio(audio, base, mask, params.max_embed_s)
-            if len(wave) < params.min_weak_s * SAMPLE_RATE:
-                continue
-            try:
-                vec = embedder.embed(wave)
-            except Exception:
-                log.debug("embedding failed for window %d speaker %d", k, s, exc_info=True)
-                continue
-            stats.embs.append(LocalEmb(k, s, vec, len(wave) / SAMPLE_RATE, is_clean))
+        stats.embs.extend(window_embeddings(k, stats.hard[k], audio, base, valid, params,
+                                            embedder))
         if progress is not None:
             progress("embedding", k + 1, stats.n_windows)
     return stats
@@ -393,3 +415,75 @@ def diarize(
         for name, audio in streams.items()
     ]
     return resolve(stats, params, cfg, num_speakers=num_speakers, matcher=matcher)
+
+
+# --------------------------------------------------------------------------- fast path
+
+
+def diarize_windows(
+    streams: Sequence[str],
+    t0: np.ndarray,
+    t1: np.ndarray,
+    emb: np.ndarray,
+    cfg: SpeakersConfig,
+    params: DiarizeParams | None = None,
+    *,
+    num_speakers: int | None = None,
+    matcher: ProfileMatcher | None = None,
+) -> DiarizationResult:
+    """Speaker turns from the live window embeddings (``windows.bin``): the fast path.
+
+    No audio and no segmentation model: the 1.5 s windows the live engine embedded anyway
+    are clustered together (spectral clustering with eigengap speaker count, the 2-way split
+    test and minor-cluster reassignment, as in ``steno refine``), each stream's window labels
+    are median-filtered and cut into turns (``steno.windows``), clusters are matched to the
+    enrolled profiles. Takes seconds whatever the meeting length. Windows exist only where
+    the live VAD found speech, and overlapping speech gets one speaker (a window has one
+    label), so this is as accurate as ``steno refine``, not as ``diarize`` (pyannote).
+    Turn times are session seconds (the windows' own clock).
+    """
+    from steno.windows import cut_turns, median_filter_labels
+
+    params = params or DiarizeParams()
+    n = len(t0)
+    if n == 0:
+        return DiarizationResult([], [], {}, np.zeros((0, 0), dtype=np.float32), 0)
+    emb = np.asarray(emb, dtype=np.float32)
+    hop = max(cfg.window_hop_s, 0.1)
+    labels = cluster_embeddings(
+        emb,
+        num_speakers=num_speakers,
+        max_speakers=cfg.refine_max_speakers,
+        pval=cfg.refine_pval,
+        min_pnum=cfg.refine_min_pnum,
+        min_spectral=cfg.refine_min_spectral,
+        ahc_threshold=cfg.refine_threshold,
+        minor_size=cfg.refine_minor_windows,
+        weights=np.full(n, hop),  # overlapping windows: each stands for one hop of speech
+        split_max_cos=params.split_cos,
+        split_min_weight=params.split_min_s,
+    )
+    k = int(labels.max()) + 1
+    centroids = np.vstack([l2_normalize(emb[labels == c].mean(axis=0)) for c in range(k)])
+    t0, t1 = np.asarray(t0, dtype=np.float64), np.asarray(t1, dtype=np.float64)
+    turns: list[SpeakerTurn] = []
+    for name in dict.fromkeys(streams):
+        idx = np.array([i for i, s in enumerate(streams) if s == name])
+        idx = idx[np.argsort(t0[idx], kind="stable")]
+        # Windows exist only where the live VAD found speech; consecutive windows of one
+        # utterance overlap. A run of overlapping windows is cut into turns on its own, so a
+        # turn never spans the silence between two utterances.
+        run: list[int] = []
+        for i in [*idx, -1]:
+            if run and (i < 0 or t0[i] > t1[run[-1]] + 0.05):
+                spans = [(float(t0[j]), float(t1[j])) for j in run]
+                seq = median_filter_labels([str(int(labels[j])) for j in run], cfg.smooth_windows)
+                for t in cut_turns(spans, seq, spans[-1][1], cfg.min_turn_s):
+                    turns.append(
+                        SpeakerTurn(max(t.t_start, spans[0][0]), t.t_end, int(t.label), name))
+                run = []
+            if i >= 0:
+                run.append(int(i))
+    turns.sort(key=lambda t: (t.t_start, t.cluster))
+    ids, profile_names = name_clusters(turns, centroids, matcher)
+    return DiarizationResult(turns, ids, profile_names, centroids, n)

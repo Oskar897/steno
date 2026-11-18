@@ -250,7 +250,8 @@ def test_summary_uses_the_final_transcript_when_it_exists(tmp_path):
     session = make_session(tmp_path)
     rec = Recorder("## Översikt\nKort.")
     path, kind = llm.summarize(session, CFG, rec)
-    assert kind == "live" and path.read_text(encoding="utf-8") == "## Översikt\nKort.\n"
+    assert kind == "live" and path.read_text(encoding="utf-8") == (
+        "## Översikt\nKort.\n\n_Text used: live transcript (transcript.jsonl)._\n")
     assert "Alice: Jag skickar" in rec.calls[0][1]["input"]
 
     final = [seg(1, 5.0, "Anna (final)", "Slutlig text.")]

@@ -14,7 +14,9 @@ Three features, each with its prompt in ``steno/prompts/*.md``:
 * ``llm_fix`` (``steno finalize --llm-fix``): the model returns diffs ``{id, old, new}``;
   an edit is applied only when ``old`` occurs in that line and the change is small.
 
-The final transcript is used when it exists, else the live one with current speaker names.
+The clean transcript (``steno clean``, see ``steno.clean``) is used when it exists and still
+matches its source, else the final transcript, else the live one with current speaker names;
+``summary.md`` and ``todo.md`` end with a line saying which text was used.
 """
 
 from __future__ import annotations
@@ -123,8 +125,12 @@ def run_claude(
 # --------------------------------------------------------------------------- transcript
 
 
-def load_transcript(session_dir: Path) -> tuple[list[Segment], str]:
-    """Segments for the LLM and which transcript they are (``"final"`` or ``"live"``)."""
+def load_source_transcript(session_dir: Path) -> tuple[list[Segment], str]:
+    """The best text before any clean-up: the final transcript, else the live one.
+
+    Returns ``(segments, "final" | "live")``. This is the single place where the text of
+    a session is chosen (``steno clean`` reads it too).
+    """
     session_dir = Path(session_dir)
     from steno.finalize import has_final, read_final
 
@@ -132,7 +138,27 @@ def load_transcript(session_dir: Path) -> tuple[list[Segment], str]:
         segments = read_final(session_dir)
         if segments:
             return segments, "final"
-    return labels.resolve_segments(session_dir, transcript.read_segments(session_dir)), "live"
+    return labels.resolve_segments(session_dir, transcript.read_best(session_dir)), "live"
+
+
+def load_transcript(session_dir: Path) -> tuple[list[Segment], str]:
+    """Segments for the LLM and which text they are: ``"clean"``, ``"final"`` or ``"live"``.
+
+    ``clean`` (``steno clean``) is used while it still matches the text it was made from.
+    """
+    from steno import clean
+
+    segments, kind = load_source_transcript(session_dir)
+    cleaned = clean.clean_overlay(Path(session_dir), segments) if segments else None
+    return (cleaned, "clean") if cleaned is not None else (segments, kind)
+
+
+TEXT_FILES = {"clean": "clean.jsonl", "final": "final.jsonl", "live": "transcript.jsonl"}
+
+
+def text_note(kind: str) -> str:
+    """The line at the end of ``summary.md`` / ``todo.md`` saying which text was used."""
+    return f"_Text used: {kind} transcript ({TEXT_FILES.get(kind, kind)})._"
 
 
 def render_for_llm(segments: list[Segment]) -> str:
@@ -202,7 +228,7 @@ def summarize(
     if not reply.strip():
         raise LlmError("the model returned an empty summary")
     path = Path(session_dir) / SUMMARY_NAME
-    atomic_write_text(path, reply.strip() + "\n")
+    atomic_write_text(path, f"{reply.strip()}\n\n{text_note(kind)}\n")
     return path, kind
 
 
@@ -279,7 +305,7 @@ def filter_person(items: list[TodoItem], person: str) -> list[TodoItem]:
     return [i for i in items if normalise(i.owner) == want]
 
 
-def render_todo_md(items: list[TodoItem], title: str = "To-do") -> str:
+def render_todo_md(items: list[TodoItem], title: str = "To-do", note: str | None = None) -> str:
     """Markdown grouped by owner (TBD last), each item with due date, confidence and time."""
     by_owner: dict[str, list[TodoItem]] = {}
     for it in sorted(items, key=lambda i: i.t):
@@ -297,6 +323,8 @@ def render_todo_md(items: list[TodoItem], title: str = "To-do") -> str:
             )
             lines.append(f"  > {it.evidence_quote}")
         lines.append("")
+    if note:
+        lines += [note, ""]
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -321,7 +349,7 @@ def extract_todos(
         items = filter_person(items, person)
     session_dir = Path(session_dir)
     title = f"To-do: {person}" if person else "To-do"
-    atomic_write_text(session_dir / TODO_MD_NAME, render_todo_md(items, title))
+    atomic_write_text(session_dir / TODO_MD_NAME, render_todo_md(items, title, text_note(kind)))
     atomic_write_text(
         session_dir / TODO_JSON_NAME,
         json.dumps([i.as_dict() for i in items], indent=2, ensure_ascii=False) + "\n",

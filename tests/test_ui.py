@@ -567,3 +567,34 @@ def test_normalise_level_scale():
     assert normalise_level(1.0) == 1.0
     assert normalise_level(1e-6) == 0.0
     assert 0.45 < normalise_level(0.03) < 0.55  # about -30 dBFS
+
+
+def test_clean_runner_and_session_payload(make_ui, monkeypatch):
+
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    sid = "20260101-100000"
+    _, c = make_ui()
+    d = c.get(f"/api/sessions/{sid}")[1]
+    assert d["clean"] is None and d["clean_source"] == "live" and d["llm_source"] == "live"
+
+    def fake_run(system, text, cfg, runner=None):
+        return json.dumps([{"id": 1, "old": "everyone", "new": "everybody"}])
+
+    monkeypatch.setattr(llm, "run_claude", fake_run)
+    runners = default_runners(Config(), lambda: None)
+    seen = []
+    msg = runners["clean"](writer.dir, {}, lambda *a: seen.append(a))
+    assert "1 of 1 edit(s) applied" in msg and "live text" in msg
+    assert seen and seen[0][0] == "waiting for Claude"
+
+    d = c.get(f"/api/sessions/{sid}")[1]
+    assert d["clean"]["fresh"] and d["clean"]["applied"] == 1 and d["llm_source"] == "clean"
+    assert c.get("/api/sessions")[1]["sessions"][0]["has_clean"]
+    assert [s["text"] for s in d["segments"]][0] == "Hello there everyone"  # view is unchanged
+
+
+def test_clean_is_a_job_kind(make_ui):
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    _, c = make_ui(runners={"clean": lambda d, p, progress: "done"})
+    status, res = c.post(f"/api/sessions/{writer.session_id}/jobs", {"kind": "clean"})
+    assert status == 200 and res["job"]["kind"] == "clean"

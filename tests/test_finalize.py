@@ -21,7 +21,7 @@ from .test_diarize import TRUTH, FakeSegmenter
 
 A, B = 220.0, 330.0
 # The classic per-line repair: these tests predate (and still cover) ``asr_mode = "selective"``.
-SEL = replace(Config(), post=replace(Config().post, asr_mode="selective"))
+SEL = replace(Config(), post=replace(Config().post, asr_mode="selective", diarization="thorough"))
 
 
 def words(*items):

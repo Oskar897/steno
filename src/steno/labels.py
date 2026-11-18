@@ -7,7 +7,7 @@ biometric data, plain text):
 ``speakers.json``  cluster/profile id -> display name
     {"v": 1,
      "clusters": {"S1": {"name": "Alice", "profile_id": "1a2b3c4d"}, "S2": {}},
-     "merged":   {"S3": "S1"},                    # live clusters merged into another
+     "merged":   {"S3": "S1", "S2": "P:1a2b3c4d"},  # clusters merged into another / a person
      "profiles": {"1a2b3c4d": "Alice"}}           # names of recognised/enrolled people
 
 ``labels.json``    refine overlay, seq -> speaker id (preferred over the live label)
@@ -26,7 +26,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from steno.transcript import MARKDOWN_NAME, Segment, atomic_write_text, format_line, read_segments
+from steno.transcript import (
+    MARKDOWN_NAME,
+    Segment,
+    atomic_write_text,
+    format_line,
+    read_best,
+)
 
 SPEAKERS_NAME = "speakers.json"
 OVERLAY_NAME = "labels.json"
@@ -108,12 +114,38 @@ class SessionLabels:
         def mutate(data: dict[str, Any]) -> None:
             clusters = data["clusters"]
             gone = clusters.pop(dead, {})
+            if survivor in data["merged"]:  # survivor already means a profile (bound cluster)
+                data["merged"][dead] = survivor
+                return
             keep = clusters.setdefault(survivor, {})
             if gone.get("name") and not keep.get("name"):
                 keep.update({k: v for k, v in gone.items() if k in ("name", "profile_id")})
             data["merged"][dead] = survivor
 
         self._update(mutate)
+
+    def bind_profile(self, cluster_id: str, profile_id: str, name: str) -> bool:
+        """Record that a live cluster is the enrolled person ``profile_id``.
+
+        Earlier lines of the cluster then resolve to ``P:<profile_id>`` through the merge
+        map (the JSONL is not rewritten). Returns False, changing nothing, when the
+        cluster was already named for somebody else by hand (``steno name``).
+        """
+        target = PROFILE_PREFIX + profile_id
+        done = True
+
+        def mutate(data: dict[str, Any]) -> None:
+            nonlocal done
+            entry = data["clusters"].get(cluster_id) or {}
+            if entry.get("name") and entry.get("profile_id") != profile_id:
+                done = False
+                return
+            data["clusters"].pop(cluster_id, None)
+            data["merged"][cluster_id] = target
+            data["profiles"][profile_id] = name
+
+        self._update(mutate)
+        return done
 
     def set_cluster_name(self, cluster_id: str, name: str, profile_id: str | None) -> None:
         def mutate(data: dict[str, Any]) -> None:
@@ -257,7 +289,7 @@ def resolve_segments(session_dir: Path, segments: list[Segment]) -> list[Segment
 def regenerate_markdown(session_dir: Path) -> bool:
     """Rewrite ``transcript.md`` with current names. False if it is locked (still recording)."""
     session_dir = Path(session_dir)
-    segments = resolve_segments(session_dir, read_segments(session_dir))
+    segments = resolve_segments(session_dir, read_best(session_dir))
     text = "".join(format_line(s) + "\n\n" for s in segments)
     try:
         atomic_write_text(session_dir / MARKDOWN_NAME, text)

@@ -120,6 +120,7 @@ Systems (`--system`, comma-separated):
 |---|---|
 | `steno-live` | Steno's live engine replayed offline: Silero VAD, CAM++ embeddings of 1.5 s windows, speaker turns inside each segment, gated online clustering with merges resolved; the transcriber is a fake (one "x" per 0.25 s) so only speaker turns matter |
 | `steno-refine` | the same session, then `refine_session` (spectral clustering of all windows, eigengap speaker count) and its labels overlay; RTF includes the live run |
+| `steno-fast` | the same live session, then `steno.diarize.diarize_windows`: the window embeddings clustered again, window labels cut into turns. This is what `steno finalize` does by default (`[post] diarization = "fast"`); the RTF includes the live run |
 | `sherpa-offline` | sherpa-onnx offline diarization (pyannote segmentation-3.0 + CAM++), speaker count estimated with `--cluster-threshold` (or fixed with `--num-speakers`) |
 | `sherpa-offline-oracle` | the same, given the true number of speakers |
 
@@ -134,3 +135,38 @@ Output: markdown table per system (one row per file, then mean over files and po
 and a summary table; `<data_dir>/eval/results/<timestamp>.json` holds every number
 plus the settings (and hypothesis RTTMs with `--save-rttm`). Numbers are only
 comparable with the same `--minutes`, `--collar`, `--skip-overlap` and meetings.
+
+## replay_speakers.py
+
+Replays a stored session through the live speaker logic (`SpeakerTracker`) without any audio
+model: the 1.5 s window embeddings of `windows.bin` (or, with `--embed`, computed once from
+`audio-mic.flac`) are fed back segment by segment, with the profiles of `STENO_DATA_DIR`. Prints
+only speaker ids and seconds (no transcript text). Use it on a *copy* of your data dir to tune
+`[speakers] cluster_match_*` and `[profiles]` (`--auto-update` really grows the profile there).
+
+```
+STENO_DATA_DIR=/tmp/copy uv run python scripts/replay_speakers.py 20260101-100000 --timeline
+uv run python scripts/replay_speakers.py <session> --set speakers.cluster_match_threshold=0
+```
+
+## simulate_live.py
+
+A live meeting without people: your own eval recordings (`<data_dir>/eval/codeswitch`, see
+`record_eval.py`) are joined with 1 s gaps and played into the real `Engine` at real-time
+pace, with the live draft model and the rolling refine worker running together.
+
+```
+uv run python scripts/simulate_live.py --refine small            # kb-whisper-small refines
+uv run python scripts/simulate_live.py --refine turbo --repeat 4 # large-v3-turbo, ~11 min meeting
+uv run python scripts/simulate_live.py --refine off              # baseline of the live draft
+```
+
+Prints only numbers (never text): draft WER, refined WER and the WER of `final.jsonl`; the live
+draft latency (median / p90 seconds from the end of an utterance to its draft line; compare with
+`--refine off` to see whether refinement slows the draft); the refine lag of every window
+(seconds from its last line to the revision), decode time per speech second and what happened
+to the lines (refined, unchanged, rejected, no words); system CPU use; and the time from stop
+(end of audio) to the finished transcript (draft drain + tail refine + `steno finalize` with
+the default fast settings). `--set section.key=value` overrides config values
+(`refine.window_speech_s=15`). It runs against a temporary data dir with the models linked in
+(nothing of your sessions or profiles is read) and deletes it afterwards.

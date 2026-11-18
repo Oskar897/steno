@@ -51,6 +51,14 @@ num_threads = 2
 min_embed_s = 1.0            # shorter segments/windows inherit the previous speaker (low confidence)
 accept_threshold = 0.55      # enrolled person: best score must reach this ...
 margin = 0.05                # ... and beat the second-best person by this much
+# A whole live cluster is matched to the enrolled people too (its centroid is far less noisy
+# than a single 1.5 s window: the same voice scores 0.4-0.75 per window against its profile
+# but 0.65-0.8 as a cluster, a different voice 0.45-0.5). A matching cluster is bound to the
+# person for good and its earlier lines follow; 0 turns this off.
+cluster_match_threshold = 0.6   # cluster centroid vs profile score
+cluster_match_margin = 0.1      # ... and ahead of the second-best person by this much
+cluster_match_s = 4.0           # a cluster is only matched after this much speech
+cluster_match_pool = 0.75       # ... and must sound like that person's windows in this session
 
 # Turns inside a segment: a VAD segment is cut into overlapping windows, each window is
 # labelled on its own, and the segment is split where the speaker changes. This is what
@@ -85,12 +93,51 @@ enroll_window_s = 2.5
 enroll_hop_s = 1.0
 enroll_outlier_sigma = 2.0
 
+[profiles]
+# A profile only changes for a person you enrolled or named. With auto_update a finished
+# session adds up to auto_update_max new voice samples (diverse, never near-duplicates; the
+# profile keeps at most 30) of every enrolled person it recognised, so the profile follows
+# your microphone and room. Encrypted like the rest of the profile; false = only `steno enroll`
+# and `steno name` change profiles.
+auto_update = true
+auto_update_min_s = 15.0        # speech recognised as the person needed in the session
+auto_update_min_score = 0.6     # the session's voice must match the profile this well
+auto_update_max = 5
+auto_update_dup = 0.93          # skip samples this similar (cosine) to one already stored
+
+[refine]
+# Rolling refinement while recording. The live draft (one utterance at a time, [asr] model)
+# appears after a few seconds; in the background a second pass transcribes every ~25 s of
+# accumulated speech again as long-form audio (whole sentences, 30 s chunks, own Silero VAD)
+# and replaces the draft text of the covered lines (revisions.jsonl; speakers stay attached).
+# Stopping then only refines the last window, so the finished transcript is ready in seconds.
+enabled = true
+model = "KBLab/kb-whisper-small"   # "deepdml/faster-whisper-large-v3-turbo-ct2": better, ~3-4x slower
+                             # (1.6 GB download on first use; a model folder path also works)
+fallback_model = ""          # used instead while far behind (switches back when caught up); "" = none
+window_speech_s = 25.0       # refine a stream once this much unrefined speech has accumulated
+max_wait_s = 60.0            # ... or once its oldest unrefined line is this old (stream time)
+pad_s = 0.5                  # audio context before the first / after the last line of a window
+threads = 4                  # CPU threads of the refine model (the live model: [asr] cpu_threads)
+beam_size = 1
+batch_size = 2               # 30 s chunks decoded together
+buffer_s = 900.0             # audio kept in memory per stream (16 bit, ~2 MB/min); older is dropped
+max_backlog_windows = 3      # more unrefined speech than this many windows: use fallback_model ...
+skip_after_windows = 6       # ... and beyond this many the oldest windows are skipped (draft stays)
+# Speakers during the meeting: pyannote segmentation-3.0 + CAM++ on every 10 s window that held
+# live speech (diar.bin, encrypted), so that `steno finalize` has the accurate speaker labels
+# ready when you stop. Needs [speakers] enabled; independent of `enabled` above.
+diarize = true
+diarize_threads = 2          # segmentation and speaker-embedding threads of that worker
+
 [post]
-# `steno finalize`: offline pass over the kept audio (record with --keep-audio) that
-# re-diarizes with pyannote segmentation-3.0 + CAM++ + Steno's clustering, transcribes again
-# and writes final.jsonl / final.md next to the live transcript.
+# `steno finalize`: the pass after a meeting; writes final.jsonl / final.md next to the live
+# transcript. By default it takes seconds and needs no kept audio.
 auto = false                 # true: run it when `steno record` stops (Ctrl+C skips it)
-# Re-transcription:
+# Text:
+#   "refined"   the text the rolling refine worker wrote during the meeting ([refine]); no new
+#               ASR. A session without revisions (older, or [refine] off) falls back to
+#               "longform" when it has kept audio, else keeps the draft.
 #   "longform"  each kept stream once as a whole with asr_model (own Silero VAD, batched 30 s
 #               windows, [asr] language and initial_prompt); the words replace the live text
 #               and go to the final speaker turns. Mic words that are only the remote side
@@ -98,8 +145,14 @@ auto = false                 # true: run it when `steno record` stops (Ctrl+C sk
 #   "selective" only live lines with low confidence, one clip at a time (--full-asr: all).
 #               Per-clip decoding pads every clip to 30 s, so use a smaller asr_model here,
 #               e.g. "KBLab/kb-whisper-medium".
-#   "off"       keep the live words.
-asr_mode = "longform"
+#   "off"       keep the live draft words.
+asr_mode = "refined"
+# Speakers:
+#   "fast"      spectral clustering of the live window embeddings (windows.bin): seconds, no
+#               audio needed, accuracy of `steno refine` (AMI far-field: DER ~30 %).
+#   "thorough"  pyannote segmentation-3.0 + CAM++ over the kept audio (AMI: DER ~18 %,
+#               ~0.1 x the audio length). `steno finalize --thorough`.
+diarization = "fast"
 asr_model = "deepdml/faster-whisper-large-v3-turbo-ct2"  # ~1.6 GB; on a 166 s Swedish+English test: WER 19 % vs 22 % (kb-whisper-small), English terms 77 % vs 49 %
 asr_beam_size = 5            # selective mode
 longform_beam_size = 1
@@ -116,11 +169,11 @@ split_min_s = 20.0           # ... and the smaller cluster has this many seconds
 merge_gap_s = 1.0            # same-speaker lines closer than this are joined
 
 [llm]
-# `steno summary` / `steno todo` / `steno finalize --llm-fix` call the Claude Code CLI
+# `steno summary` / `steno todo` / `steno clean` / `steno finalize --llm-fix` call the Claude Code CLI
 # (`claude -p`, your own login, no API key here). Only text is sent, never audio.
 command = "claude"
 model = "haiku"              # alias or full model name
 effort = "medium"             # low, medium, high, xhigh, max; "" = CLI default
 language = "sv"              # output language; "auto" = the language of the meeting
 timeout_s = 300
-fix_max_edit = 0.3           # --llm-fix: largest accepted correction (share of the line)
+fix_max_edit = 0.3           # --llm-fix and `steno clean`: largest accepted correction (share of the line)

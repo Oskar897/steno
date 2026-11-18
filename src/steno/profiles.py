@@ -65,6 +65,49 @@ def prune_redundant(emb: np.ndarray, tags: list[str], limit: int) -> tuple[np.nd
     return emb[keep], [tags[k] for k in keep]
 
 
+def select_growth(
+    existing: np.ndarray,
+    pool: np.ndarray,
+    *,
+    min_score: float = 0.6,
+    max_new: int = 5,
+    dup: float = 0.93,
+) -> np.ndarray:
+    """Pick up to ``max_new`` embeddings of ``pool`` that add something to ``existing``.
+
+    ``pool`` holds the windows a session recognised as the person. Their mean (the
+    session's voice) must itself resemble the profile (cosine of the unit mean to the
+    profile centroid or to its top-3 embeddings >= ``min_score``), otherwise nothing is
+    added. Only windows close to that mean are candidates (no coughs, no neighbours'
+    voices); then the ones *least* similar to what the profile and the earlier picks
+    already hold are taken first (farthest-first), and a candidate within ``dup`` cosine of
+    an existing embedding is never added. Returns an ``(k, dim)`` array, ``k`` may be 0.
+    """
+    empty = np.zeros((0, existing.shape[1] if existing.ndim == 2 else 0), dtype=np.float32)
+    if len(pool) == 0 or len(existing) == 0 or max_new <= 0:
+        return empty
+    base = _normalise_rows(existing)
+    pool = _normalise_rows(pool)
+    mean = pool.mean(axis=0)
+    mean /= max(float(np.linalg.norm(mean)), 1e-12)
+    centroid = base.mean(axis=0)
+    centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
+    top = np.sort(base @ mean)[-3:].mean()
+    if max(float(centroid @ mean), float(top)) < min_score:
+        return empty
+    cand = pool[pool @ mean >= min_score]
+    chosen: list[np.ndarray] = []
+    while len(chosen) < max_new and len(cand):
+        held = np.vstack([base] + chosen) if chosen else base
+        nearest = (cand @ held.T).max(axis=1)
+        i = int(np.argmin(nearest))
+        if nearest[i] >= dup:
+            break
+        chosen.append(cand[i : i + 1])
+        cand = np.delete(cand, i, axis=0)
+    return np.vstack(chosen).astype(np.float32) if chosen else empty
+
+
 # --------------------------------------------------------------------------- profiles
 
 
@@ -196,6 +239,35 @@ class ProfileStore:
             profile.updated = now_iso()
             self._save(profile)
             return profile
+
+    def grow(
+        self,
+        profile_id: str,
+        pool: np.ndarray,
+        tag: str = "",
+        *,
+        min_score: float = 0.6,
+        max_new: int = 5,
+        dup: float = 0.93,
+    ) -> int:
+        """Add the diverse, confident part of ``pool`` to an existing profile (see
+        ``select_growth``). Returns how many embeddings were added; the profile is only
+        rewritten when that is more than zero."""
+        with self._lock:
+            profile = self.get(profile_id)
+            if profile is None:
+                return 0
+            new = select_growth(
+                profile.embeddings, pool, min_score=min_score, max_new=max_new, dup=dup
+            )
+            if not len(new):
+                return 0
+            emb = np.vstack([profile.embeddings, new])
+            tags = profile.tags + [tag] * len(new)
+            profile.embeddings, profile.tags = prune_redundant(emb, tags, MAX_EMBEDDINGS)
+            profile.updated = now_iso()
+            self._save(profile)
+            return len(new)
 
     def rename(self, old: str, new: str) -> Profile:
         new = new.strip()

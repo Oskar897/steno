@@ -30,6 +30,8 @@ from .synth import FakeEmbedder, silence, timeline
 from .test_diarize import FakeSegmenter
 from .test_finalize import SEL, A, B, FakeTranscriber, deps, make_session
 
+LONG = replace(Config(), post=replace(Config().post, asr_mode="longform", diarization="thorough"))
+
 
 def W(*items):
     return [Word(a, b, t) for a, b, t in items]
@@ -255,9 +257,9 @@ def lf_script():
     ]
 
 
-def test_longform_is_the_default_mode_and_a_new_model_is_configured():
+def test_refined_and_fast_are_the_defaults_and_a_longform_model_is_configured():
     cfg = Config()
-    assert cfg.post.asr_mode == "longform"
+    assert cfg.post.asr_mode == "refined" and cfg.post.diarization == "fast"
     assert cfg.post.asr_model == "deepdml/faster-whisper-large-v3-turbo-ct2"
     assert cfg.post.longform_beam_size == 1 and cfg.post.longform_batch_size == 4
 
@@ -267,7 +269,7 @@ def test_finalize_longform_replaces_live_text_and_assigns_words_to_turns(tmp_pat
     fake = FakeLongform(lf_script())
     seen = []
     before = (session / "transcript.jsonl").read_bytes()
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=deps(fake),
+    res = fz.finalize_session(session, LONG, ProfileStore(), deps=deps(fake),
                               progress=lambda *a: seen.append(a))
     assert (session / "transcript.jsonl").read_bytes() == before
     assert res.asr_mode == "longform" and res.longform is not None
@@ -298,7 +300,7 @@ def test_finalize_longform_replaces_live_text_and_assigns_words_to_turns(tmp_pat
 def test_full_asr_does_not_trigger_the_per_line_pass_in_longform(tmp_path):
     session = make_session(tmp_path)
     fake = FakeLongform(lf_script())
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=deps(fake), full_asr=True)
+    res = fz.finalize_session(session, LONG, ProfileStore(), deps=deps(fake), full_asr=True)
     assert res.flagged == 0 and len(fake.calls) == 1
 
 
@@ -338,7 +340,7 @@ def test_a_model_that_cannot_load_fails_cleanly_without_writing(tmp_path):
             raise OSError("download failed")
 
     with pytest.raises(fz.FinalizeError, match="could not load"):
-        fz.finalize_session(session, Config(), ProfileStore(), deps=deps(NoModel([])))
+        fz.finalize_session(session, LONG, ProfileStore(), deps=deps(NoModel([])))
     assert not fz.has_final(session)
 
 
@@ -372,14 +374,14 @@ def test_finalize_does_not_bring_dropped_mic_echo_back(tmp_path):
         0: [seg(2.0, 6.0, "remote", "words", "here")],
         1: [seg(2.2, 5.8, "remote", "words", "here"), seg(10.0, 12.0, "my", "answer")],
     })
-    res = fz.finalize_session(session, Config(), ProfileStore(), deps=d)
+    res = fz.finalize_session(session, LONG, ProfileStore(), deps=d)
     final = fz.read_final(session)
     assert [(s.source, s.text) for s in final] == [
         ("loopback", "remote words here"), ("mic", "my answer")]
     assert res.longform.echo_dropped == 3
 
     # with the rule off (or in a session without [echo]) the duplicate would be there
-    cfg = replace(Config(), echo=replace(Config().echo, enabled=False))
+    cfg = replace(LONG, echo=replace(LONG.echo, enabled=False))
     fz.finalize_session(session, cfg, ProfileStore(), deps=d)
     assert [s.text for s in fz.read_final(session) if s.source == "mic"][0].startswith("remote")
 

@@ -34,7 +34,9 @@ DEFAULT_INITIAL_PROMPT = (
 )
 
 #: ``[post] asr_mode`` values, see ``PostConfig``.
-ASR_MODES = ("longform", "selective", "off")
+ASR_MODES = ("refined", "longform", "selective", "off")
+#: ``[post] diarization`` values, see ``PostConfig``.
+DIARIZATION_MODES = ("fast", "thorough")
 
 
 class ConfigError(ValueError):
@@ -98,6 +100,13 @@ class SpeakersConfig:
     min_embed_s: float = 1.0  # shorter segments/windows inherit the previous speaker (conf 0)
     accept_threshold: float = 0.55  # profile match: best score must reach this ...
     margin: float = 0.05  # ... and beat the second-best person by this much
+    # Live recognition of an enrolled person is made stable by matching whole session
+    # clusters to the profiles: a centroid is far less noisy than one 1.5 s window. A
+    # matching cluster is bound to the person for good (earlier lines follow).
+    cluster_match_threshold: float = 0.6  # cluster centroid vs profile score; 0 = off
+    cluster_match_margin: float = 0.1  # ... and ahead of the second-best person by this much
+    cluster_match_s: float = 4.0  # a cluster is only matched after this much speech
+    cluster_match_pool: float = 0.75  # ... and must sound like the person's windows this session
     # Sub-segment turns: a VAD segment is cut into overlapping windows, each is labelled
     # on its own, and the segment is split where the label changes.
     window_s: float = 1.5  # embedding window length; 0 = one embedding per segment (old way)
@@ -127,14 +136,56 @@ class SpeakersConfig:
 
 
 @dataclass(frozen=True)
+class ProfilesConfig:
+    """Voice profiles. A profile only ever changes for a person who was enrolled or named
+    by you; ``auto_update`` lets a finished session add a few new voice samples to the
+    profile that was recognised in it (encrypted like the rest of the profile)."""
+
+    auto_update: bool = True
+    auto_update_min_s: float = 15.0  # speech recognised as the person needed in the session
+    auto_update_min_score: float = 0.6  # the session's voice must match the profile this well
+    auto_update_max: int = 5  # at most this many new embeddings per session and person
+    auto_update_dup: float = 0.93  # skip samples this similar to one the profile already has
+
+
+@dataclass(frozen=True)
+class RefineConfig:
+    """Rolling refinement while recording: stretches of speech are transcribed again with more
+    context in the background and replace the live draft text (``revisions.jsonl``)."""
+
+    enabled: bool = True
+    model: str = "KBLab/kb-whisper-small"  # "deepdml/faster-whisper-large-v3-turbo-ct2" is better
+    # Model used instead while the worker is far behind ("" = none; switching back when it
+    # has caught up). Only worth setting for a model slower than about 0.3 x real time.
+    fallback_model: str = ""
+    window_speech_s: float = 25.0  # refine a stream once this much unrefined speech is there
+    max_wait_s: float = 60.0  # ... or once its oldest unrefined line is this old (stream time)
+    pad_s: float = 0.5  # audio context before the first and after the last line of a window
+    threads: int = 4  # CPU threads of the refine model (the live model has [asr] cpu_threads)
+    beam_size: int = 1
+    batch_size: int = 2  # 30 s chunks decoded together
+    buffer_s: float = 900.0  # audio kept in memory per stream (16 bit); older audio is dropped
+    max_backlog_windows: int = 3  # more unrefined speech than this many windows: degrade
+    skip_after_windows: int = 6  # ... and the oldest windows are skipped beyond this many
+    # Incremental speaker diarization (pyannote segmentation per 10 s window that held speech,
+    # while recording) so that `steno finalize` has it ready; independent of `enabled`.
+    diarize: bool = True
+    diarize_threads: int = 2  # segmentation and speaker-embedding threads of that worker
+
+
+@dataclass(frozen=True)
 class PostConfig:
     """`steno finalize`: the offline pass over the kept audio after a meeting."""
 
     auto: bool = False  # run finalize automatically when `steno record` stops
-    # Re-transcription: "longform" = each kept stream is transcribed once as a whole and the
-    # words are assigned to the final turns; "selective" = only low-confidence live lines are
-    # transcribed again, one by one; "off" = keep the live words.
-    asr_mode: str = "longform"
+    # Text: "refined" = the text the rolling refine worker wrote during the meeting (no new ASR,
+    # no kept audio needed); "longform" = each kept stream is transcribed once as a whole and
+    # the words are assigned to the final turns; "selective" = only low-confidence live lines
+    # are transcribed again, one by one; "off" = keep the live draft words.
+    asr_mode: str = "refined"
+    # Speakers: "fast" = cluster the live window embeddings (windows.bin, no audio needed,
+    # seconds); "thorough" = pyannote segmentation over the kept audio (slower, more accurate).
+    diarization: str = "fast"
     # Model of the re-transcription. Whole-recording decoding (longform) is where a large
     # model is affordable; per-line decoding ("selective") pads every clip to 30 s, so pick a
     # smaller model for it (e.g. KBLab/kb-whisper-medium).
@@ -173,6 +224,8 @@ class Config:
     vad: VadConfig = field(default_factory=VadConfig)
     echo: EchoConfig = field(default_factory=EchoConfig)
     speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
+    profiles: ProfilesConfig = field(default_factory=ProfilesConfig)
+    refine: RefineConfig = field(default_factory=RefineConfig)
     post: PostConfig = field(default_factory=PostConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
 
@@ -236,6 +289,16 @@ def config_from_dict(data: dict[str, Any]) -> Config:
         raise ConfigError(
             f"[post] asr_mode: expected one of {', '.join(ASR_MODES)}, got {cfg.post.asr_mode!r}"
         )
+    if cfg.post.diarization not in DIARIZATION_MODES:
+        raise ConfigError(
+            f"[post] diarization: expected one of {', '.join(DIARIZATION_MODES)}, "
+            f"got {cfg.post.diarization!r}"
+        )
+    r = cfg.refine
+    if r.window_speech_s <= 0 or r.batch_size < 1 or r.beam_size < 1 or r.threads < 1:
+        raise ConfigError("[refine] window_speech_s, batch_size, beam_size, threads must be > 0")
+    if r.max_backlog_windows < 1 or r.skip_after_windows < r.max_backlog_windows:
+        raise ConfigError("[refine] need 1 <= max_backlog_windows <= skip_after_windows")
     if cfg.post.longform_batch_size < 1 or cfg.post.longform_beam_size < 1:
         raise ConfigError("[post] longform_batch_size and longform_beam_size must be at least 1")
     return cfg

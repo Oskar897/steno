@@ -149,6 +149,11 @@ def name_cluster(
         raise OpsError("name must not be empty")
     session_labels = lab.SessionLabels(session_dir)
     cluster = session_labels.resolve_root(cluster)
+    if cluster.startswith(lab.PROFILE_PREFIX):  # live recognition bound it to an enrolled person
+        raise OpsError(
+            f"{spec} was recognised as {session_labels.display_name(cluster)!r} (an enrolled "
+            "voice profile); there is nothing to name. Rename the person with `steno rename`."
+        )
 
     segments = transcript.read_segments(session_dir)
     emb = SessionEmbeddings.load(session_dir)

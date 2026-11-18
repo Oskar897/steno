@@ -15,12 +15,18 @@ Pipeline for one finished VAD segment (see ``SpeakerTracker.identify_turns``):
    ``confirm_s`` seconds of speech from ``confirm_segments`` segments, otherwise it is
    merged into the nearest confirmed cluster (when it expires and at the end of the
    session; the merge lives in the label layer, the JSONL is never rewritten).
+   A cluster with enough speech whose *centroid* matches an enrolled person
+   (``cluster_match_*``; a centroid is much less noisy than a window) is bound to that
+   person: its earlier lines resolve to the profile through the label layer, and later
+   windows that land in it are labelled with the profile directly.
 4. The segment is cut into turns where the label changes (``steno.windows``); the
    engine splits the ASR words between the turns.
 
 ``identify`` is the older whole-segment path (one embedding, one label) that remains
-available with ``window_s = 0``. The tracker never enrols anyone; profiles change only
-through explicit commands. All thresholds are uncalibrated defaults (see ``[speakers]``).
+available with ``window_s = 0``. The tracker never enrols anyone; a profile only grows
+(``[profiles] auto_update``, see ``ProfileStore.grow``) when the session recognised that
+enrolled person, and only after the session ends. All thresholds are uncalibrated
+defaults (see ``[speakers]``).
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ from typing import Protocol
 import numpy as np
 
 from steno import paths
-from steno.config import SpeakersConfig
+from steno.config import ProfilesConfig, SpeakersConfig
 from steno.labels import PROFILE_PREFIX, UNKNOWN_ID, UNKNOWN_NAME, SessionLabels
 from steno.profiles import Profile, ProfileStore, SessionEmbeddings, SessionWindows
 from steno.windows import (
@@ -59,6 +65,7 @@ MODEL_URL_BASE = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/"
 )
 TOP_K = 3
+POOL_MIN_WINDOWS = 6  # accepted windows a person needs before they vouch for a cluster
 INHERIT_CONF = 0.0
 
 
@@ -475,6 +482,18 @@ class TurnLabel:
 NEW = "?"  # window label: dissimilar to every known speaker, still to be placed
 
 
+@dataclass
+class _Pool:
+    """Window embeddings (and their speech) of one speaker, kept to grow a profile."""
+
+    embs: list[np.ndarray]
+    seconds: float = 0.0
+
+    def add(self, emb: np.ndarray, seconds: float) -> None:
+        self.embs.append(emb)
+        self.seconds += seconds
+
+
 class SpeakerTracker:
     """Live speaker identification for one session. Not thread-safe: use from one thread."""
 
@@ -489,9 +508,11 @@ class SpeakerTracker:
         *,
         reload_interval_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
+        profiles_cfg: ProfilesConfig | None = None,
     ):
         self.embedder = embedder
         self.cfg = cfg
+        self.profiles_cfg = profiles_cfg
         self.store = store
         self.labels = labels
         self.embeddings = embeddings
@@ -512,6 +533,11 @@ class SpeakerTracker:
         self._next_reload = 0.0
         self._signature: object = None
         self._matcher = ProfileMatcher([], cfg.accept_threshold, cfg.margin)
+        self._cluster_matcher = ProfileMatcher(
+            [], cfg.cluster_match_threshold, cfg.cluster_match_margin
+        )
+        self._bound: dict[str, tuple[str, str]] = {}  # cluster id -> (profile id, name)
+        self._pools: dict[str, _Pool] = {}  # cluster id or "P:<id>" -> its windows
         self._maybe_reload(force=True)
 
     # -- profiles ------------------------------------------------------------------
@@ -534,6 +560,9 @@ class SpeakerTracker:
             log.exception("Could not load voice profiles")
             return
         self._matcher = ProfileMatcher(profiles, self.cfg.accept_threshold, self.cfg.margin)
+        self._cluster_matcher = ProfileMatcher(
+            profiles, self.cfg.cluster_match_threshold, self.cfg.cluster_match_margin
+        )
 
     # -- naming --------------------------------------------------------------------
 
@@ -547,21 +576,88 @@ class SpeakerTracker:
         prev = self._last.get(stream)
         if prev is None:
             return SpeakerLabel(UNKNOWN_ID, UNKNOWN_NAME, INHERIT_CONF, True)
-        prev = self.clusterer.resolve(prev)
+        prev = self._canon(prev) or prev
         self._last[stream] = prev
         return SpeakerLabel(prev, self._name_for(prev), INHERIT_CONF, True)
+
+    def _canon(self, speaker_id: str | None) -> str | None:
+        """Current id of a speaker: merges followed, a cluster bound to a person -> ``P:<id>``."""
+        if speaker_id is None or speaker_id.startswith(PROFILE_PREFIX):
+            return speaker_id
+        cid = self.clusterer.resolve(speaker_id)
+        bound = self._bound.get(cid)
+        return PROFILE_PREFIX + bound[0] if bound is not None else cid
+
+    def _pool_move(self, src: str, dst: str) -> None:
+        pool = self._pools.pop(src, None)
+        if pool is None:
+            return
+        target = self._pools.setdefault(dst, _Pool([]))
+        target.embs.extend(pool.embs)
+        target.seconds += pool.seconds
 
     def _sync_labels(self) -> None:
         """Mirror cluster creation and merges into ``speakers.json``."""
         merges = self.clusterer.pop_merges()
+        for dead, survivor in merges:
+            self._pool_move(dead, survivor)
+            moved = self._bound.pop(dead, None)
+            adopt = moved is not None and survivor not in self._bound
+            if adopt:
+                self._bound[survivor] = moved
+            if self.labels is not None:
+                self.labels.merge(dead, survivor)
+                if adopt:
+                    self.labels.bind_profile(survivor, *moved)
         if self.labels is None:
             return
         for cid in self.clusterer.cluster_ids:
             if cid not in self._announced:
                 self.labels.ensure_cluster(cid)
                 self._announced.add(cid)
-        for dead, survivor in merges:
-            self.labels.merge(dead, survivor)
+
+    def _fits_session_voice(self, key: str, centroid: np.ndarray) -> bool:
+        """Second opinion for a cluster/profile match, measured in this session's own sound.
+
+        The windows already accepted for the person (their pool) say how that voice sounds
+        on this microphone today; a cluster that is the same person is close to their
+        mean (0.9 in practice), a different voice that merely resembles the enrolment
+        is not (0.6). Without enough pool windows there is nothing to compare with.
+        """
+        need = self.cfg.cluster_match_pool
+        pool = self._pools.get(key)
+        if need <= 0 or pool is None or len(pool.embs) < POOL_MIN_WINDOWS:
+            return True
+        mean = l2_normalize(np.mean(pool.embs, axis=0))
+        return float(mean @ centroid) >= need
+
+    def _bind_clusters(self) -> None:
+        """Bind session clusters whose centroid clearly matches an enrolled person.
+
+        One 1.5 s window is a noisy sample (the same voice scores 0.4-0.75 against its
+        own profile); a cluster centroid averages that noise away. A match is therefore
+        accepted at ``cluster_match_threshold`` once the cluster holds ``cluster_match_s``
+        seconds of speech, and the cluster means the person from then on, including its
+        earlier lines (label layer).
+        """
+        cfg = self.cfg
+        if cfg.cluster_match_threshold <= 0 or not self._cluster_matcher.profiles:
+            return
+        for cid in self.clusterer.cluster_ids:
+            if cid in self._bound or self.clusterer.speech_s(cid) < cfg.cluster_match_s:
+                continue
+            centroid = self.clusterer.centroid(cid)
+            match = self._cluster_matcher.match(centroid)
+            if not match.accepted or match.profile is None:
+                continue
+            pid, name = match.profile.id, match.profile.name
+            if not self._fits_session_voice(PROFILE_PREFIX + pid, centroid):
+                continue
+            if self.labels is not None and not self.labels.bind_profile(cid, pid, name):
+                continue  # named for somebody else by hand
+            self._bound[cid] = (pid, name)
+            self._pool_move(cid, PROFILE_PREFIX + pid)
+            log.info("Speaker cluster %s matched enrolled profile %s (%.2f)", cid, pid, match.score)
 
     def _profile_label(self, match: Match) -> SpeakerLabel:
         assert match.profile is not None
@@ -590,9 +686,11 @@ class SpeakerTracker:
         segment = self.clusterer.begin_segment()
         cid, score = self.clusterer.observe(emb, len(audio) / SAMPLE_RATE, segment)
         self._sync_labels()
-        cid = self.clusterer.resolve(cid)
+        self._bind_clusters()
+        cid = self._canon(cid) or cid
         self._last[stream] = cid
-        return SpeakerLabel(cid, self._name_for(cid), score, True, emb)
+        provisional = not cid.startswith(PROFILE_PREFIX)
+        return SpeakerLabel(cid, self._name_for(cid), score, provisional, emb)
 
     # -- turns ---------------------------------------------------------------------
 
@@ -631,18 +729,29 @@ class SpeakerTracker:
         raw: list[str] = []
         matches: list[Match | None] = []
         profile_labels: dict[str, SpeakerLabel] = {}
+        keys: list[str] = []  # raw labels with clusters bound to a person shown as that person
         for emb in embs:
             match = self._matcher.match(emb)
             if match.accepted and match.profile is not None:
                 sid = PROFILE_PREFIX + match.profile.id
                 raw.append(sid)
+                keys.append(sid)
                 matches.append(match)
                 profile_labels.setdefault(sid, self._profile_label(match))
                 continue
             matches.append(None)
             cid, sim = self.clusterer.nearest(emb)
-            raw.append(cid if cid is not None and sim >= self.clusterer.assign_floor else NEW)
-        smooth = median_filter_labels(raw, cfg.smooth_windows)
+            if cid is not None and sim >= self.clusterer.assign_floor:
+                raw.append(cid)
+                keys.append(self._canon(cid) or cid)
+                bound = self._bound.get(self.clusterer.resolve(cid))
+                if bound is not None:
+                    pid = PROFILE_PREFIX + bound[0]
+                    profile_labels.setdefault(pid, SpeakerLabel(pid, bound[1], 0.0, False))
+            else:
+                raw.append(NEW)
+                keys.append(NEW)
+        smooth = median_filter_labels(keys, cfg.smooth_windows)
 
         # Pass 2: apply the clustering gate to the smoothed labels.
         centers = window_centers(spans)
@@ -657,15 +766,24 @@ class SpeakerTracker:
                 cid = lab
                 m = matches[i]
                 score = m.score if m is not None and raw[i] == lab else 0.0
+                if m is None and keys[i] == lab and raw[i] != NEW:
+                    # A window of a cluster bound to this person: the cluster keeps evolving
+                    # exactly as if it were not bound (binding only renames its output).
+                    cluster = self.clusterer.resolve(raw[i])
+                    score = float(self.clusterer.centroid(cluster) @ l2_normalize(emb))
+                    if score >= self.clusterer.cluster_threshold:
+                        self.clusterer.update(cluster, emb, core, segment)
             else:
                 cid = self.clusterer.resolve(lab)
                 score = float(self.clusterer.centroid(cid) @ l2_normalize(emb))
-                if raw[i] == lab and score >= self.clusterer.cluster_threshold:
+                if keys[i] == lab and score >= self.clusterer.cluster_threshold:
                     self.clusterer.update(cid, emb, core, segment)
             final.append(cid)
             scores.append(score)
+            self._pools.setdefault(cid, _Pool([])).add(emb, core)
         self._sync_labels()
-        final = [x if x.startswith(PROFILE_PREFIX) else self.clusterer.resolve(x) for x in final]
+        self._bind_clusters()
+        final = [self._canon(x) or x for x in final]
 
         turns = cut_turns(spans, final, dur, cfg.min_turn_s)
         if cfg.snap_boundaries:
@@ -693,13 +811,46 @@ class SpeakerTracker:
         if self.embeddings is not None and label.embedding is not None:
             self.embeddings.add(seq, label.embedding)
 
+    def _session_tag(self) -> str:
+        for holder in (self.labels, self.embeddings, self.windows):
+            path = getattr(holder, "path", None)
+            if path is not None:
+                return f"auto:{Path(path).parent.name}"
+        return "auto"
+
+    def _grow_profiles(self) -> None:
+        """``[profiles] auto_update``: add a few diverse samples of every enrolled person
+        this session recognised (never creates a profile, never touches anyone else's)."""
+        cfg = self.profiles_cfg
+        if cfg is None or not cfg.auto_update or self.store is None:
+            return
+        for key, pool in self._pools.items():
+            if not key.startswith(PROFILE_PREFIX) or pool.seconds < cfg.auto_update_min_s:
+                continue
+            added = self.store.grow(
+                key[len(PROFILE_PREFIX):],
+                np.vstack(pool.embs),
+                self._session_tag(),
+                min_score=cfg.auto_update_min_score,
+                max_new=cfg.auto_update_max,
+                dup=cfg.auto_update_dup,
+            )
+            if added:
+                log.info("Profile %s: added %d voice sample(s) from this session",
+                         key[len(PROFILE_PREFIX):], added)
+
     def close(self) -> None:
         """Merge speakers that never got enough evidence, then flush the stores."""
         self.clusterer.settle(final=True)
         try:
             self._sync_labels()
+            self._bind_clusters()
         except Exception:
             log.exception("Could not record final speaker merges")
+        try:
+            self._grow_profiles()
+        except Exception:
+            log.exception("Could not update voice profiles")
         if self.embeddings is not None:
             self.embeddings.close()
         if self.windows is not None:

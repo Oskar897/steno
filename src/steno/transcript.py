@@ -4,15 +4,21 @@ Layout and schema are specified in ``docs/formats.md``. The writer appends one
 JSON line per final segment (flush + fsync). Readers (``read_segments``,
 ``fetch_new``) are safe to run while the writer is active: a trailing line
 without a newline is considered partial and ignored.
+
+``revisions.jsonl`` (``Revision``, written by ``SessionWriter.append_revisions``) holds better
+text for lines of the live transcript, appended by the engine's refine worker while recording;
+``read_best`` applies the newest revision of every line and ``fetch_new_best`` implements the
+"only what is new" rule for consumers with revisions (see ``docs/formats.md``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +28,7 @@ from steno import __version__, paths
 SCHEMA_VERSION = 1
 TRANSCRIPT_NAME = "transcript.jsonl"
 MARKDOWN_NAME = "transcript.md"
+REVISIONS_NAME = "revisions.jsonl"
 META_NAME = "session.json"
 CURSORS_DIR = "cursors"
 SESSION_ID_FORMAT = "%Y%m%d-%H%M%S"
@@ -50,6 +57,8 @@ class Segment:
     avg_logprob: float | None = None  # ASR confidence of the utterance the line came from
     words: list[list] | None = None  # [[start, end, word], ...] in session seconds
     final: bool | None = None  # True in final.jsonl (written by `steno finalize`)
+    #: Number of the revision whose text this segment carries (``read_best``); never written.
+    rev: int | None = None
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -122,6 +131,121 @@ def atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+# --------------------------------------------------------------------------- revisions
+
+
+@dataclass(frozen=True)
+class Revision:
+    """A better text for an already written line (``revisions.jsonl``, see docs/formats.md).
+
+    ``transcript.jsonl`` is append-only and never changes; the refine worker of the live
+    engine re-transcribes stretches of speech with more context and appends one revision
+    per line it improved. The line keeps its ``seq``, speaker and times.
+    """
+
+    rev: int  # 1-based, strictly increasing within a session
+    seq: int  # the line this text replaces
+    text: str
+    wall: str = ""  # ISO 8601 local time the revision was written
+    lang: str | None = None
+    words: list[list] | None = None  # [[start, end, word], ...] in session seconds
+    avg_logprob: float | None = None
+    model: str | None = None
+    v: int = SCHEMA_VERSION
+
+    def to_json(self) -> str:
+        data = asdict(self)
+        ordered = {k: data[k] for k in ("v", "rev", "seq", "wall", "text")}
+        for key in ("lang", "words", "avg_logprob", "model"):
+            if data[key] is not None:
+                ordered[key] = data[key]
+        return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Revision:
+        return cls(
+            v=int(data.get("v", SCHEMA_VERSION)),
+            rev=int(data["rev"]),
+            seq=int(data["seq"]),
+            text=str(data["text"]),
+            wall=str(data.get("wall", "")),
+            lang=None if data.get("lang") is None else str(data["lang"]),
+            words=_parse_words(data.get("words")),
+            avg_logprob=(
+                None if data.get("avg_logprob") is None else float(data["avg_logprob"])
+            ),
+            model=None if data.get("model") is None else str(data["model"]),
+        )
+
+
+def read_revisions(session_dir: Path) -> list[Revision]:
+    """All revisions in file order. Ignores a trailing partial line and corrupt lines."""
+    try:
+        raw = (Path(session_dir) / REVISIONS_NAME).read_bytes()
+    except FileNotFoundError:
+        return []
+    complete, _, _partial = raw.rpartition(b"\n")
+    out: list[Revision] = []
+    for line in complete.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            out.append(Revision.from_dict(json.loads(line.decode("utf-8"))))
+        except (ValueError, KeyError, TypeError):
+            continue
+    return out
+
+
+def latest_revisions(
+    revisions: Iterable[Revision], max_rev: int | None = None
+) -> dict[int, Revision]:
+    """seq -> its newest revision (highest ``rev``); only ``rev <= max_rev`` when given."""
+    best: dict[int, Revision] = {}
+    for r in revisions:
+        if max_rev is not None and r.rev > max_rev:
+            continue
+        if r.seq not in best or r.rev >= best[r.seq].rev:
+            best[r.seq] = r
+    return best
+
+
+def apply_revision(seg: Segment, rev: Revision | None) -> Segment:
+    """``seg`` with the text, words and confidence of ``rev`` (unchanged without one)."""
+    if rev is None:
+        return seg
+    return replace(
+        seg,
+        text=rev.text,
+        words=rev.words if rev.words is not None else seg.words,
+        avg_logprob=rev.avg_logprob if rev.avg_logprob is not None else seg.avg_logprob,
+        rev=rev.rev,
+    )
+
+
+def read_best(
+    session_dir: Path, after_seq: int = 0, name: str = TRANSCRIPT_NAME
+) -> list[Segment]:
+    """The live segments with the newest revision of every line applied (``rev`` set on them).
+
+    Same lines, ``seq`` values, speakers and times as ``read_segments``; only text, words
+    and confidence differ. Safe while the engine is running. ``name`` other than the live
+    transcript (``final.jsonl``) has no revisions and is returned as is.
+    """
+    segments = read_segments(session_dir, after_seq, name)
+    if name != TRANSCRIPT_NAME:
+        return segments
+    best = latest_revisions(read_revisions(session_dir))
+    return [apply_revision(s, best.get(s.seq)) for s in segments]
+
+
+_WORD_RE = re.compile(r"[\w]+", re.UNICODE)
+
+
+def same_words(a: str, b: str) -> bool:
+    """True when two texts differ only in case, punctuation and spacing."""
+    return _WORD_RE.findall(a.casefold()) == _WORD_RE.findall(b.casefold())
+
+
 # --------------------------------------------------------------------------- writer
 
 
@@ -137,6 +261,9 @@ class SessionWriter:
         self._closed = False
         self._jsonl = (session_dir / TRANSCRIPT_NAME).open("ab")
         self._md = (session_dir / MARKDOWN_NAME).open("ab")
+        self._revisions = None  # opened by the first revision
+        self._rev = 0
+        self._segments: dict[int, Segment] = {}  # what the Markdown mirror currently shows
 
     @classmethod
     def create(
@@ -223,7 +350,72 @@ class SessionWriter:
             os.fsync(self._jsonl.fileno())
             self._md.write((format_line(seg) + "\n\n").encode("utf-8"))
             self._md.flush()
+            self._segments[seg.seq] = seg
             return seg
+
+    def append_revisions(
+        self,
+        items: Iterable[tuple[int, str, dict[str, Any]]],
+        *,
+        model: str | None = None,
+    ) -> list[Segment]:
+        """Append revisions ``(seq, text, extra)`` to ``revisions.jsonl``; returns revised lines.
+
+        ``extra`` may carry ``lang``, ``words`` (session seconds) and ``avg_logprob``. Items for
+        an unknown ``seq`` or with empty text are skipped. The Markdown mirror is rewritten
+        once afterwards so that it shows the best text (``transcript.jsonl`` is not touched).
+        """
+        out: list[Segment] = []
+        with self._lock:
+            if self._closed:
+                raise ValueError("session is closed")
+            for seq, text, extra in items:
+                seg = self._segments.get(seq)
+                if seg is None or not text.strip():
+                    continue
+                self._rev += 1
+                words = extra.get("words")
+                lp = extra.get("avg_logprob")
+                rev = Revision(
+                    rev=self._rev,
+                    seq=seq,
+                    text=text,
+                    wall=datetime.now().isoformat(timespec="seconds"),
+                    lang=extra.get("lang"),
+                    words=(
+                        None if not words
+                        else [[round(a, 2), round(b, 2), str(w)] for a, b, w in words]
+                    ),
+                    avg_logprob=None if lp is None else round(lp, 3),
+                    model=model,
+                )
+                if self._revisions is None:
+                    self._revisions = (self.dir / REVISIONS_NAME).open("ab")
+                self._revisions.write((rev.to_json() + "\n").encode("utf-8"))
+                revised = apply_revision(seg, rev)
+                self._segments[seq] = replace(revised, rev=None)  # the mirror only needs text
+                out.append(revised)
+            if out:
+                self._revisions.flush()
+                os.fsync(self._revisions.fileno())
+                self._rewrite_markdown()
+        return out
+
+    def _rewrite_markdown(self) -> None:
+        """Replace ``transcript.md`` with the current best text (caller holds the lock).
+
+        Windows cannot replace a file that is open, so the append handle is closed for the
+        moment. A reader that holds the file open makes the swap fail; the next revision
+        (or the end of the session) tries again.
+        """
+        text = "".join(format_line(self._segments[q]) + "\n\n" for q in sorted(self._segments))
+        self._md.close()
+        try:
+            atomic_write_text(self.dir / MARKDOWN_NAME, text)
+        except OSError:
+            (self.dir / (MARKDOWN_NAME + ".tmp")).unlink(missing_ok=True)
+        finally:
+            self._md = (self.dir / MARKDOWN_NAME).open("ab")
 
     def set_meta(self, key: str, value: Any) -> None:
         """Add a key to session.json (written when the session closes)."""
@@ -238,6 +430,8 @@ class SessionWriter:
             self._closed = True
             self._jsonl.close()
             self._md.close()
+            if self._revisions is not None:
+                self._revisions.close()
             self._meta["ended_at"] = datetime.now().isoformat(timespec="seconds")
             self._meta["segments"] = self._seq
             atomic_write_text(self.dir / META_NAME, json.dumps(self._meta, indent=2) + "\n")
@@ -285,19 +479,36 @@ def _cursor_path(session_dir: Path, consumer: str) -> Path:
     return Path(session_dir) / CURSORS_DIR / f"{consumer}.json"
 
 
-def read_cursor(session_dir: Path, consumer: str) -> int:
+def read_cursor_state(session_dir: Path, consumer: str) -> tuple[int, int]:
+    """``(last_seq, last_rev)`` of a consumer: the last line and the last revision it has seen."""
     path = _cursor_path(session_dir, consumer)  # raises on invalid names
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return max(0, int(data["last_seq"]))
+        last_seq = max(0, int(data["last_seq"]))
     except (FileNotFoundError, ValueError, KeyError, TypeError):
-        return 0
+        return 0, 0
+    try:
+        return last_seq, max(0, int(data.get("last_rev", 0)))
+    except (ValueError, TypeError):
+        return last_seq, 0
 
 
-def write_cursor(session_dir: Path, consumer: str, last_seq: int) -> None:
+def read_cursor(session_dir: Path, consumer: str) -> int:
+    return read_cursor_state(session_dir, consumer)[0]
+
+
+def write_cursor(
+    session_dir: Path, consumer: str, last_seq: int, last_rev: int | None = None
+) -> None:
+    """Store the cursor; ``last_rev`` None keeps the revision position that is already stored."""
     path = _cursor_path(session_dir, consumer)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, json.dumps({"last_seq": int(last_seq)}) + "\n")
+    if last_rev is None:
+        last_rev = read_cursor_state(session_dir, consumer)[1]
+    data: dict[str, int] = {"last_seq": int(last_seq)}
+    if last_rev:
+        data["last_rev"] = int(last_rev)
+    atomic_write_text(path, json.dumps(data) + "\n")
 
 
 def fetch_new(
@@ -309,14 +520,73 @@ def fetch_new(
 ) -> list[Segment]:
     """Segments the consumer has not seen yet; advances its cursor unless ``peek``.
 
-    ``resolve`` may rewrite the segments for display (see ``steno.labels``), e.g. to
-    apply speaker names that were assigned after the segment was written.
+    The draft lines exactly as written to ``transcript.jsonl`` (no revisions, and the
+    revision position of the cursor is left alone); ``fetch_new_best`` is the version that
+    delivers refined text. ``resolve`` may rewrite the segments for display (see
+    ``steno.labels``), e.g. to apply speaker names that were assigned after the segment
+    was written.
     """
     last = read_cursor(session_dir, consumer)
     segments = read_segments(session_dir, after_seq=last)
     if segments and not peek:
         write_cursor(session_dir, consumer, segments[-1].seq)
     return resolve(Path(session_dir), segments) if resolve else segments
+
+
+@dataclass(frozen=True)
+class NewText:
+    """What ``fetch_new_best`` delivers: new lines and corrections of lines delivered before."""
+
+    new: list[Segment]  # lines after the cursor, with the best text known right now
+    corrections: list[Segment]  # earlier lines whose text has since been improved
+
+    def __bool__(self) -> bool:
+        return bool(self.new or self.corrections)
+
+
+def fetch_new_best(
+    session_dir: Path,
+    consumer: str,
+    *,
+    peek: bool = False,
+    resolve: Callable[[Path, list[Segment]], list[Segment]] | None = None,
+) -> NewText:
+    """Like ``fetch_new`` but refined: the rule for "only what is new" with revisions.
+
+    * Lines after ``last_seq`` are delivered once, with the newest revision already applied
+      (a line the refine worker has reached is never delivered as a draft *and* again).
+    * A line the consumer got before (``seq <= last_seq``) is delivered again, as a
+      *correction*, only when a revision written after the consumer's last read
+      (``rev > last_rev``) changes its text beyond case and punctuation. A revision that
+      says the same thing is skipped silently.
+    * The cursor then moves to the newest line and the newest revision read, so nothing is
+      delivered twice. Peeking changes nothing.
+    """
+    session_dir = Path(session_dir)
+    last_seq, last_rev = read_cursor_state(session_dir, consumer)
+    revisions = read_revisions(session_dir)
+    drafts = read_segments(session_dir)
+    newest = latest_revisions(revisions)
+    seen = latest_revisions(revisions, max_rev=last_rev)  # what the consumer was shown
+    new = [apply_revision(s, newest.get(s.seq)) for s in drafts if s.seq > last_seq]
+    corrections = []
+    for s in drafts:
+        if s.seq > last_seq:
+            continue
+        cur = newest.get(s.seq)
+        if cur is None or cur.rev <= last_rev:
+            continue
+        shown = seen[s.seq].text if s.seq in seen else s.text
+        if not same_words(shown, cur.text):
+            corrections.append(apply_revision(s, cur))
+    top_rev = max((r.rev for r in revisions), default=0)
+    if not peek and (new or top_rev > last_rev):
+        write_cursor(
+            session_dir, consumer, max(last_seq, new[-1].seq if new else 0), max(last_rev, top_rev)
+        )
+    if resolve:
+        new, corrections = resolve(session_dir, new), resolve(session_dir, corrections)
+    return NewText(new, corrections)
 
 
 # --------------------------------------------------------------------------- sessions

@@ -76,7 +76,8 @@ AMI_RTTM_URL = (
     "only_words/rttms/test/{id}.rttm"
 )
 DEFAULT_SYSTEMS = (
-    "steno-live,steno-refine,steno-finalize,steno-finalize-oracle,"
+    "steno-live,steno-refine,steno-fast,steno-incremental,steno-finalize,"
+    "steno-finalize-oracle,"
     "sherpa-offline,sherpa-offline-oracle"
 )
 DEFAULT_MINUTES = 10.0
@@ -339,6 +340,68 @@ def sys_steno_refine(case: Case, ctx: Context) -> Hypothesis:
     return Hypothesis(_segments_to_turns(copy), seconds, "live + refine")
 
 
+def sys_steno_fast(case: Case, ctx: Context) -> Hypothesis:
+    """`steno finalize`'s default speaker path: the live window embeddings, clustered again."""
+    from steno.diarize import diarize_windows
+    from steno.finalize import diarize_params
+    from steno.profiles import SessionWindows
+
+    live_dir, live_s = _live_session(case, ctx)
+    windows = SessionWindows.load(live_dir)
+    if windows is None or not len(windows):
+        raise EvalError("the live session has no window embeddings")
+    t0 = time.perf_counter()
+    result = diarize_windows(
+        windows.stream, windows.t0, windows.t1, windows.emb,
+        ctx.cfg.speakers,  # type: ignore[attr-defined]
+        diarize_params(ctx.cfg),  # type: ignore[arg-type]
+    )
+    seconds = time.perf_counter() - t0
+    turns = [(a, b, spk) for a, b, spk, _ in result.labelled()]
+    return Hypothesis(turns, live_s + seconds, f"live + fast ({seconds:.1f} s, "
+                      f"{len(result.speaker_ids)} found)")
+
+
+def sys_steno_incremental(case: Case, ctx: Context) -> Hypothesis:
+    """pyannote segmentation run window by window as the live engine does while recording
+    (windows without live speech skipped), then ``resolve``: what `steno finalize` does by
+    default for a session recorded with ``[refine] diarize = true``. The reported time is the
+    work that is left at stop (the tail windows + resolve); the rest ran during the meeting."""
+    from steno import transcript
+    from steno.diarize import resolve
+    from steno.finalize import diarize_params
+    from steno.livediar import LiveDiarizer
+    from steno.refine import AudioRing
+    from steno.segmentation import PyannoteSegmenter
+    from steno.speakers import create_embedder
+
+    cfg = ctx.cfg
+    live_dir, _ = _live_session(case, ctx)
+    embedder = create_embedder(replace(cfg.speakers, num_threads=cfg.post.threads))  # type: ignore[attr-defined]
+    embedder.load()
+    segmenter = PyannoteSegmenter(ensure_segmentation_model(), cfg.post.threads)  # type: ignore[attr-defined]
+    segmenter.load()
+    params = diarize_params(cfg)  # type: ignore[arg-type]
+    dz = LiveDiarizer(segmenter, embedder, params)
+    ring = AudioRing(case.duration + 30)
+    ring.append(np.asarray(case.audio, dtype=np.float32), 0.0)
+    for seg in transcript.read_segments(live_dir):
+        dz.note_line("mic", seg.t_start, seg.t_end)
+    t0 = time.perf_counter()
+    dz.step({"mic": ring}, limit=10**9)  # what ran during the meeting (not timed as stop work)
+    during = time.perf_counter() - t0
+    t1 = time.perf_counter()
+    dz.finish({"mic": ring})
+    result = resolve(dz.stats(), params, cfg.speakers)  # type: ignore[attr-defined]
+    at_stop = time.perf_counter() - t1
+    turns = [(a, b, spk) for a, b, spk, _ in result.labelled()]
+    return Hypothesis(
+        turns, during + at_stop,
+        f"{dz.windows} windows run, {dz.skipped} skipped; {during:.0f} s during, "
+        f"{at_stop:.1f} s at stop; {len(result.speaker_ids)} found",
+    )
+
+
 def _finalize_diarization(case: Case, ctx: Context, num_speakers: int | None) -> Hypothesis:
     from steno.diarize import diarize
     from steno.finalize import diarize_params
@@ -424,6 +487,8 @@ def sys_sherpa_oracle(case: Case, ctx: Context) -> Hypothesis:
 SYSTEMS = {
     "steno-live": sys_steno_live,
     "steno-refine": sys_steno_refine,
+    "steno-fast": sys_steno_fast,
+    "steno-incremental": sys_steno_incremental,
     "steno-finalize": sys_steno_finalize,
     "steno-finalize-oracle": sys_steno_finalize_oracle,
     "sherpa-offline": sys_sherpa_offline,

@@ -63,13 +63,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "finalize", help="post-meeting pass: re-diarize the kept audio, repair ASR, write final.*")
     p.add_argument("session", nargs="?", default="latest",
-                   help="'latest' (default) or a session id (needs --keep-audio)")
+                   help="'latest' (default) or a session id (--thorough and --asr-mode "
+                        "longform/selective need --keep-audio)")
     p.add_argument("--speakers", type=int, metavar="N",
                    help="force exactly N speakers instead of estimating the count")
     p.add_argument("--asr-mode", choices=ASR_MODES,
-                   help="re-transcription (overrides [post] asr_mode): longform = each kept "
-                        "stream once as a whole with [post] asr_model (default); selective = "
-                        "only low-confidence live lines, one by one; off = keep the live words")
+                   help="text (overrides [post] asr_mode): refined = the text the refine worker "
+                        "wrote during the meeting, no new ASR (default); longform = each kept "
+                        "stream once as a whole with [post] asr_model; selective = "
+                        "only low-confidence live lines, one by one; off = keep the live draft")
+    p.add_argument("--thorough", action="store_true",
+                   help="speakers: pyannote segmentation over the kept audio (slower, more "
+                        "accurate; overrides [post] diarization = fast, which resolves what the "
+                        "live run computed, in seconds)")
     p.add_argument("--full-asr", action="store_true",
                    help="with --asr-mode selective: transcribe every live line again, not only "
                         "the low-confidence ones (longform transcribes everything anyway)")
@@ -89,6 +95,12 @@ def _build_parser() -> argparse.ArgumentParser:
     who = p.add_mutually_exclusive_group()
     who.add_argument("--person", metavar="NAME", help="only this person's tasks")
     who.add_argument("--all", action="store_true", help="everyone's tasks, grouped (default)")
+
+    p = sub.add_parser(
+        "clean", help="clean up the transcript text with Claude (clean.jsonl/.md, text only)")
+    p.add_argument("session", nargs="?", default="latest")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show the edits Claude proposes and which pass validation; write nothing")
 
     p = sub.add_parser("ui", help="open the local web UI (record, transcripts, speakers, people)")
     p.add_argument("--port", type=int, default=0,
@@ -154,12 +166,15 @@ def _run_engine(
 ) -> int:
     from steno.asr import create_transcriber
     from steno.engine import Engine
+    from steno.refine import create_refine_models
     from steno.speakers import SpeakerError, create_embedder
 
     transcriber = create_transcriber(cfg.asr)
     embedder = create_embedder(cfg.speakers) if cfg.speakers.enabled else None
+    refine = create_refine_models(cfg)
     engine = Engine(cfg, transcriber, sources, speaker_labels=speaker_labels, embedder=embedder,
-                    keep_audio=keep_audio)
+                    keep_audio=keep_audio, refine_transcriber=refine.transcriber,
+                    refine_fallback=refine.fallback, refine_diarizer=refine.diarizer)
     engine.subscribe(lambda seg: print(_fmt_segment(seg), flush=True))
     print(f"Loading model {transcriber.name} ...", file=sys.stderr, flush=True)
     try:
@@ -187,7 +202,9 @@ def _run_engine(
         engine.stop(drain=False)
     print(f"Saved session {session_dir.name}", file=sys.stderr)
     if auto_finalize:
-        if keep_audio:
+        needs_audio = (cfg.post.diarization == "thorough"
+                       or cfg.post.asr_mode in ("longform", "selective"))
+        if keep_audio or not needs_audio:
             print("Finalizing (Ctrl+C to skip; `steno finalize` runs it later) ...",
                   file=sys.stderr, flush=True)
             try:
@@ -241,11 +258,16 @@ def cmd_new(args: argparse.Namespace) -> int:
     if session_dir is None:
         print(f"(no such session: {args.session})", file=sys.stderr)
         return 0
-    segments = transcript.fetch_new(
+    new = transcript.fetch_new_best(
         session_dir, args.consumer, peek=args.peek, resolve=labels.resolve_segments
     )
-    if segments:
-        print(transcript.render_markdown(segments))
+    if new.new:
+        print(transcript.render_markdown(new.new))
+    if new.corrections:
+        if new.new:
+            print()
+        print("Corrections: these lines were sent before; the text below replaces the old text.")
+        print(transcript.render_markdown(new.corrections))
     return 0
 
 
@@ -398,7 +420,7 @@ def _progress_printer():
 
 
 def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fix=False,
-              asr_mode=None) -> int:
+              asr_mode=None, thorough=None) -> int:
     from steno import finalize, llm
     from steno.segmentation import SegmentationError
     from steno.speakers import SpeakerError
@@ -407,7 +429,8 @@ def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fi
     try:
         res = finalize.finalize_session(
             session_dir, cfg, _store(), num_speakers=speakers, full_asr=full_asr,
-            asr_mode=asr_mode, post_edit=post_edit, progress=_progress_printer())
+            asr_mode=asr_mode, thorough=thorough, post_edit=post_edit,
+            progress=_progress_printer())
     except (finalize.FinalizeError, SpeakerError, SegmentationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -416,12 +439,16 @@ def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fi
         asr = f"longform ASR: {lf.words} words in {lf.seconds:.0f} s"
         if lf.echo_dropped:
             asr += f", {lf.echo_dropped} mic word(s) dropped as echo"
+    elif res.asr_mode == "refined":
+        asr = f"refined text ({res.revised} of {res.live_segments} live line(s) revised)"
     elif res.asr_mode == "selective":
         asr = f"{res.redone}/{res.flagged} line(s) transcribed again"
     else:
         asr = "live words kept"
+    if res.fell_back:
+        asr += " (no refine revisions in this session)"
     print(f"Finalized {session_dir.name}: {res.segments} lines (live: {res.live_segments}), "
-          f"{len(res.speakers)} speaker(s); {asr}; "
+          f"{len(res.speakers)} speaker(s) [{res.diarization}]; {asr}; "
           f"{res.seconds:.0f} s for {res.audio_s / 60:.1f} min of audio.")
     if res.longform is not None and res.longform.fallback:
         print("  kept the live text of: " + ", ".join(res.longform.fallback)
@@ -446,7 +473,8 @@ def cmd_finalize(args: argparse.Namespace, cfg: Config) -> int:
         return 1
     try:
         return _finalize(session_dir, cfg, speakers=args.speakers, full_asr=args.full_asr,
-                         llm_fix=args.llm_fix, asr_mode=args.asr_mode)
+                         llm_fix=args.llm_fix, asr_mode=args.asr_mode,
+                         thorough=True if args.thorough else None)
     except KeyboardInterrupt:
         print("\nInterrupted; nothing was written.", file=sys.stderr)
         return 130
@@ -464,7 +492,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             print("error: no final transcript; run `steno finalize` first", file=sys.stderr)
             return 1
     else:
-        segments = labels.resolve_segments(session_dir, transcript.read_segments(session_dir))
+        segments = labels.resolve_segments(session_dir, transcript.read_best(session_dir))
     if segments:
         print(transcript.render_markdown(segments))
     return 0
@@ -499,6 +527,38 @@ def cmd_todo(args: argparse.Namespace, cfg: Config) -> int:
         print(f"({kind} transcript; {len(items)} item(s), {dropped} dropped without evidence; "
               f"saved as {llm.TODO_MD_NAME} and {llm.TODO_JSON_NAME})", file=sys.stderr)
         print((session_dir / llm.TODO_MD_NAME).read_text(encoding="utf-8"), end="")
+        return 0
+
+    return _llm_command(args, run)
+
+
+def cmd_clean(args: argparse.Namespace, cfg: Config) -> int:
+    from steno import clean
+
+    def run(session_dir, llm) -> int:
+        print("Sending the transcript text (never audio) to Claude in chunks ...",
+              file=sys.stderr, flush=True)
+        res = clean.clean_session(session_dir, cfg.llm, dry_run=args.dry_run,
+                                  progress=_progress_printer())
+        meta = res.meta
+        for e in meta["edits"] if args.dry_run else meta["edits"][:10]:
+            print(f"  [{e['seq']}] {e['old']!r} -> {e['new']!r}")
+        if not args.dry_run and len(meta["edits"]) > 10:
+            print(f"  ... {len(meta['edits']) - 10} more in {clean.CLEAN_META_NAME}")
+        for r in meta["rejected_edits"] if args.dry_run else []:
+            print(f"  rejected ({r['reason']}): [{r.get('seq')}] {r.get('old')!r} "
+                  f"-> {r.get('new')!r}")
+        done = "Would apply" if args.dry_run else "Cleaned"
+        print(f"{done} ({meta['source']} text, {meta['model']}, {meta['seconds']:.0f} s): "
+              f"{clean.summary_line(meta)}.")
+        if meta["rejected_by_reason"]:
+            print("  rejected: " + ", ".join(
+                f"{n} {why}" for why, n in meta["rejected_by_reason"].items()), file=sys.stderr)
+        if args.dry_run:
+            print("(dry run: nothing written)", file=sys.stderr)
+        else:
+            print(f"(saved as {clean.CLEAN_NAME}, {clean.CLEAN_MARKDOWN_NAME} and "
+                  f"{clean.CLEAN_META_NAME}; summary and todo now use it)", file=sys.stderr)
         return 0
 
     return _llm_command(args, run)
@@ -543,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_summary(args, cfg)
         if args.command == "todo":
             return cmd_todo(args, cfg)
+        if args.command == "clean":
+            return cmd_clean(args, cfg)
         if args.command == "ui":
             return cmd_ui(args, cfg)
     except ConfigError as exc:

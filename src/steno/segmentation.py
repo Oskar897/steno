@@ -260,6 +260,24 @@ class PyannoteSegmenter:
         )
         self._input = self._session.get_inputs()[0].name
 
+    def run_windows(self, windows: np.ndarray) -> np.ndarray:
+        """``(n, 160000)`` audio windows -> ``(n, 589, 7)`` powerset probabilities.
+
+        For callers that cut the windows themselves (the live diarizer, one window at a time
+        as the audio arrives); ``run`` is the whole-recording version.
+        """
+        self.load()
+        assert self._session is not None
+        windows = np.asarray(windows, dtype=np.float32)
+        out = np.zeros((len(windows), NUM_FRAMES, len(POWERSET)), dtype=np.float32)
+        for lo in range(0, len(windows), self._batch):
+            part = windows[lo : lo + self._batch, None, :]
+            scores = self._session.run(None, {self._input: part})[0]
+            if scores.shape[1] != NUM_FRAMES or scores.shape[2] != len(POWERSET):
+                raise SegmentationError(f"unexpected segmentation output shape {scores.shape}")
+            out[lo : lo + len(part)] = softmax(scores)
+        return out
+
     def run(
         self,
         audio: np.ndarray,

@@ -4,19 +4,28 @@ The live transcript is written under time pressure: a 1.5 s window decides each 
 a VAD cut decides where speech starts, a small ASR model decides the words. Afterwards
 there is time to do better, and this module does:
 
-1. **Diarization** of every kept stream (``steno.diarize``: pyannote segmentation-3.0
-   windows linked by CAM++ embeddings, clustered with Steno's spectral clustering and
-   matched to enrolled profiles).
+1. **Diarization**, by ``[post] diarization``:
+
+   - ``fast`` (default): the live window embeddings (``windows.bin``) are clustered again
+     with all windows at once (``steno.diarize.diarize_windows``): seconds, no audio needed,
+     the accuracy of ``steno refine``.
+   - ``thorough``: every kept stream goes through ``steno.diarize`` (pyannote
+     segmentation-3.0 windows linked by CAM++ embeddings, clustered with Steno's spectral
+     clustering and matched to enrolled profiles). Needs kept audio and takes about 0.1 x
+     the audio length, but is much more accurate (AMI far-field: DER 18 % vs 31 %).
 2. **ASR**, by ``[post] asr_mode``:
 
-   - ``longform`` (default): every kept stream is transcribed once as a whole with
+   - ``refined`` (default): the text the rolling refine worker wrote during the meeting
+     (``revisions.jsonl``, see ``steno.refine``); no new ASR and no kept audio needed. A
+     session without revisions that has kept audio falls back to ``longform``.
+   - ``longform``: every kept stream is transcribed once as a whole with
      ``[post] asr_model`` (a large model is affordable that way: whole-recording decoding runs
      in batches of 30 s windows and sees whole sentences, where line-by-line decoding pads
      every clip to 30 s). The live lines are replaced by the new words; see "Echo" below.
    - ``selective``: live lines with a low average log-probability or a repetitive text (and
      every line with ``--full-asr``) are transcribed again one by one; the new text replaces
      the old only when it is not worse.
-   - ``off``: the live words are kept.
+   - ``off``: the live draft words are kept.
 3. **Words to speakers** (the WhisperX rule): each word goes to the speaker turn it overlaps
    most, consecutive words of one speaker become a line. Sessions recorded before word
    timestamps were stored get approximate word times (spread over the line by length).
@@ -61,10 +70,11 @@ from steno.diarize import (
     DiarizeParams,
     SpeakerTurn,
     StreamStats,
+    diarize_windows,
     extract_stream,
     resolve,
 )
-from steno.profiles import ProfileStore, now_iso
+from steno.profiles import ProfileStore, SessionWindows, now_iso
 from steno.segmentation import SAMPLE_RATE
 from steno.speakers import ProfileMatcher
 from steno.transcript import META_NAME, Segment, atomic_write_text, format_line
@@ -599,6 +609,10 @@ class FinalizeResult:
     diar_seconds: float = 0.0
     asr_mode: str = "selective"
     longform: LongformReport | None = None
+    diarization: str = "thorough"  # "fast", "thorough" or "none" (no window embeddings)
+    revised: int = 0  # refined mode: live lines whose text is a refine revision
+    fell_back: bool = False  # refined mode asked for, but the session had no revisions
+    diar_source: str = ""  # fast: "incremental" (diar.bin) or "windows" (windows.bin)
 
 
 def load_flac(path: Path) -> np.ndarray:
@@ -643,14 +657,17 @@ def finalize_session(
     num_speakers: int | None = None,
     full_asr: bool = False,
     asr_mode: str | None = None,
+    thorough: bool | None = None,
     deps: Deps | None = None,
     post_edit: Callable[[list[Segment]], tuple[list[Segment], dict[str, Any]]] | None = None,
     progress: Progress | None = None,
 ) -> FinalizeResult:
     """Run the whole pass for one session and write ``final.*`` (see the module docstring).
 
-    ``asr_mode`` overrides ``[post] asr_mode``. ``full_asr`` only matters in ``selective``
-    mode (every live line is transcribed again); ``longform`` transcribes everything anyway.
+    ``asr_mode`` overrides ``[post] asr_mode``, ``thorough`` (True: pyannote over the kept
+    audio, False: the live window embeddings) overrides ``[post] diarization``. ``full_asr``
+    only matters in ``selective`` mode (every live line is transcribed again); ``longform``
+    transcribes everything anyway.
     """
     t_begin = time.perf_counter()
     mode = asr_mode or cfg.post.asr_mode
@@ -660,52 +677,91 @@ def finalize_session(
     deps = deps or Deps()
     if num_speakers is not None and num_speakers < 1:
         raise FinalizeError("the number of speakers must be at least 1")
-    live = transcript.read_segments(session_dir)
-    if not live:
+    drafts = transcript.read_segments(session_dir)
+    if not drafts:
         raise FinalizeError("session has no transcript lines")
+    if thorough is None:
+        thorough = cfg.post.diarization == "thorough"
     meta = _read_meta(session_dir)
     origins = {k: float(v) for k, v in (meta.get("stream_origins") or {}).items()}
     loader = deps.audio_loader or load_flac
-    streams = sorted({s.source for s in live} | set(meta.get("sources", [])))
+    streams = sorted({s.source for s in drafts} | set(meta.get("sources", [])))
+    kept = {n: session_dir / f"audio-{n}.flac" for n in streams
+            if (session_dir / f"audio-{n}.flac").is_file()}
+    revisions = transcript.read_revisions(session_dir)
+    fell_back = False
+    if mode == "refined" and not revisions and kept:
+        log.info("No refine revisions in this session: using long-form ASR instead")
+        mode, fell_back = "longform", True
+    live = drafts if mode == "off" else transcript.read_best(session_dir)
+    revised = sum(1 for s in live if s.rev is not None)
     audio: dict[str, np.ndarray] = {}
-    for name in streams:
-        path = session_dir / f"audio-{name}.flac"
-        if path.is_file():
-            audio[name] = loader(path)
-    if not audio:
-        raise FinalizeError(
-            "no kept audio in this session (audio-<stream>.flac); record with --keep-audio"
-        )
-    audio_s = max(len(a) for a in audio.values()) / SAMPLE_RATE
+    if thorough or mode in ("longform", "selective"):
+        audio = {name: loader(path) for name, path in kept.items()}
+        if not audio:
+            raise FinalizeError(
+                "no kept audio in this session (audio-<stream>.flac); record with --keep-audio, "
+                "or use the defaults ([post] asr_mode = \"refined\", diarization = \"fast\")"
+            )
+    audio_s = (
+        max(len(a) for a in audio.values()) / SAMPLE_RATE if audio
+        else max(s.t_end for s in live)
+    )
 
     # 1. diarization -------------------------------------------------------------------
-    embedder, segmenter = deps.embedder, deps.segmenter
-    if embedder is None:
-        from steno.speakers import create_embedder
-
-        embedder = create_embedder(replace(cfg.speakers, num_threads=cfg.post.threads))
-        embedder.load()
-    if segmenter is None:
-        from steno.segmentation import PyannoteSegmenter
-
-        segmenter = PyannoteSegmenter(num_threads=cfg.post.threads)
-        segmenter.load()
     params = diarize_params(cfg)
-    t_diar = time.perf_counter()
-    stats: list[StreamStats] = [
-        extract_stream(name, a, segmenter, embedder, params,
-                       (lambda st, d, n, name=name: _say(progress, f"{st} {name}", d, n)))
-        for name, a in audio.items()
-    ]
     matcher = ProfileMatcher(store.list(), cfg.speakers.accept_threshold, cfg.speakers.margin)
-    diar = resolve(stats, params, cfg.speakers, num_speakers=num_speakers, matcher=matcher)
+    t_diar = time.perf_counter()
+    if thorough:
+        embedder, segmenter = deps.embedder, deps.segmenter
+        if embedder is None:
+            from steno.speakers import create_embedder
+
+            embedder = create_embedder(replace(cfg.speakers, num_threads=cfg.post.threads))
+            embedder.load()
+        if segmenter is None:
+            from steno.segmentation import PyannoteSegmenter
+
+            segmenter = PyannoteSegmenter(num_threads=cfg.post.threads)
+            segmenter.load()
+        stats: list[StreamStats] = [
+            extract_stream(name, a, segmenter, embedder, params,
+                           (lambda st, d, n, name=name: _say(progress, f"{st} {name}", d, n)))
+            for name, a in audio.items()
+        ]
+        diar = resolve(stats, params, cfg.speakers, num_speakers=num_speakers, matcher=matcher)
+        shifted = [
+            replace(t, t_start=t.t_start + origins.get(t.stream, 0.0),
+                    t_end=t.t_end + origins.get(t.stream, 0.0))
+            for t in diar.turns
+        ]
+        diar = replace(diar, turns=shifted)
+        diarization = "thorough"
+        diar_source = "audio"
+    else:
+        _say(progress, "clustering speakers")
+        incremental = _load_incremental(session_dir)
+        windows = SessionWindows.load(session_dir)
+        if incremental:
+            diar = resolve(incremental, params, cfg.speakers, num_speakers=num_speakers,
+                           matcher=matcher)
+            diar = replace(diar, turns=[
+                replace(t, t_start=t.t_start + origins.get(t.stream, 0.0),
+                        t_end=t.t_end + origins.get(t.stream, 0.0))
+                for t in diar.turns
+            ])
+            diarization, diar_source = "fast", "incremental"
+        elif windows is not None and len(windows):
+            diar = diarize_windows(
+                windows.stream, windows.t0, windows.t1, windows.emb, cfg.speakers, params,
+                num_speakers=num_speakers, matcher=matcher,
+            )
+            diarization, diar_source = "fast", "windows"
+        else:
+            log.warning("No window embeddings in this session: the live speaker labels are kept")
+            diar = DiarizationResult([], [], {}, np.zeros((0, 0), dtype=np.float32), 0)
+            diarization, diar_source = "none", ""
     diar_seconds = time.perf_counter() - t_diar
-    shifted = [
-        replace(t, t_start=t.t_start + origins.get(t.stream, 0.0),
-                t_end=t.t_end + origins.get(t.stream, 0.0))
-        for t in diar.turns
-    ]
-    diar = replace(diar, turns=shifted)
     names = name_final_clusters(diar, live_names(session_dir, live))
 
     # 2. ASR ---------------------------------------------------------------------------
@@ -802,12 +858,30 @@ def finalize_session(
     speakers = [(c.speaker_id, c.name, seconds_by_id.get(c.speaker_id, 0.0))
                 for c in unique.values()]
     speakers = [t for t in speakers if t[2] > 0]
+    if not names:  # no diarization at all: the live labels are all there is
+        by_name: dict[str, float] = {}
+        for s in out:
+            by_name[s.speaker] = by_name.get(s.speaker, 0.0) + (s.t_end - s.t_start)
+        speakers = [(labels.UNKNOWN_ID, name, secs) for name, secs in by_name.items()]
     result = FinalizeResult(
         len(out), len(live), redone, len(flagged), sorted(speakers, key=lambda t: -t[2]),
         time.perf_counter() - t_begin, audio_s, fix_report, diar_seconds, mode, report,
+        diarization, revised, fell_back, diar_source,
     )
     _write_outputs(session_dir, out, names, result, cfg, num_speakers, full_asr)
     return result
+
+
+def _load_incremental(session_dir: Path) -> list[StreamStats] | None:
+    """``diar.bin`` of a session recorded with ``[refine] diarize`` (None: absent or unreadable)."""
+    from steno import livediar
+
+    try:
+        return livediar.load_stats(session_dir)
+    except Exception:
+        log.exception("Could not read %s; clustering the window embeddings instead",
+                      livediar.DIAR_NAME)
+        return None
 
 
 def _default_transcriber(cfg: Config, *, longform: bool = False):
@@ -877,9 +951,21 @@ def _write_outputs(
              "locked": any(n.speaker_id == sid and n.locked for n in names)}
             for sid, name, sec in result.speakers
         ],
-        "diarization": "pyannote-segmentation-3.0 + CAM++ + spectral clustering",
+        "diarization": (
+            "pyannote-segmentation-3.0 + CAM++ + spectral clustering"
+            if result.diarization == "thorough"
+            else "live window embeddings + spectral clustering (fast)"
+            if result.diarization == "fast"
+            else "none (live speaker labels)"
+        ),
+        "diarization_mode": result.diarization,
+        "diarization_source": result.diar_source or None,
+        "revised_lines": result.revised if result.asr_mode == "refined" else None,
+        "asr_fell_back_to_longform": result.fell_back,
         "asr_mode": result.asr_mode,
-        "asr_model": None if result.asr_mode == "off" else cfg.post.asr_model,
+        "asr_model": (
+            None if result.asr_mode in ("off", "refined") else cfg.post.asr_model
+        ),
         "asr_redone": result.redone,
         "asr_flagged": result.flagged,
         "full_asr": full_asr and result.asr_mode == "selective",

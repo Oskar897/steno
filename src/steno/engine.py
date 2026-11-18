@@ -29,6 +29,13 @@ a little (``min_silence`` + 0.3 s of loopback stream time) so the overlapping
 loopback utterance is known when the decision is made. Genuine cross-talk louder
 than the threshold is kept; quiet interjections over a loud remote speaker may
 be lost (tune ``ratio``).
+
+Rolling refinement (``[refine]``, ``steno.refine``): when a ``refine_transcriber`` is given, a
+fourth worker keeps the stream audio in memory (bounded) and re-transcribes stretches of
+speech as long-form audio in the background. Its results are appended as *revisions*
+(``revisions.jsonl``) that replace the draft text of the covered lines; ``subscribe_revisions``
+delivers each revised ``Segment``. ``stop()`` refines only what is still pending, so the
+finished transcript is ready seconds after the meeting.
 """
 
 from __future__ import annotations
@@ -49,6 +56,7 @@ from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource, St
 from steno.config import Config
 from steno.labels import SessionLabels
 from steno.profiles import ProfileStore, SessionEmbeddings, SessionWindows
+from steno.refine import Refiner
 from steno.speakers import Embedder, SpeakerTracker, TurnLabel
 from steno.transcript import Segment, SessionWriter
 from steno.vad import (
@@ -65,6 +73,9 @@ from steno.windows import Turn, Word, assign_words, split_by_turns
 log = logging.getLogger(__name__)
 
 SegmentCallback = Callable[[Segment], None]
+
+#: How long ``stop()`` waits for the refine worker to finish the last windows.
+REFINE_TAIL_TIMEOUT_S = 180.0
 
 
 # --------------------------------------------------------------------------- echo gate
@@ -155,6 +166,9 @@ class Engine:
         embedder: Embedder | None = None,
         profile_store: ProfileStore | None = None,
         keep_audio: bool = False,
+        refine_transcriber: Transcriber | None = None,
+        refine_fallback: Callable[[], Transcriber] | None = None,
+        refine_diarizer=None,
     ):
         self.config = config
         self.transcriber = transcriber
@@ -173,7 +187,12 @@ class Engine:
         self._keep_audio = keep_audio
         self._recorders: dict[str, StreamRecorder] = {}
         self._subscribers: list[SegmentCallback] = []
+        self._rev_subscribers: list[SegmentCallback] = []
         self._sub_lock = threading.Lock()
+        self._refine_tr = refine_transcriber if config.refine.enabled else None
+        self._refine_fallback = refine_fallback
+        self._refine_dz = refine_diarizer if config.refine.diarize else None
+        self._refiner: Refiner | None = None
 
         self._audio_q: queue.Queue[AudioChunk] = queue.Queue()
         self._asr_q: queue.PriorityQueue[_Job] = queue.PriorityQueue()
@@ -221,6 +240,26 @@ class Engine:
 
         return unsubscribe
 
+    def subscribe_revisions(self, callback: SegmentCallback) -> Callable[[], None]:
+        """Call ``callback(segment)`` (same ``seq``, refined text, ``rev`` set) per revised line.
+
+        Called from the refine thread, after the revision is on disk.
+        """
+        with self._sub_lock:
+            self._rev_subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            with self._sub_lock:
+                if callback in self._rev_subscribers:
+                    self._rev_subscribers.remove(callback)
+
+        return unsubscribe
+
+    @property
+    def refiner(self) -> Refiner | None:
+        """The rolling refine worker (None when refinement is off); see ``Refiner.stats``."""
+        return self._refiner
+
     def start(self) -> Path:
         """Load the model, create the session and start capturing. Returns the session dir."""
         if self._writer is not None:
@@ -260,10 +299,12 @@ class Engine:
                 labels,
                 SessionEmbeddings(self._writer.dir),
                 SessionWindows(self._writer.dir),
+                profiles_cfg=self.config.profiles,
             )
         if self._keep_audio:
             for name in self._streams:
                 self._recorders[name] = StreamRecorder(self._writer.dir, name)
+        self._start_refiner()
         self._pipeline = threading.Thread(target=self._pipeline_loop, name="vad", daemon=True)
         self._asr = threading.Thread(target=self._asr_loop, name="asr", daemon=True)
         self._pipeline.start()
@@ -312,10 +353,63 @@ class Engine:
                 self._pipeline.join(timeout=5)
         if self._asr is not None:
             self._asr.join()
+        if self._refiner is not None:
+            if self._abort.is_set():
+                self._refiner.abort()
+            else:
+                self._refiner.finish(timeout=REFINE_TAIL_TIMEOUT_S)
+            st = self._refiner.stats
+            dz = self._refiner.diarizer
+            if dz is not None and not self._abort.is_set():
+                self._refiner.save_diarization(self._writer.dir)
+            self._writer.set_meta("refine", {
+                "model": self._refiner.name, "windows": st.windows, "revisions": st.revisions,
+                "failed": st.failed, "skipped_speech_s": round(st.skipped_s, 1),
+                "fallback_windows": st.fallback_windows,
+                "diar_windows": dz.windows if dz is not None else 0,
+            })
         self._writer.set_meta(
             "stream_origins", {n: round(s.origin or 0.0, 3) for n, s in self._streams.items()}
         )
         self._writer.close()
+
+    # -- refine worker ----------------------------------------------------------
+
+    def _start_refiner(self) -> None:
+        tr, dz = self._refine_tr, self._refine_dz
+        if tr is not None and not hasattr(tr, "transcribe_longform"):
+            log.warning("[refine] model has no long-form mode; rolling refinement is off")
+            tr = None
+        if tr is None and dz is None:
+            return
+        refiner = Refiner(
+            self.config.refine, tr, self._emit_revisions,
+            fallback_factory=self._refine_fallback,
+            live_busy=lambda: self._asr_q.qsize() > 0,
+            max_compression=self.config.post.asr_max_compression,
+            diarizer=dz,
+        )
+        try:
+            refiner.load()
+        except Exception:
+            log.exception("Could not load the refine model; rolling refinement is off")
+            return
+        if not refiner.active:
+            return
+        self._refiner = refiner
+        refiner.start()
+
+    def _emit_revisions(self, items: list[tuple[int, str, dict]], model: str) -> None:
+        assert self._writer is not None
+        revised = self._writer.append_revisions(items, model=model)
+        with self._sub_lock:
+            subscribers = list(self._rev_subscribers)
+        for seg in revised:
+            for cb in subscribers:
+                try:
+                    cb(seg)
+                except Exception:
+                    log.exception("Revision subscriber raised")
 
     # -- pipeline thread --------------------------------------------------------
 
@@ -336,6 +430,8 @@ class Engine:
                 recorder = self._recorders.get(chunk.source)
                 if recorder is not None and chunk.samples.size:
                     recorder.write(chunk.samples)
+                if chunk.samples.size and self._refiner is not None:
+                    self._refiner.feed(chunk.source, chunk.samples, stream.origin or 0.0)
                 if chunk.samples.size:
                     gain = stream.agc.update(chunk.samples) if stream.agc else 1.0
                     for utt in stream.segmenter.feed(chunk.samples, gain):
@@ -486,6 +582,8 @@ class Engine:
         )
         if label is not None and self._tracker is not None:
             self._tracker.record(seg.seq, label)
+        if self._refiner is not None:
+            self._refiner.note_line(seg)
         self._notify(seg)
 
     def _notify(self, seg: Segment) -> None:
