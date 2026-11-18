@@ -1,0 +1,30 @@
+# Copy to config.toml (git-ignored) and adjust. No secrets belong here.
+# Search order: <data dir>/config.toml (%APPDATA%\Steno), then the repo root.
+# Every key is optional; the values below are the built-in defaults.
+
+[audio]
+sample_rate = 16000
+capture_mic = true
+capture_loopback = true      # system audio (Discord, Meet, Teams)
+mic_speaker_label = "Me"     # label for the microphone stream
+loopback_speaker_label = "Remote"
+
+[asr]
+backend = "faster-whisper"
+model = "KBLab/kb-whisper-small"   # chosen from scripts/benchmark_asr.py results
+compute_type = "int8"
+language = "sv"                    # "sv", "en" or "auto"
+cpu_threads = 6
+beam_size = 1
+
+[vad]
+threshold = 0.5
+min_silence_ms = 500
+min_speech_ms = 250
+max_segment_s = 15
+
+[echo]
+# Drop mic speech that overlaps loopback speech and is much quieter than it
+# (the remote voice leaking from speakers into the mic).
+enabled = true
+ratio = 0.35

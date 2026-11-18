@@ -1,0 +1,85 @@
+#!/usr/bin/env python
+"""Pre-commit guard for a public repo.
+
+Blocks commits that contain audio, transcripts, voiceprints, models,
+large files, local config, or strings that look like secrets.
+Enable with:  git config core.hooksPath .githooks
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+
+MAX_BYTES = 1_000_000
+
+BLOCKED_EXT = {
+    ".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".webm", ".aac", ".wma",
+    ".jsonl", ".npy", ".npz", ".pkl", ".sqlite", ".sqlite3", ".db",
+    ".onnx", ".bin", ".gguf", ".pt", ".ckpt", ".safetensors",
+    ".key", ".pem",
+}
+BLOCKED_NAMES = {".env", "config.toml", "settings.local.json"}
+BLOCKED_DIRS = ("data/", "recordings/", "sessions/", "transcripts/",
+                "profiles/", "voiceprints/", "models/", "context/",
+                "benchmarks/audio/", "benchmarks/results/")
+
+SECRET_PATTERNS = [
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), "Anthropic API key"),
+    (re.compile(r"sk-[A-Za-z0-9]{32,}"), "OpenAI-style API key"),
+    (re.compile(r"hf_[A-Za-z0-9]{30,}"), "Hugging Face token"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"), "GitHub token"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    (re.compile(r"[A-Za-z0-9._%+\-]+@(?:student\.)?ju\.se", re.I), "JU e-mail address"),
+    (re.compile(r"[A-Za-z]:\\Users\\[^\\\s\"']+", re.I), "absolute Windows user path"),
+]
+# Lines containing this marker are exempt (use for docs examples only).
+ALLOW_MARKER = "steno:allow-secret"
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", check=True).stdout
+
+
+def main() -> int:
+    files = [f for f in git("diff", "--cached", "--name-only", "--diff-filter=ACMR").splitlines() if f]
+    problems: list[str] = []
+
+    for path in files:
+        low = path.replace("\\", "/").lower()
+        name = low.rsplit("/", 1)[-1]
+        ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+        if ext in BLOCKED_EXT:
+            problems.append(f"{path}: blocked file type {ext}")
+        if name in BLOCKED_NAMES or (name.startswith(".env") and name != ".env.example"):
+            problems.append(f"{path}: local config/secret file")
+        if any(low.startswith(d) or f"/{d}" in low for d in BLOCKED_DIRS):
+            problems.append(f"{path}: inside a private data directory")
+        size = int(git("cat-file", "-s", f":{path}").strip() or 0)
+        if size > MAX_BYTES:
+            problems.append(f"{path}: {size} bytes > {MAX_BYTES}")
+            continue
+        if path == ".githooks/pre-commit":
+            continue  # this file contains the patterns themselves
+        blob = git("show", f":{path}")
+        for lineno, line in enumerate(blob.splitlines(), 1):
+            if ALLOW_MARKER in line:
+                continue
+            for pattern, label in SECRET_PATTERNS:
+                if pattern.search(line):
+                    problems.append(f"{path}:{lineno}: looks like {label}")
+
+    if problems:
+        print("pre-commit: BLOCKED (public repo guard)\n", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("\nRemove these from the commit. Never bypass with --no-verify.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
