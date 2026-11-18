@@ -1,5 +1,5 @@
 # Copy to config.toml (git-ignored) and adjust. No secrets belong here.
-# Search order: <data dir>/config.toml (%APPDATA%\Steno), then the repo root.
+# Search order: <data dir>/config.toml (%USERPROFILE%\.steno), then the repo root.
 # Every key is optional; the values below are the built-in defaults.
 
 [audio]
@@ -18,10 +18,17 @@ cpu_threads = 6
 beam_size = 1
 
 [vad]
-threshold = 0.5
+threshold = 0.4              # lower = more speech kept (0.5 before the far-field tests)
 min_silence_ms = 500
 min_speech_ms = 250
 max_segment_s = 15
+# Lift quiet far-field audio (laptop mic across a room) before the VAD only; ASR and
+# speaker recognition still get the original audio. Never amplifies more than
+# auto_gain_max, so a loud mic is untouched. Helps when the VAD misses much of a quiet
+# recording (far-field AMI: 22 % of the speech missed -> 13 % with threshold 0.4).
+auto_gain = true
+auto_gain_target = 0.05      # RMS that the 90th-percentile level of the last 30 s is lifted to
+auto_gain_max = 8.0
 
 [echo]
 # Drop mic speech that overlaps loopback speech and is much quieter than it
@@ -33,13 +40,43 @@ ratio = 0.35
 # Speaker recognition. Needs the 'speakers' extra (sherpa-onnx); the model
 # (~28 MB) is downloaded to <data dir>\models on first use.
 # All thresholds are cosine similarities and are UNCALIBRATED starting points:
-# tune them on your own microphone and rooms.
+# tune them on your own microphone and rooms (scripts/eval_diarization.py).
 enabled = true
 model = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
 num_threads = 2
-min_embed_s = 1.0            # shorter segments inherit the previous speaker (low confidence)
+min_embed_s = 1.0            # shorter segments/windows inherit the previous speaker (low confidence)
 accept_threshold = 0.55      # enrolled person: best score must reach this ...
 margin = 0.05                # ... and beat the second-best person by this much
-cluster_threshold = 0.5      # live session clusters ("Speaker 1", ...): join at/above this
-merge_threshold = 0.7        # live: merge two clusters whose centroids reach this
-refine_threshold = 0.45      # `steno refine`: average-linkage stop similarity
+
+# Turns inside a segment: a VAD segment is cut into overlapping windows, each window is
+# labelled on its own, and the segment is split where the speaker changes. This is what
+# catches a short "yes" from a second person inside a long monologue.
+window_s = 1.5               # embedding window; 0 = one embedding per segment (old behaviour)
+window_hop_s = 0.75
+smooth_windows = 3           # median filter over the window labels (odd; 1 = off)
+min_turn_s = 0.5             # shorter turns are absorbed by the longer neighbour
+snap_boundaries = false      # move each cut to the quietest point within 0.4 s (no DER gain on AMI)
+
+# Live session clusters ("Speaker 1", ...), with an anti-fragmentation gate.
+cluster_threshold = 0.5      # window joins a cluster and moves its centroid at/above this
+assign_floor = 0.4           # between floor and threshold: takes the label, centroid stays
+                             # below the floor a window opens a new, tentative speaker
+merge_threshold = 0.7        # merge two clusters whose centroids reach this
+confirm_s = 3.5              # a new speaker needs this much speech ...
+confirm_segments = 2         # ... from this many different segments, else it is merged
+                             # into the nearest real speaker (latest when the session ends)
+tentative_ttl = 8            # ... or when it was not heard for this many segments
+max_speakers = 10
+
+# `steno refine`: spectral clustering of all windows, speaker count from the eigengap.
+refine_threshold = 0.4       # agglomerative stop similarity (used below refine_min_spectral)
+refine_pval = 0.012          # p-pruning: keep this fraction of strongest neighbours per row ...
+refine_min_pnum = 6          # ... but at least this many
+refine_min_spectral = 40     # fewer windows than this: agglomerative clustering instead
+refine_max_speakers = 10
+refine_minor_windows = 4     # clusters this small are reassigned to the nearest large one
+
+# `steno enroll`: windows over the recording; outliers (cough, noise) are dropped.
+enroll_window_s = 2.5
+enroll_hop_s = 1.0
+enroll_outlier_sigma = 2.0

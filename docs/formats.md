@@ -14,13 +14,14 @@ system) can consume Steno output without importing Steno.
   speakers.json        # speaker label layer: cluster/profile id -> display name
   labels.json          # optional refine overlay: seq -> speaker id (`steno refine`)
   embeddings.bin       # ENCRYPTED speaker embeddings, seq -> vector (biometric)
+  windows.bin          # ENCRYPTED embeddings of every 1.5 s window, for `steno refine` (biometric)
   audio-mic.flac, audio-loopback.flac   # only with `steno record --keep-audio`
 ```
 
 Voice profiles live next to the sessions, also encrypted:
 `<data_dir>/profiles/<profile id>.bin` (see "Biometric data" below).
 
-`<data_dir>` is `%APPDATA%\Steno` on Windows (override: `STENO_DATA_DIR`).
+`<data_dir>` is `%USERPROFILE%\.steno` on Windows (override: `STENO_DATA_DIR`).
 
 ## transcript.jsonl (v1)
 
@@ -48,13 +49,25 @@ readers must treat all three as optional).
 - `speaker_id`: `"S1"`, `"S2"`, ... = anonymous cluster of this session;
   `"P:<profile id>"` = recognised enrolled person; `"U"` = unknown (short segment
   with no earlier speaker on that stream).
-- `speaker_conf`: cosine similarity behind the decision (to the profile, or to the
-  cluster centroid; `0.0` for a short segment that inherited the previous speaker
-  of its stream and for the first segment of a new cluster).
+- `speaker_conf`: cosine similarity behind the decision, averaged over the turn's
+  1.5 s windows (to the profile, or to the cluster centroid; `0.0` for a short
+  segment that inherited the previous speaker of its stream and for the first window
+  of a new cluster).
 - `provisional`: `true` for cluster labels and inherited speakers (live labels can
   change when clusters merge or after `steno refine`), `false` for a profile match.
+  A new live speaker is *tentative* until it has at least 3.5 s of speech from two
+  segments; tentative speakers that never reach that (a cough, a one-off noise) are
+  folded into the nearest real speaker via the `merged` map below, at the latest when
+  the session ends. Until then they appear as their own `S<n>`.
 - `speaker` stays the display label *at write time* ("Speaker 2", "Alice").
   The JSONL is never rewritten, so names assigned later live in the label layer.
+
+A VAD segment in which the speaker changes (a short interjection inside someone
+else's long turn) is written as **one line per speaker turn**: consecutive `seq`
+values, `t_start`/`t_end` of the turns are disjoint parts of the segment, and the
+words of the segment are divided between the lines by their timestamps (a turn that
+received no word gets no line). Readers should therefore not assume that one line is
+one breath of speech; consecutive lines by the same speaker are normal.
 
 Example (fake data):
 
@@ -91,7 +104,9 @@ overlay, then the segment's own `speaker_id`, then its written `speaker`.
               "2": {"speaker_id": "S1", "name": "Speaker 1", "conf": 0.91}}}
 ```
 
-Refine replaces the cluster namespace in `speakers.json` (unmatched clusters are
+Refine clusters the window embeddings of the whole session (spectral clustering,
+speaker count from the eigengap, or `--speakers N`) and gives each line the majority
+cluster of the windows inside it. It replaces the cluster namespace in `speakers.json` (unmatched clusters are
 renumbered `S1`, `S2`, ... by first appearance and `merged` is cleared), so ids in
 the overlay and in the live JSONL lines of the same session are different
 namespaces; always resolve through the overlay first. `name` in the overlay is a
@@ -112,9 +127,18 @@ encryption is unavailable and Steno refuses to store them, unless
 
 - Profile: up to 30 embeddings per person (most redundant ones dropped first),
   name, created/updated timestamps, and a per-embedding origin tag (session id or
-  `enroll:<timestamp>`).
-- `embeddings.bin`: seq -> embedding for each segment that was long enough to embed
-  (`min_embed_s`), flushed every 20 segments and at the end of the session.
+  `enroll:<timestamp>`). `steno enroll` stores 2.5 s windows (1 s hop) of the
+  recording, without outliers (cosine to the mean more than 2 sigma below the average);
+  at least 30 s of speech is recommended.
+- `embeddings.bin`: seq -> embedding for each line that was long enough to embed
+  (`min_embed_s`; the normalised mean of the line's window embeddings), flushed every
+  20 lines and at the end of the session. `steno name` learns from these.
+- `windows.bin`: one embedding per 1.5 s window (every 0.75 s) of every embedded
+  segment, with stream name and session start/end time of the window (`npz`: `stream`
+  codes, `t0`, `t1`, `embeddings`, JSON `meta` with the stream names), flushed every
+  100 windows and at the end. About 1 KB per second of speech. Sessions recorded
+  before windows existed have no such file; `steno refine` then clusters the
+  per-line embeddings instead.
 - Profiles are changed only by explicit commands: `steno enroll`, `steno name`,
   `steno people`. The live stream never enrols anyone.
 

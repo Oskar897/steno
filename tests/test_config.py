@@ -20,6 +20,17 @@ def test_example_matches_defaults():
         assert config_from_dict(tomllib.load(fh)) == Config()
 
 
+def test_example_lists_every_key_of_every_section_and_nothing_else():
+    from dataclasses import fields
+
+    with (REPO / "config.example.toml").open("rb") as fh:
+        data = tomllib.load(fh)
+    cfg = Config()
+    assert set(data) == {f.name for f in fields(cfg)}
+    for section, values in data.items():
+        assert set(values) == {f.name for f in fields(getattr(cfg, section))}, section
+
+
 def test_partial_override_from_data_dir(steno_data_dir):
     steno_data_dir.mkdir(parents=True, exist_ok=True)
     (steno_data_dir / "config.toml").write_text(

@@ -293,6 +293,13 @@ class FakeTranscriber:
     def transcribe(self, audio: np.ndarray) -> tuple[str, str]:
         return "x", "en"
 
+    def transcribe_words(self, audio: np.ndarray):
+        """One fake word per 0.25 s, so every speaker turn of the segment gets text."""
+        from steno.windows import Word
+
+        n = max(1, int(len(audio) / SAMPLE_RATE / 0.25))
+        return "x", "en", [Word(i * 0.25, (i + 1) * 0.25, "x") for i in range(n)]
+
 
 def _segments_to_turns(session_dir: Path) -> list[der.Turn]:
     from steno import labels, transcript
@@ -436,6 +443,29 @@ def isolated_data_dir(cfg):
                 os.environ["STENO_DATA_DIR"] = old
 
 
+def apply_overrides(cfg, overrides: list[str]):
+    """Apply ``section.key=value`` strings (TOML scalars) on top of a Config."""
+    import tomllib
+    from dataclasses import replace
+
+    for item in overrides:
+        key, sep, raw = item.partition("=")
+        section, dot, name = key.strip().partition(".")
+        if not (sep and dot) or not hasattr(cfg, section):
+            raise ValueError(f"bad --set {item!r}; expected section.key=value")
+        sub = getattr(cfg, section)
+        if not hasattr(sub, name):
+            raise ValueError(f"unknown config key {key!r}")
+        try:
+            value = tomllib.loads(f"v = {raw}")["v"]
+        except tomllib.TOMLDecodeError:
+            value = raw  # bare word -> string
+        if isinstance(getattr(sub, name), float) and isinstance(value, int):
+            value = float(value)
+        cfg = replace(cfg, **{section: replace(sub, **{name: value})})
+    return cfg
+
+
 # --------------------------------------------------------------------------- reporting
 
 
@@ -513,6 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=int, default=4, help="sherpa-offline threads (default 4)")
     p.add_argument("--config", type=Path, help="Steno config.toml for the steno-* systems "
                    "(default: built-in defaults, so results are reproducible)")
+    p.add_argument("--set", action="append", default=[], metavar="SECTION.KEY=VALUE",
+                   help="override one Steno config value for the steno-* systems, e.g. "
+                        "--set speakers.window_s=1.0 --set vad.threshold=0.35 (repeatable)")
     p.add_argument("--save-rttm", action="store_true",
                    help="also write each hypothesis as RTTM next to the results JSON")
     return p
@@ -558,6 +591,11 @@ def main(argv: list[str] | None = None) -> int:
     from steno.config import Config, load_config
 
     cfg = load_config(args.config) if args.config else Config()
+    try:
+        cfg = apply_overrides(cfg, args.set)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     results_dir = eval_dir() / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -627,11 +665,13 @@ def main(argv: list[str] | None = None) -> int:
         "sherpa_threads": args.threads,
         "meetings": [c.name for c in cases],
         "frame_s": der.FRAME_S,
+        "overrides": args.set,
     }
     payload = {
         "timestamp": stamp,
         "settings": settings,
         "steno_speakers_config": asdict(cfg.speakers),
+        "steno_vad_config": asdict(cfg.vad),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "results": report,

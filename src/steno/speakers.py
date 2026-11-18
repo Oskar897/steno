@@ -1,21 +1,26 @@
-"""Speaker recognition: embeddings, profile matching, session clustering.
+"""Speaker recognition: embeddings, profile matching, session clustering, turns.
 
-Pipeline for one finished VAD segment (see ``SpeakerTracker.identify``):
+Pipeline for one finished VAD segment (see ``SpeakerTracker.identify_turns``):
 
-1. Shorter than ``min_embed_s``: no embedding; inherit the previous speaker of the
-   same stream with confidence 0 (provisional).
-2. Otherwise compute an L2-normalised embedding (``Embedder``; production:
-   sherpa-onnx CAM++ via ``SherpaEmbedder``).
-3. ``ProfileMatcher``: per enrolled person score = max(centroid cosine, mean of the
-   top-3 cosines). Accept when score >= ``accept_threshold`` AND the margin to the
-   second-best person is >= ``margin``.
-4. Otherwise ``SessionClusterer`` (leader-follower): join the nearest running
-   centroid when cosine >= ``cluster_threshold``, else open "Speaker N"; two
-   clusters whose centroids reach ``merge_threshold`` are merged. Live labels are
-   provisional; ``steno refine`` recomputes them offline.
+1. The segment is cut into overlapping windows (``window_s`` every ``window_hop_s``,
+   default 1.5 s / 0.75 s); a segment shorter than ``min_embed_s`` is not embedded and
+   inherits the previous speaker of its stream (confidence 0, provisional).
+2. Every window gets an L2-normalised embedding (``Embedder``; production: sherpa-onnx
+   CAM++ via ``SherpaEmbedder``) and a label: ``ProfileMatcher`` first (per enrolled
+   person score = max(centroid cosine, mean of the top-3 cosines); accepted when
+   >= ``accept_threshold`` AND ahead of the second-best person by ``margin``), else the
+   nearest session cluster, else "new".
+3. The label sequence is median-filtered; "new" windows pass the ``SessionClusterer``
+   gate: a new speaker starts as a tentative cluster and only counts after
+   ``confirm_s`` seconds of speech from ``confirm_segments`` segments, otherwise it is
+   merged into the nearest confirmed cluster (when it expires and at the end of the
+   session; the merge lives in the label layer, the JSONL is never rewritten).
+4. The segment is cut into turns where the label changes (``steno.windows``); the
+   engine splits the ASR words between the turns.
 
-The tracker never enrols anyone. Profiles change only through explicit commands.
-All thresholds are uncalibrated defaults (see ``[speakers]`` in the config).
+``identify`` is the older whole-segment path (one embedding, one label) that remains
+available with ``window_s = 0``. The tracker never enrols anyone; profiles change only
+through explicit commands. All thresholds are uncalibrated defaults (see ``[speakers]``).
 """
 
 from __future__ import annotations
@@ -36,7 +41,14 @@ import numpy as np
 from steno import paths
 from steno.config import SpeakersConfig
 from steno.labels import PROFILE_PREFIX, UNKNOWN_ID, UNKNOWN_NAME, SessionLabels
-from steno.profiles import Profile, ProfileStore, SessionEmbeddings
+from steno.profiles import Profile, ProfileStore, SessionEmbeddings, SessionWindows
+from steno.windows import (
+    cut_turns,
+    median_filter_labels,
+    snap_boundaries,
+    window_centers,
+    window_spans,
+)
 
 log = logging.getLogger(__name__)
 
@@ -197,21 +209,59 @@ class ProfileMatcher:
 
 
 class SessionClusterer:
-    """Leader-follower clustering with running centroids and merging.
+    """Online clustering of speaker embeddings with an anti-fragmentation gate.
 
     Cluster ids are ``S1``, ``S2``, ... in order of creation. After a merge the
     lower-numbered cluster survives; ``pop_merges`` reports ``(dead, survivor)``
     pairs, and ``resolve`` maps any historic id to its current one.
+
+    Three similarity levels (cosine to a running centroid) decide what an embedding
+    does, the way diart's ``rho_update`` and 3D-Speaker's minor-cluster rule do:
+
+    * ``>= cluster_threshold``: joins that cluster and moves its centroid;
+    * ``>= assign_floor``: gets that cluster's label but does *not* move the centroid
+      (an uncertain window must not drag a speaker's centroid towards someone else);
+    * below ``assign_floor``: opens a new *tentative* cluster.
+
+    A tentative cluster becomes a *confirmed* speaker only after ``confirm_s`` seconds
+    of confidently joined speech from ``confirm_segments`` different segments. An
+    unconfirmed cluster that stays untouched for ``ttl_segments`` segments, and every
+    unconfirmed one when the session ends (``settle(final=True)``), is merged into the
+    nearest confirmed cluster. Noises of one or two seconds therefore cannot create
+    "Speaker 6"; the merge is recorded in the label layer, so earlier transcript lines
+    follow without rewriting the JSONL. With ``assign_floor=None`` and
+    ``confirm_s=0`` this is the classic leader-follower clustering of ``assign``.
     """
 
-    def __init__(self, cluster_threshold: float = 0.5, merge_threshold: float = 0.7):
+    def __init__(
+        self,
+        cluster_threshold: float = 0.5,
+        merge_threshold: float = 0.7,
+        *,
+        assign_floor: float | None = None,
+        confirm_s: float = 0.0,
+        confirm_segments: int = 1,
+        ttl_segments: int = 0,
+        max_speakers: int = 0,
+    ):
         self.cluster_threshold = cluster_threshold
         self.merge_threshold = merge_threshold
+        self.assign_floor = cluster_threshold if assign_floor is None else assign_floor
+        self.confirm_s = confirm_s
+        self.confirm_segments = confirm_segments
+        self.ttl_segments = ttl_segments
+        self.max_speakers = max_speakers
         self._sum: dict[str, np.ndarray] = {}
         self._count: dict[str, int] = {}
+        self._speech: dict[str, float] = {}
+        self._segs: dict[str, set[int]] = {}
+        self._touched: dict[str, int] = {}
+        self._clock = 0  # segments seen so far
         self._next = 1
         self._alias: dict[str, str] = {}
         self._merges: list[tuple[str, str]] = []
+
+    # -- queries ---------------------------------------------------------------------
 
     @property
     def cluster_ids(self) -> list[str]:
@@ -223,6 +273,9 @@ class SessionClusterer:
     def count(self, cluster_id: str) -> int:
         return self._count[cluster_id]
 
+    def speech_s(self, cluster_id: str) -> float:
+        return self._speech[cluster_id]
+
     def resolve(self, cluster_id: str) -> str:
         while cluster_id in self._alias:
             cluster_id = self._alias[cluster_id]
@@ -232,28 +285,108 @@ class SessionClusterer:
         out, self._merges = self._merges, []
         return out
 
-    def assign(self, emb: np.ndarray) -> tuple[str, float]:
-        """Add ``emb``; return ``(cluster id, cosine to that cluster's centroid before adding)``.
+    def confirmed(self, cluster_id: str) -> bool:
+        return (
+            self._speech[cluster_id] >= self.confirm_s
+            and len(self._segs[cluster_id]) >= self.confirm_segments
+        )
 
-        For a new cluster the score is the cosine to the nearest existing centroid (0 if none).
-        """
+    def nearest(self, emb: np.ndarray) -> tuple[str | None, float]:
+        """Most similar cluster (any state) and its cosine; ``(None, -1)`` when empty."""
         emb = l2_normalize(emb)
         best_id, best = None, -1.0
         for cid in self._sum:
             sim = float(self.centroid(cid) @ emb)
             if sim > best:
                 best_id, best = cid, sim
+        return best_id, best
+
+    # -- updates ---------------------------------------------------------------------
+
+    def begin_segment(self) -> int:
+        """Mark the start of a new segment; settles expired tentative clusters."""
+        self._clock += 1
+        if self.ttl_segments > 0:
+            self.settle()
+        return self._clock
+
+    def update(
+        self, cid: str, emb: np.ndarray, dur: float = 0.0, segment: int | None = None
+    ) -> None:
+        """Move ``cid``'s centroid towards ``emb`` (``dur`` seconds of speech from ``segment``)."""
+        self._sum[cid] = self._sum[cid] + l2_normalize(emb)
+        self._count[cid] += 1
+        self._speech[cid] += dur
+        self._segs[cid].add(self._clock if segment is None else segment)
+        self._touched[cid] = self._clock
+
+    def create(self, emb: np.ndarray, dur: float = 0.0, segment: int | None = None) -> str:
+        cid = f"S{self._next}"
+        self._next += 1
+        self._sum[cid] = l2_normalize(emb)
+        self._count[cid] = 1
+        self._speech[cid] = dur
+        self._segs[cid] = {self._clock if segment is None else segment}
+        self._touched[cid] = self._clock
+        return cid
+
+    def observe(
+        self, emb: np.ndarray, dur: float = 0.0, segment: int | None = None
+    ) -> tuple[str, float]:
+        """Classify ``emb`` and apply the gate. Returns ``(cluster id, score)``.
+
+        The score is the cosine to the chosen cluster's centroid before the update
+        (cosine to the nearest cluster for a new one, 0 if there is none).
+        """
+        emb = l2_normalize(emb)
+        best_id, best = self.nearest(emb)
+        full = self.max_speakers > 0 and len(self._sum) >= self.max_speakers
         if best_id is not None and best >= self.cluster_threshold:
-            self._sum[best_id] = self._sum[best_id] + emb
-            self._count[best_id] += 1
+            self.update(best_id, emb, dur, segment)
             cid = best_id
+        elif best_id is not None and (best >= self.assign_floor or full):
+            cid = best_id  # label only: the centroid stays where it is
         else:
-            cid = f"S{self._next}"
-            self._next += 1
-            self._sum[cid] = emb.copy()
-            self._count[cid] = 1
+            cid = self.create(emb, dur, segment)
         cid = self._merge_close(cid)
         return cid, max(best, 0.0) if best_id is not None else 0.0
+
+    def assign(self, emb: np.ndarray) -> tuple[str, float]:
+        """Classic whole-embedding leader-follower step (see ``observe``)."""
+        return self.observe(emb)
+
+    # -- settling and merging ----------------------------------------------------------
+
+    def settle(self, final: bool = False) -> None:
+        """Merge unconfirmed clusters (expired ones, or all when ``final``) into the nearest
+        confirmed cluster. If nothing is confirmed, the best-supported cluster is kept."""
+        if self.confirm_s <= 0 and self.confirm_segments <= 1:
+            return
+        while True:
+            ids = self.cluster_ids
+            confirmed = [c for c in ids if self.confirmed(c)]
+            if not confirmed and ids:
+                confirmed = [max(ids, key=lambda c: self._speech[c])]
+            weak = [
+                c
+                for c in ids
+                if c not in confirmed
+                and (final or self._clock - self._touched[c] >= self.ttl_segments)
+            ]
+            if not weak or not confirmed:
+                return
+            dead = min(weak, key=lambda c: self._speech[c])
+            keep = max(confirmed, key=lambda c: float(self.centroid(c) @ self.centroid(dead)))
+            self._absorb(keep, dead)
+
+    def _absorb(self, keep: str, dead: str) -> None:
+        self._sum[keep] = self._sum[keep] + self._sum.pop(dead)
+        self._count[keep] += self._count.pop(dead)
+        self._speech[keep] += self._speech.pop(dead)
+        self._segs[keep] |= self._segs.pop(dead)
+        self._touched[keep] = max(self._touched[keep], self._touched.pop(dead))
+        self._alias[dead] = keep
+        self._merges.append((dead, keep))
 
     def _merge_close(self, touched: str) -> str:
         """Merge clusters whose centroids reach the threshold; returns ``touched``'s survivor."""
@@ -268,11 +401,7 @@ class SessionClusterer:
                     if sim >= best[0]:
                         best = (sim, a, b)
             if best[1] is not None:
-                keep, dead = best[1], best[2]  # ids sorted by number: keep the older one
-                self._sum[keep] = self._sum[keep] + self._sum.pop(dead)
-                self._count[keep] += self._count.pop(dead)
-                self._alias[dead] = keep
-                self._merges.append((dead, keep))
+                self._absorb(best[1], best[2])  # ids sorted by number: keep the older one
                 changed = True
         return self.resolve(touched)
 
@@ -334,6 +463,18 @@ class SpeakerLabel:
     embedding: np.ndarray | None = None  # kept for the session embedding store
 
 
+@dataclass(frozen=True)
+class TurnLabel:
+    """One speaker turn inside a segment; times are seconds from the start of its audio."""
+
+    t_start: float
+    t_end: float
+    label: SpeakerLabel
+
+
+NEW = "?"  # window label: dissimilar to every known speaker, still to be placed
+
+
 class SpeakerTracker:
     """Live speaker identification for one session. Not thread-safe: use from one thread."""
 
@@ -344,6 +485,7 @@ class SpeakerTracker:
         store: ProfileStore | None = None,
         labels: SessionLabels | None = None,
         embeddings: SessionEmbeddings | None = None,
+        windows: SessionWindows | None = None,
         *,
         reload_interval_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
@@ -353,8 +495,18 @@ class SpeakerTracker:
         self.store = store
         self.labels = labels
         self.embeddings = embeddings
-        self.clusterer = SessionClusterer(cfg.cluster_threshold, cfg.merge_threshold)
+        self.windows = windows
+        self.clusterer = SessionClusterer(
+            cfg.cluster_threshold,
+            cfg.merge_threshold,
+            assign_floor=cfg.assign_floor,
+            confirm_s=cfg.confirm_s,
+            confirm_segments=cfg.confirm_segments,
+            ttl_segments=cfg.tentative_ttl,
+            max_speakers=cfg.max_speakers,
+        )
         self._last: dict[str, str] = {}  # stream -> last speaker id
+        self._announced: set[str] = set()  # clusters already written to speakers.json
         self._reload_interval = reload_interval_s
         self._clock = clock
         self._next_reload = 0.0
@@ -399,9 +551,29 @@ class SpeakerTracker:
         self._last[stream] = prev
         return SpeakerLabel(prev, self._name_for(prev), INHERIT_CONF, True)
 
-    # -- main entry ----------------------------------------------------------------
+    def _sync_labels(self) -> None:
+        """Mirror cluster creation and merges into ``speakers.json``."""
+        merges = self.clusterer.pop_merges()
+        if self.labels is None:
+            return
+        for cid in self.clusterer.cluster_ids:
+            if cid not in self._announced:
+                self.labels.ensure_cluster(cid)
+                self._announced.add(cid)
+        for dead, survivor in merges:
+            self.labels.merge(dead, survivor)
+
+    def _profile_label(self, match: Match) -> SpeakerLabel:
+        assert match.profile is not None
+        pid = match.profile.id
+        if self.labels is not None:
+            self.labels.set_profile_name(pid, match.profile.name)
+        return SpeakerLabel(PROFILE_PREFIX + pid, match.profile.name, match.score, False)
+
+    # -- whole-segment path (``window_s = 0``) -------------------------------------
 
     def identify(self, stream: str, audio: np.ndarray) -> SpeakerLabel:
+        """One label for the whole segment (a single embedding)."""
         if len(audio) / SAMPLE_RATE < self.cfg.min_embed_s:
             return self._inherit(stream)
         try:
@@ -412,21 +584,109 @@ class SpeakerTracker:
         self._maybe_reload()
         match = self._matcher.match(emb)
         if match.accepted and match.profile is not None:
-            pid = match.profile.id
-            sid = PROFILE_PREFIX + pid
-            if self.labels is not None:
-                self.labels.set_profile_name(pid, match.profile.name)
-            self._last[stream] = sid
-            return SpeakerLabel(sid, match.profile.name, match.score, False, emb)
-        cid, score = self.clusterer.assign(emb)
-        if self.labels is not None:
-            self.labels.ensure_cluster(cid)
-            for dead, survivor in self.clusterer.pop_merges():
-                self.labels.merge(dead, survivor)
-        else:
-            self.clusterer.pop_merges()
+            label = self._profile_label(match)
+            self._last[stream] = label.speaker_id
+            return SpeakerLabel(label.speaker_id, label.name, label.conf, False, emb)
+        segment = self.clusterer.begin_segment()
+        cid, score = self.clusterer.observe(emb, len(audio) / SAMPLE_RATE, segment)
+        self._sync_labels()
+        cid = self.clusterer.resolve(cid)
         self._last[stream] = cid
         return SpeakerLabel(cid, self._name_for(cid), score, True, emb)
+
+    # -- turns ---------------------------------------------------------------------
+
+    def identify_turns(
+        self, stream: str, audio: np.ndarray, t_start: float = 0.0
+    ) -> list[TurnLabel]:
+        """Split one segment into speaker turns (see ``steno.windows``).
+
+        ``t_start`` is the segment's session time, only used to date the stored window
+        embeddings. Never returns an empty list: a segment too short to embed is one
+        turn that inherits the previous speaker of its stream.
+        """
+        cfg = self.cfg
+        dur = len(audio) / SAMPLE_RATE
+        if cfg.window_s <= 0:
+            return [TurnLabel(0.0, dur, self.identify(stream, audio))]
+        spans = window_spans(dur, cfg.window_s, cfg.window_hop_s, cfg.min_embed_s)
+        embs: list[np.ndarray] = []
+        kept: list[tuple[float, float]] = []
+        for a, b in spans:
+            try:
+                embs.append(self.embedder.embed(audio[int(a * SAMPLE_RATE) : int(b * SAMPLE_RATE)]))
+                kept.append((a, b))
+            except Exception:
+                log.exception("Speaker embedding failed for a window")
+        if not embs:
+            return [TurnLabel(0.0, dur, self._inherit(stream))]
+        spans = kept
+        self._maybe_reload()
+        segment = self.clusterer.begin_segment()
+        if self.windows is not None:
+            for (a, b), emb in zip(spans, embs, strict=True):
+                self.windows.add(stream, t_start + a, t_start + b, emb)
+
+        # Pass 1: classify every window without changing any cluster.
+        raw: list[str] = []
+        matches: list[Match | None] = []
+        profile_labels: dict[str, SpeakerLabel] = {}
+        for emb in embs:
+            match = self._matcher.match(emb)
+            if match.accepted and match.profile is not None:
+                sid = PROFILE_PREFIX + match.profile.id
+                raw.append(sid)
+                matches.append(match)
+                profile_labels.setdefault(sid, self._profile_label(match))
+                continue
+            matches.append(None)
+            cid, sim = self.clusterer.nearest(emb)
+            raw.append(cid if cid is not None and sim >= self.clusterer.assign_floor else NEW)
+        smooth = median_filter_labels(raw, cfg.smooth_windows)
+
+        # Pass 2: apply the clustering gate to the smoothed labels.
+        centers = window_centers(spans)
+        cuts = [0.0] + [(centers[i] + centers[i + 1]) / 2 for i in range(len(spans) - 1)] + [dur]
+        final: list[str] = []
+        scores: list[float] = []
+        for i, (emb, lab) in enumerate(zip(embs, smooth, strict=True)):
+            core = cuts[i + 1] - cuts[i]
+            if lab == NEW:
+                cid, score = self.clusterer.observe(emb, core, segment)
+            elif lab.startswith(PROFILE_PREFIX):
+                cid = lab
+                m = matches[i]
+                score = m.score if m is not None and raw[i] == lab else 0.0
+            else:
+                cid = self.clusterer.resolve(lab)
+                score = float(self.clusterer.centroid(cid) @ l2_normalize(emb))
+                if raw[i] == lab and score >= self.clusterer.cluster_threshold:
+                    self.clusterer.update(cid, emb, core, segment)
+            final.append(cid)
+            scores.append(score)
+        self._sync_labels()
+        final = [x if x.startswith(PROFILE_PREFIX) else self.clusterer.resolve(x) for x in final]
+
+        turns = cut_turns(spans, final, dur, cfg.min_turn_s)
+        if cfg.snap_boundaries:
+            turns = snap_boundaries(turns, audio)
+        out: list[TurnLabel] = []
+        for turn in turns:
+            idx = [i for i, c in enumerate(centers) if turn.t_start <= c < turn.t_end]
+            same = [i for i in idx if final[i] == turn.label]
+            idx = same or idx or [min(range(len(centers)), key=lambda i: abs(
+                centers[i] - (turn.t_start + turn.t_end) / 2))]
+            emb = l2_normalize(np.mean([embs[i] for i in idx], axis=0))
+            conf = float(np.mean([scores[i] for i in idx]))
+            sid = turn.label
+            if sid.startswith(PROFILE_PREFIX):
+                name = profile_labels[sid].name if sid in profile_labels else self._name_for(sid)
+                label = SpeakerLabel(sid, name, conf, False, emb)
+            else:
+                label = SpeakerLabel(sid, self._name_for(sid), conf, True, emb)
+            out.append(TurnLabel(turn.t_start, turn.t_end, label))
+        self._last[stream] = out[-1].label.speaker_id
+        return out
 
     def record(self, seq: int, label: SpeakerLabel) -> None:
         """Store the embedding of the segment that was written as ``seq``."""
@@ -434,5 +694,13 @@ class SpeakerTracker:
             self.embeddings.add(seq, label.embedding)
 
     def close(self) -> None:
+        """Merge speakers that never got enough evidence, then flush the stores."""
+        self.clusterer.settle(final=True)
+        try:
+            self._sync_labels()
+        except Exception:
+            log.exception("Could not record final speaker merges")
         if self.embeddings is not None:
             self.embeddings.close()
+        if self.windows is not None:
+            self.windows.close()

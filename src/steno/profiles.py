@@ -4,6 +4,7 @@ Everything here is written through ``steno.secure`` (Windows DPAPI, current user
 
     <data_dir>/profiles/<id>.bin              one person: embeddings + name + timestamps
     <data_dir>/sessions/<id>/embeddings.bin   seq -> embedding of every embedded segment
+    <data_dir>/sessions/<id>/windows.bin      embedding of every 1.5 s window (for refine)
 
 Both files are an ``npz`` archive (no pickles) holding float32 embeddings plus a
 small JSON metadata string. A profile keeps up to ``MAX_EMBEDDINGS`` embeddings per
@@ -29,6 +30,7 @@ from steno.secure import SecureStorageError, read_protected, write_protected
 
 MAX_EMBEDDINGS = 30
 EMBEDDINGS_NAME = "embeddings.bin"
+WINDOWS_NAME = "windows.bin"
 _ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
@@ -262,6 +264,88 @@ class SessionEmbeddings:
         emb = np.vstack([self._items[int(s)] for s in seqs]).astype(np.float32)
         buf = io.BytesIO()
         np.savez(buf, seq=seqs, embeddings=emb)
+        write_protected(self.path, buf.getvalue())
+        self._dirty = 0
+
+    def close(self) -> None:
+        self.flush()
+
+
+# --------------------------------------------------------------------------- session windows
+
+
+@dataclass(frozen=True)
+class WindowSet:
+    """All window embeddings of a session, in the order they were produced."""
+
+    stream: list[str]  # per window: audio stream name ("mic", "loopback")
+    t0: np.ndarray  # (n,) float64, session seconds
+    t1: np.ndarray
+    emb: np.ndarray  # (n, dim) float32, L2-normalised rows
+
+    def __len__(self) -> int:
+        return len(self.t0)
+
+
+class SessionWindows:
+    """Window embeddings of one session (biometric: encrypted like ``embeddings.bin``).
+
+    ``steno refine`` clusters these instead of one embedding per segment. ``add`` buffers
+    and rewrites the whole file every ``flush_every`` windows and on ``close``.
+    """
+
+    def __init__(self, session_dir: Path, flush_every: int = 100):
+        self.path = Path(session_dir) / WINDOWS_NAME
+        self._flush_every = flush_every
+        self._streams: list[str] = []
+        self._t0: list[float] = []
+        self._t1: list[float] = []
+        self._emb: list[np.ndarray] = []
+        self._dirty = 0
+        existing = self.load(session_dir)
+        if existing is not None:
+            self._streams = list(existing.stream)
+            self._t0, self._t1 = list(existing.t0), list(existing.t1)
+            self._emb = list(existing.emb)
+
+    @staticmethod
+    def load(session_dir: Path) -> WindowSet | None:
+        path = Path(session_dir) / WINDOWS_NAME
+        if not path.is_file():
+            return None
+        with np.load(io.BytesIO(read_protected(path)), allow_pickle=False) as npz:
+            meta = json.loads(str(npz["meta"]))
+            names = list(meta["streams"])
+            return WindowSet(
+                stream=[names[int(i)] for i in npz["stream"]],
+                t0=np.asarray(npz["t0"], dtype=np.float64),
+                t1=np.asarray(npz["t1"], dtype=np.float64),
+                emb=np.asarray(npz["embeddings"], dtype=np.float32),
+            )
+
+    def add(self, stream: str, t0: float, t1: float, embedding: np.ndarray) -> None:
+        self._streams.append(stream)
+        self._t0.append(float(t0))
+        self._t1.append(float(t1))
+        self._emb.append(np.asarray(embedding, dtype=np.float32))
+        self._dirty += 1
+        if self._dirty >= self._flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._dirty or not self._emb:
+            return
+        names = sorted(set(self._streams))
+        index = {n: i for i, n in enumerate(names)}
+        buf = io.BytesIO()
+        np.savez(
+            buf,
+            stream=np.array([index[s] for s in self._streams], dtype=np.int16),
+            t0=np.array(self._t0, dtype=np.float64),
+            t1=np.array(self._t1, dtype=np.float64),
+            embeddings=np.vstack(self._emb).astype(np.float32),
+            meta=np.array(json.dumps({"v": 1, "streams": names})),
+        )
         write_protected(self.path, buf.getvalue())
         self._dirty = 0
 

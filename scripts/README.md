@@ -44,6 +44,7 @@ uv run python scripts/eval_diarization.py --download --minutes 10     # fetch da
 uv run python scripts/eval_diarization.py                              # all systems
 uv run python scripts/eval_diarization.py --system steno-live,sherpa-offline --save-rttm
 uv run python scripts/eval_diarization.py --session 20260101-100000 --rttm mine.rttm
+uv run python scripts/eval_diarization.py --system steno-live --set speakers.window_s=1.0   # try a setting
 ```
 
 Data (`--download`, all outside the repo in `<data_dir>/eval/`): three AMI test
@@ -63,14 +64,16 @@ Systems (`--system`, comma-separated):
 
 | system | what it runs |
 |---|---|
-| `steno-live` | Steno's live engine replayed offline: Silero VAD, CAM++ embedding, leader-follower clustering with merges resolved; the transcriber is a fake ("x") so only speaker turns matter |
-| `steno-refine` | the same session, then `refine_session` (agglomerative re-clustering) and its labels overlay; RTF includes the live run |
+| `steno-live` | Steno's live engine replayed offline: Silero VAD, CAM++ embeddings of 1.5 s windows, speaker turns inside each segment, gated online clustering with merges resolved; the transcriber is a fake (one "x" per 0.25 s) so only speaker turns matter |
+| `steno-refine` | the same session, then `refine_session` (spectral clustering of all windows, eigengap speaker count) and its labels overlay; RTF includes the live run |
 | `sherpa-offline` | sherpa-onnx offline diarization (pyannote segmentation-3.0 + CAM++), speaker count estimated with `--cluster-threshold` (or fixed with `--num-speakers`) |
 | `sherpa-offline-oracle` | the same, given the true number of speakers |
 
 The `steno-*` systems run against a temporary `STENO_DATA_DIR` (ONNX models linked in,
 no profiles, no sessions), so your real profiles are never read or changed. They use
-the built-in default config unless `--config` is given. Segments labelled unknown
+the built-in default config unless `--config` is given; `--set section.key=value`
+(repeatable) overrides single values on top of it. Use `--skip-overlap` to score only
+regions where one reference speaker talks (a single-label system cannot get the rest). Segments labelled unknown
 (`U`) are dropped from the hypothesis and so count as missed speech.
 
 Output: markdown table per system (one row per file, then mean over files and pooled)

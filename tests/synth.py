@@ -93,3 +93,14 @@ class FakeAsr:
         self.calls += 1
         level = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
         return f"amp{round(level * 100)}", "sv"
+
+
+class FakeWordAsr(FakeAsr):
+    """FakeAsr with word timestamps: one word ``w<i>`` per 0.25 s of audio."""
+
+    def transcribe_words(self, audio: np.ndarray):
+        from steno.windows import Word
+
+        text, lang = self.transcribe(audio)
+        n = max(1, int(len(audio) / SR / 0.25))
+        return text, lang, [Word(i * 0.25, (i + 1) * 0.25, f"w{i}") for i in range(n)]

@@ -1,8 +1,11 @@
 """Speech recognition backends behind a minimal protocol.
 
-The engine only needs ``transcribe(audio) -> (text, lang)``. To add another
-backend (for example sherpa-onnx / Parakeet), implement ``Transcriber``, register
-it in ``BACKENDS`` and select it with ``[asr] backend`` in the config.
+The engine only needs ``transcribe(audio) -> (text, lang)``. A backend may also offer
+``transcribe_words(audio) -> (text, lang, words)`` with per-word timestamps; the engine
+uses it to split one segment's text between speakers when a segment holds several turns
+(see ``steno.windows``). To add another backend (for example sherpa-onnx / Parakeet),
+implement ``Transcriber``, register it in ``BACKENDS`` and select it with
+``[asr] backend`` in the config.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import numpy as np
 
 from steno import paths
 from steno.config import AsrConfig
+from steno.windows import Word
 
 log = logging.getLogger(__name__)
 
@@ -57,12 +61,13 @@ class WhisperTranscriber:
         self._language = None if language == "auto" else language
         self._beam_size = beam_size
         self._model = None
+        self._pipeline = None
 
     def load(self) -> None:
         if self._model is not None:
             return
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-        from faster_whisper import WhisperModel
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
 
         log.info("Loading ASR model %s", self._model_id)
         self._model = WhisperModel(
@@ -72,6 +77,7 @@ class WhisperTranscriber:
             cpu_threads=self._cpu_threads,
             download_root=str(paths.models_dir()),
         )
+        self._pipeline = BatchedInferencePipeline(self._model)
 
     def transcribe(self, audio: np.ndarray) -> tuple[str, str]:
         self.load()
@@ -86,6 +92,37 @@ class WhisperTranscriber:
         )
         text = " ".join(s.text.strip() for s in segments).strip()
         return text, info.language or (self._language or "")
+
+    def transcribe_words(self, audio: np.ndarray) -> tuple[str, str, list[Word]]:
+        """Like ``transcribe`` plus word timestamps (seconds from the start of ``audio``).
+
+        Goes through faster-whisper's ``BatchedInferencePipeline`` with a single clip
+        covering the whole utterance. The plain ``WhisperModel.transcribe`` with
+        ``word_timestamps=True`` re-seeks to the last word and encodes the remaining tail
+        again, which made it 3-8x slower on CPU; the batched path costs about 15 % more
+        than plain transcription.
+        """
+        self.load()
+        assert self._pipeline is not None
+        samples = np.asarray(audio, dtype=np.float32)
+        segments, info = self._pipeline.transcribe(
+            samples,
+            language=self._language,
+            beam_size=self._beam_size,
+            word_timestamps=True,
+            clip_timestamps=[{"start": 0.0, "end": len(samples) / 16000}],
+            batch_size=1,
+            condition_on_previous_text=False,
+        )
+        segments = list(segments)
+        text = " ".join(s.text.strip() for s in segments).strip()
+        words = [
+            Word(float(w.start), float(w.end), w.word.strip())
+            for s in segments
+            for w in (s.words or [])
+            if w.word.strip()
+        ]
+        return text, info.language or (self._language or ""), words
 
 
 def _make_faster_whisper(cfg: AsrConfig) -> Transcriber:

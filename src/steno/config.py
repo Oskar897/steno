@@ -51,10 +51,15 @@ class AsrConfig:
 
 @dataclass(frozen=True)
 class VadConfig:
-    threshold: float = 0.5
+    threshold: float = 0.4
     min_silence_ms: int = 500
     min_speech_ms: int = 250
     max_segment_s: float = 15.0
+    # Lift quiet far-field audio before the VAD (see steno.vad.AutoGain); the audio that goes
+    # on to ASR and speaker recognition is not changed.
+    auto_gain: bool = True
+    auto_gain_target: float = 0.05  # RMS the 90th-percentile block level is lifted to
+    auto_gain_max: float = 8.0  # never amplify more than this
 
 
 @dataclass(frozen=True)
@@ -75,12 +80,35 @@ class SpeakersConfig:
     enabled: bool = True
     model: str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
     num_threads: int = 2
-    min_embed_s: float = 1.0  # shorter segments inherit the previous speaker of their stream
+    min_embed_s: float = 1.0  # shorter segments/windows inherit the previous speaker (conf 0)
     accept_threshold: float = 0.55  # profile match: best score must reach this ...
     margin: float = 0.05  # ... and beat the second-best person by this much
-    cluster_threshold: float = 0.5  # live: join a session cluster at/above this, else new
-    merge_threshold: float = 0.7  # live: merge two clusters whose centroids reach this
-    refine_threshold: float = 0.45  # `steno refine`: average-linkage stop similarity
+    # Sub-segment turns: a VAD segment is cut into overlapping windows, each is labelled
+    # on its own, and the segment is split where the label changes.
+    window_s: float = 1.5  # embedding window length; 0 = one embedding per segment (old way)
+    window_hop_s: float = 0.75
+    smooth_windows: int = 3  # median filter over window labels (odd; 1 = off)
+    min_turn_s: float = 0.5  # shorter turns are absorbed by the longer neighbour
+    snap_boundaries: bool = False  # move turn cuts to the quietest point within 0.4 s
+    # Live session clusters.
+    cluster_threshold: float = 0.5  # window joins a cluster (moves its centroid) at/above this
+    assign_floor: float = 0.4  # between floor and threshold: take the label, keep the centroid
+    merge_threshold: float = 0.7  # merge two clusters whose centroids reach this
+    confirm_s: float = 3.5  # a new speaker needs this much speech ...
+    confirm_segments: int = 2  # ... from this many different segments, else it is merged away
+    tentative_ttl: int = 8  # unconfirmed cluster untouched for this many segments is merged
+    max_speakers: int = 10
+    # `steno refine`: spectral clustering of all windows (AHC below min_spectral windows).
+    refine_threshold: float = 0.4  # AHC stop similarity (few windows) / segment-level fallback
+    refine_pval: float = 0.012  # p-pruning: fraction of strongest neighbours kept per row ...
+    refine_min_pnum: int = 6  # ... but at least this many
+    refine_min_spectral: int = 40  # fewer windows than this: agglomerative instead
+    refine_max_speakers: int = 10
+    refine_minor_windows: int = 4  # clusters this small are reassigned to the nearest large one
+    # `steno enroll`: windows over the recording, outliers dropped.
+    enroll_window_s: float = 2.5
+    enroll_hop_s: float = 1.0
+    enroll_outlier_sigma: float = 2.0
 
 
 @dataclass(frozen=True)

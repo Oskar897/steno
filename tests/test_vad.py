@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from steno.vad import FRAME, SpeechSegmenter, VadParams
+from steno.vad import FRAME, AutoGain, SpeechSegmenter, VadParams
 
 from .synth import SR, EnergyVad, silence, timeline, tone
 
@@ -111,3 +111,37 @@ def test_silero_onnx_model_shapes_and_state():
     model.reset()
     single = np.concatenate([model(noise[i : i + 1]) for i in range(8)])
     assert np.allclose(batch, single, atol=1e-4)
+
+
+# --------------------------------------------------------------------------- input gain
+
+
+def test_gain_lets_the_vad_hear_quiet_speech_without_changing_the_audio():
+    quiet = np.concatenate([silence(0.5), tone(2.0, 0.01), silence(1.5)])  # RMS 0.007 < 0.02
+    plain = SpeechSegmenter(EnergyVad())
+    assert plain.feed(quiet) + plain.flush() == []
+    loud_ears = SpeechSegmenter(EnergyVad())
+    out = loud_ears.feed(quiet, gain=4.0) + loud_ears.flush()
+    assert len(out) == 1
+    assert float(np.max(np.abs(out[0].audio))) == pytest.approx(0.01, abs=1e-4)  # untouched
+
+
+def test_auto_gain_lifts_quiet_audio_but_never_attenuates_or_overshoots():
+    quiet = tone(5.0, 0.01)  # RMS ~0.007
+    gain = AutoGain(target=0.05, max_gain=8.0)
+    assert gain.update(quiet[: SR // 2]) == 1.0  # not enough history yet
+    for i in range(0, len(quiet), SR // 2):
+        g = gain.update(quiet[i : i + SR // 2])
+    assert g == pytest.approx(0.05 / (0.01 / 2**0.5), rel=0.01)  # lifted to the target level
+    capped = AutoGain(target=0.05, max_gain=3.0)
+    for i in range(0, len(quiet), SR // 2):
+        g = capped.update(quiet[i : i + SR // 2])
+    assert g == 3.0
+    medium = AutoGain(target=0.05, max_gain=20.0)
+    for _ in range(10):
+        g = medium.update(tone(0.5, 0.05))
+    assert 1.0 < g < 20.0
+    loud = AutoGain()
+    for _ in range(10):
+        g = loud.update(tone(0.5, 0.5))
+    assert g == 1.0

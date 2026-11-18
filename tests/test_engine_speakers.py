@@ -52,7 +52,7 @@ def test_mic_segments_get_speaker_ids_not_the_fixed_me_label():
     assert segs[0].speaker_conf is not None
     # The 0.4 s clip (seq 4) is below min_embed_s: inherits S1 with zero confidence.
     assert segs[3].speaker_id == "S1" and segs[3].speaker_conf == 0.0
-    assert len(embedder.calls) == 4  # not embedded for the short one
+    assert len(embedder.calls) == 8  # two 1.5 s windows per embedded segment, none for seq 4
     assert seen == segs  # subscribers get the speaker fields too
 
     meta = json.loads((engine.session_dir / "session.json").read_text(encoding="utf-8"))
@@ -127,9 +127,11 @@ def test_explicit_speaker_label_bypasses_recognition():
 
 def test_embedding_error_does_not_stop_transcription():
     class Flaky(FakeEmbedder):
+        failures = 0
+
         def embed(self, audio):
-            if not self.calls:
-                self.calls.append(0.0)
+            if self.failures < 2:  # both windows of the first segment
+                self.failures += 1
                 raise RuntimeError("boom")
             return super().embed(audio)
 
@@ -157,3 +159,66 @@ def test_keep_audio_writes_one_flac_per_stream():
         path = engine.session_dir / f"audio-{name}.flac"
         data, rate = soundfile.read(path)
         assert rate == 16000 and abs(len(data) - len(source)) < 4000
+
+
+# --------------------------------------------------------------------------- turns inside a segment
+
+
+def interjection_audio():
+    """One continuous VAD segment: voice A, a 2 s interjection by B, then A again."""
+    return pad(timeline((1.0, 5.0, 0.3, A), (5.0, 7.0, 0.3, B), (7.0, 11.0, 0.3, A)))
+
+
+def run_words(sources, **kw):
+    from .synth import FakeWordAsr
+
+    engine = Engine(Config(), FakeWordAsr(), sources, vad_factory=EnergyVad,
+                    embedder=FakeEmbedder(), **kw)
+    engine.start()
+    assert engine.wait(timeout=20)
+    engine.stop()
+    return engine
+
+
+def test_one_segment_is_split_into_one_line_per_speaker_turn():
+    engine = run_words([ArraySource("mic", interjection_audio())])
+    segs = transcript.read_segments(engine.session_dir)
+    assert [s.speaker_id for s in segs] == ["S1", "S2", "S1"]
+    assert [s.seq for s in segs] == [1, 2, 3]
+    assert abs(segs[0].t_start - 0.8) < 0.1 and abs(segs[-1].t_end - 11.15) < 0.4  # VAD roll
+    assert all(a.t_end <= b.t_start + 1e-6 for a, b in zip(segs, segs[1:], strict=False))
+    words = [w for s in segs for w in s.text.split()]
+    assert words == [f"w{i}" for i in range(len(words))]  # every word once, in order
+    assert all(s.text for s in segs)
+    # S2 only got the words around its 2 s turn
+    assert 3 <= len(segs[1].text.split()) <= 12
+    assert all(s.provisional for s in segs)
+    # embeddings are stored per written line, windows once per window
+    emb = SessionEmbeddings.load(engine.session_dir)
+    assert sorted(emb) == [1, 2, 3]
+    from steno.profiles import SessionWindows
+
+    assert len(SessionWindows.load(engine.session_dir)) >= 10
+    assert (engine.session_dir / "windows.bin").is_file()
+
+
+def test_unconfirmed_interjection_speaker_is_folded_back_after_the_session():
+    engine = run_words([ArraySource("mic", interjection_audio())])
+    # 2 s of S2 in one segment is below the confirmation rule: merged into S1 at close
+    labels = SessionLabels(engine.session_dir).load()
+    assert labels["merged"] == {"S2": "S1"}
+    resolved = resolve_segments(engine.session_dir, transcript.read_segments(engine.session_dir))
+    assert {s.speaker for s in resolved} == {"Speaker 1"}
+
+
+def test_backend_without_word_timestamps_keeps_one_line_per_segment():
+    engine, _, _ = run([ArraySource("mic", interjection_audio())])  # plain FakeAsr
+    segs = transcript.read_segments(engine.session_dir)
+    assert len(segs) == 1 and segs[0].speaker_id == "S1"
+    assert abs(segs[0].t_end - segs[0].t_start - 10.4) < 0.6  # the whole segment span
+
+
+def test_forced_speaker_label_never_splits_turns():
+    engine = run_words([ArraySource("mic", interjection_audio())], speaker_labels={"mic": "Anna"})
+    segs = transcript.read_segments(engine.session_dir)
+    assert len(segs) == 1 and segs[0].speaker == "Anna" and segs[0].speaker_id is None

@@ -37,7 +37,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("enroll", help="record your voice from the mic and save/extend a profile")
     p.add_argument("name")
-    p.add_argument("--seconds", type=float, default=20.0, help="recording length (default 20)")
+    p.add_argument("--seconds", type=float, default=40.0,
+                   help="recording length (default 40; aim for at least 30 s of speech)")
 
     p = sub.add_parser("name", help="name a speaker cluster of a session and learn the voice")
     p.add_argument("session", help="'latest' or a session id")
@@ -56,6 +57,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("refine", help="re-cluster a session offline and re-match to profiles")
     p.add_argument("session", nargs="?", default="latest",
                    help="'latest' (default) or a session id")
+    p.add_argument("--speakers", type=int, metavar="N",
+                   help="force exactly N speakers instead of estimating the count")
 
     p = sub.add_parser("transcribe-file", help="transcribe an audio file into a new session")
     p.add_argument("audio")
@@ -233,14 +236,21 @@ def cmd_enroll(args: argparse.Namespace, cfg: Config) -> int:
             "(read aloud, in the language you use in meetings). Voiceprints are biometric data; "
             "only enrol people who agreed.", file=sys.stderr, flush=True)
         audio = record_seconds(CaptureSource("mic"), args.seconds)
-        result = ops.enroll_audio(audio, args.name, _store(), embedder,
-                                  min_chunk_s=cfg.speakers.min_embed_s)
+        result = ops.enroll_audio(
+            audio, args.name, _store(), embedder, min_chunk_s=cfg.speakers.min_embed_s,
+            window_s=cfg.speakers.enroll_window_s, hop_s=cfg.speakers.enroll_hop_s,
+            outlier_sigma=cfg.speakers.enroll_outlier_sigma)
     except (AudioError, SpeakerError, ops.OpsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     verb = "Created" if result.created else "Extended"
-    print(f"{verb} profile '{result.profile.name}' ({result.used} chunk(s) added, "
+    print(f"{verb} profile '{result.profile.name}' ({result.used} window(s) added from "
+          f"{result.speech_s:.0f} s of speech, {result.dropped} outlier(s) dropped, "
           f"{result.total} stored).")
+    if result.speech_s < ops.ENROLL_SUGGESTED_SPEECH_S:
+        print(f"Only {result.speech_s:.0f} s of speech: recognition is more reliable with at "
+              f"least {ops.ENROLL_SUGGESTED_SPEECH_S:.0f} s. Run enroll again to add more.",
+              file=sys.stderr)
     return 0
 
 
@@ -306,7 +316,8 @@ def cmd_refine(args: argparse.Namespace, cfg: Config) -> int:
     if session_dir is None:
         return 1
     try:
-        res = ops.refine_session(session_dir, cfg.speakers, _store())
+        res = ops.refine_session(
+            session_dir, cfg.speakers, _store(), num_speakers=args.speakers)
     except ops.OpsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

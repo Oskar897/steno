@@ -9,12 +9,16 @@ UI or a WebSocket server can all drive it: ``subscribe(callback)`` to receive
 each final ``Segment``, ``start()`` / ``stop()`` to control it.
 
 Speaker recognition (layer 2, ``[speakers]``): when an ``embedder`` is given, the
-ASR thread identifies the speaker of every transcribed segment right after ASR
+ASR thread identifies the speakers of every transcribed segment right after ASR
 (one worker keeps segments in time order, which the live clustering relies on) and
 writes ``speaker_id`` / ``speaker_conf`` / ``provisional`` next to the display
-label; see ``steno.speakers``. Without an embedder (or with ``[speakers] enabled =
-false``) the fixed per-stream labels from ``[audio]`` are used. Subscribers receive
-the full ``Segment`` including those fields. Embeddings are stored encrypted in the
+label; see ``steno.speakers``. A segment in which the speaker changes (a short
+interjection inside a long turn) is written as one line per speaker turn: the ASR
+backend's word timestamps decide which words belong to which turn (``steno.windows``).
+Lines keep strictly increasing ``seq`` and cover disjoint parts of the segment.
+Without an embedder (or with ``[speakers] enabled = false``) the fixed per-stream
+labels from ``[audio]`` are used. Subscribers receive the full ``Segment`` including
+those fields. Embeddings are stored encrypted in the
 session directory; profiles are never modified by the engine.
 
 Echo heuristic (``[echo]`` config): when the speakers play the remote side, the
@@ -44,10 +48,19 @@ from steno.asr import Transcriber
 from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource, StreamRecorder
 from steno.config import Config
 from steno.labels import SessionLabels
-from steno.profiles import ProfileStore, SessionEmbeddings
-from steno.speakers import Embedder, SpeakerLabel, SpeakerTracker
+from steno.profiles import ProfileStore, SessionEmbeddings, SessionWindows
+from steno.speakers import Embedder, SpeakerTracker, TurnLabel
 from steno.transcript import Segment, SessionWriter
-from steno.vad import SileroVad, SpeechProbModel, SpeechSegmenter, Utterance, VadParams, rms
+from steno.vad import (
+    AutoGain,
+    SileroVad,
+    SpeechProbModel,
+    SpeechSegmenter,
+    Utterance,
+    VadParams,
+    rms,
+)
+from steno.windows import Turn, split_by_turns
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +114,7 @@ class _Stream:
     name: str
     segmenter: SpeechSegmenter
     origin: float | None = None  # session-clock time of the first sample
+    agc: AutoGain | None = None  # input gain for the VAD only
     eof: bool = False
 
     @property
@@ -221,8 +235,11 @@ class Engine:
             max_segment_s=self.config.vad.max_segment_s,
         )
         for src in self.sources:
+            agc = None
+            if self.config.vad.auto_gain:
+                agc = AutoGain(self.config.vad.auto_gain_target, self.config.vad.auto_gain_max)
             self._streams[src.name] = _Stream(
-                src.name, SpeechSegmenter(self._vad_factory(), params)
+                src.name, SpeechSegmenter(self._vad_factory(), params), agc=agc
             )
         self._writer = SessionWriter.create(
             root=self._sessions_root,
@@ -242,6 +259,7 @@ class Engine:
                 self._profile_store or ProfileStore(paths.profiles_dir()),
                 labels,
                 SessionEmbeddings(self._writer.dir),
+                SessionWindows(self._writer.dir),
             )
         if self._keep_audio:
             for name in self._streams:
@@ -316,7 +334,8 @@ class Engine:
                 if recorder is not None and chunk.samples.size:
                     recorder.write(chunk.samples)
                 if chunk.samples.size:
-                    for utt in stream.segmenter.feed(chunk.samples):
+                    gain = stream.agc.update(chunk.samples) if stream.agc else 1.0
+                    for utt in stream.segmenter.feed(chunk.samples, gain):
                         self._on_utterance(stream, utt)
                 if chunk.eof:
                     for utt in stream.segmenter.flush():
@@ -388,27 +407,26 @@ class Engine:
                 if self._abort.is_set():
                     continue
                 try:
-                    text, lang = self.transcriber.transcribe(job.audio)  # type: ignore[arg-type]
+                    text, lang, words = self._transcribe(job)
                 except Exception:
                     log.exception("Transcription failed for utterance at %.1fs", job.t_start)
                     continue
                 if not text.strip(" .,!?-…"):
                     continue
-                label = self._identify(job)
-                seg = self._writer.append(
-                    t_start=job.t_start,
-                    t_end=job.t_end,
-                    source=job.stream,
-                    speaker=label.name if label else self._labels.get(job.stream, job.stream),
-                    text=text.strip(),
-                    lang=lang,
-                    speaker_id=label.speaker_id if label else None,
-                    speaker_conf=label.conf if label else None,
-                    provisional=label.provisional if label else None,
+                turns = self._identify(job)
+                if turns is None:
+                    self._write(job, 0.0, job.t_end - job.t_start, None, text.strip(), lang)
+                    continue
+                pieces = split_by_turns(
+                    text.strip(), words, [Turn(x.t_start, x.t_end, "") for x in turns]
                 )
-                if label is not None and self._tracker is not None:
-                    self._tracker.record(seg.seq, label)
-                self._notify(seg)
+                for index, piece in pieces:
+                    turn = turns[index]
+                    if len(turns) > 1 and words:  # the cut is real: a turn spans only its part
+                        t0, t1 = turn.t_start, turn.t_end
+                    else:
+                        t0, t1 = 0.0, job.t_end - job.t_start
+                    self._write(job, t0, t1, turn.label, piece, lang)
         finally:
             if self._tracker is not None:
                 try:
@@ -417,14 +435,39 @@ class Engine:
                     log.exception("Could not save session embeddings")
             self._done.set()
 
-    def _identify(self, job: _Job) -> SpeakerLabel | None:
+    def _transcribe(self, job: _Job) -> tuple[str, str, list | None]:
+        """``(text, language, words)``; ``words`` is None for backends without timestamps."""
+        fn = getattr(self.transcriber, "transcribe_words", None)
+        if fn is not None and self._tracker is not None and job.stream not in self._forced:
+            return fn(job.audio)
+        text, lang = self.transcriber.transcribe(job.audio)  # type: ignore[arg-type]
+        return text, lang, None
+
+    def _identify(self, job: _Job) -> list[TurnLabel] | None:
         if self._tracker is None or job.stream in self._forced:
             return None
         try:
-            return self._tracker.identify(job.stream, job.audio)  # type: ignore[arg-type]
+            return self._tracker.identify_turns(job.stream, job.audio, job.t_start)  # type: ignore[arg-type]
         except Exception:
             log.exception("Speaker identification failed for utterance at %.1fs", job.t_start)
             return None
+
+    def _write(self, job: _Job, t0: float, t1: float, label, text: str, lang: str) -> None:
+        assert self._writer is not None
+        seg = self._writer.append(
+            t_start=job.t_start + t0,
+            t_end=job.t_start + t1,
+            source=job.stream,
+            speaker=label.name if label else self._labels.get(job.stream, job.stream),
+            text=text,
+            lang=lang,
+            speaker_id=label.speaker_id if label else None,
+            speaker_conf=label.conf if label else None,
+            provisional=label.provisional if label else None,
+        )
+        if label is not None and self._tracker is not None:
+            self._tracker.record(seg.seq, label)
+        self._notify(seg)
 
     def _notify(self, seg: Segment) -> None:
         with self._sub_lock:

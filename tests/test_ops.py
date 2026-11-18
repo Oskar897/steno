@@ -274,11 +274,124 @@ def test_enroll_audio_creates_then_extends_profile():
     audio = np.concatenate([timeline((0.5, 3.0, 0.3, 220.0)), silence(1.0),
                             timeline((0.2, 2.5, 0.3, 220.0)), silence(1.0)])
     first = ops.enroll_audio(audio, "Alice", store, FakeEmbedder(), vad_factory=EnergyVad)
-    assert first.created and first.used == 2 and first.total == 2
+    assert first.created and first.used == first.total >= 2  # windows, not whole chunks
+    assert first.speech_s > 4.0 and first.dropped == 0
     again = ops.enroll_audio(audio, "alice", store, FakeEmbedder(), vad_factory=EnergyVad)
-    assert not again.created and again.total == 4
+    assert not again.created and again.total == 2 * first.total
     assert len(store.list()) == 1
 
     with pytest.raises(ops.OpsError, match="no speech"):
         ops.enroll_audio(silence(5.0), "Bob", store, FakeEmbedder(), vad_factory=EnergyVad)
     assert store.find_by_name("Bob") is None
+
+
+# --------------------------------------------------------------------------- refine on windows
+
+
+def make_window_session(voices, seg_s=5.0, cough_seq=None, minute=30):
+    """One mic stream, one segment per entry of ``voices``; windows every 0.75 s inside each.
+
+    Live labels are deliberately fragmented (every segment its own cluster).
+    A voice of ``None`` is a 3-window noise burst (``cough``).
+    """
+    from steno.profiles import SessionWindows
+
+    w = SessionWriter.create(model="fake", sources=["mic"],
+                             now=datetime(2026, 1, 1, 11, minute, 0))
+    wins = SessionWindows(w.dir)
+    t = 0.0
+    for i, voice in enumerate(voices):
+        dur = 2.5 if voice is None else seg_s
+        w.append(t_start=t, t_end=t + dur, source="mic", speaker=f"Speaker {i + 1}",
+                 text=f"t{i + 1}", lang="sv", speaker_id=f"S{i + 1}", speaker_conf=0.5,
+                 provisional=True)
+        n = 3 if voice is None else int((dur - 1.5) / 0.75) + 1
+        for k in range(n):
+            vec = voice_vector(2 if voice is None else voice, 0.15, seed=1000 * i + k)
+            wins.add("mic", t + 0.75 * k, t + 0.75 * k + 1.5, vec)
+        t += dur + 0.5
+    wins.close()
+    w.close()
+    return w.dir
+
+
+def test_refine_clusters_windows_with_spectral_and_votes_per_segment():
+    voices = [ALICE, BOB, ALICE, ALICE, BOB, ALICE, BOB, BOB, ALICE, BOB, ALICE, BOB]
+    session = make_window_session(voices)
+    res = ops.refine_session(session, SpeakersConfig(), ProfileStore())
+    names = speakers_by_seq(session)
+    first = {v: names[voices.index(v) + 1] for v in (ALICE, BOB)}
+    assert first[ALICE] != first[BOB]
+    assert all(names[i + 1] == first[v] for i, v in enumerate(voices))
+    assert len(res.speakers) == 2 and res.embedded == len(voices)
+
+
+def test_refine_reassigns_a_minor_cluster_and_honours_a_forced_count():
+    voices = [ALICE, BOB, ALICE, BOB, None, ALICE, BOB, ALICE, BOB, ALICE, BOB]
+    session = make_window_session(voices, minute=31)
+    res = ops.refine_session(session, SpeakersConfig(), ProfileStore())
+    assert len(res.speakers) == 2  # the 3-window burst is not a speaker
+    one = ops.refine_session(session, SpeakersConfig(), ProfileStore(), num_speakers=1)
+    assert len(one.speakers) == 1
+    with pytest.raises(ops.OpsError, match="at least 1"):
+        ops.refine_session(session, SpeakersConfig(), ProfileStore(), num_speakers=0)
+
+
+def test_refine_with_windows_matches_profiles_by_cluster_centroid():
+    voices = [ALICE, BOB] * 8
+    session = make_window_session(voices, minute=32)
+    store = ProfileStore()
+    bob = store.create("Bob", np.vstack([voice_vector(BOB, 0.05, 90 + s) for s in range(4)]))
+    ops.refine_session(session, SpeakersConfig(), store)
+    names = speakers_by_seq(session)
+    assert names[2] == names[16] == "Bob" and names[1] == "Speaker 1"
+    assert labels.read_overlay(session)[2]["speaker_id"] == f"P:{bob.id}"
+
+
+def test_refine_cli_speakers_option(capsys):
+    session = make_window_session([ALICE, BOB] * 8, minute=33)
+    assert cli.main(["refine", session.name, "--speakers", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "1 speaker(s)" in out
+
+
+# --------------------------------------------------------------------------- windows store, enrol
+
+
+def test_session_windows_roundtrip_and_append_after_reopen(tmp_path):
+    from steno.profiles import SessionWindows
+
+    assert SessionWindows.load(tmp_path) is None
+    sw = SessionWindows(tmp_path, flush_every=2)
+    sw.add("mic", 0.0, 1.5, voice_vector(0))
+    sw.add("loopback", 1.0, 2.5, voice_vector(1))
+    sw.add("mic", 2.0, 3.5, voice_vector(2))
+    sw.close()
+    again = SessionWindows(tmp_path)  # reopening continues the same file
+    again.add("mic", 4.0, 5.5, voice_vector(3))
+    again.close()
+    ws = SessionWindows.load(tmp_path)
+    assert len(ws) == 4 and ws.stream == ["mic", "loopback", "mic", "mic"]
+    assert ws.t0.tolist() == [0.0, 1.0, 2.0, 4.0] and ws.t1[-1] == 5.5
+    assert np.allclose(ws.emb[1], voice_vector(1))
+    raw = (tmp_path / "windows.bin").read_bytes()
+    assert raw.startswith((b"STENO-DPAPI1", b"STENO-PLAIN1"))  # same protected container
+
+
+def test_drop_outliers_removes_the_far_embeddings_only():
+    good = np.vstack([voice_vector(0, 0.05, s) for s in range(12)])
+    cough = voice_vector(3)[None, :]
+    keep = ops.drop_outliers(np.vstack([good, cough]), sigma=2.0)
+    assert keep[:-1].all() and not keep[-1]
+    assert ops.drop_outliers(np.vstack([good[:3], cough]), 2.0).all()  # too few to judge
+    assert ops.drop_outliers(np.vstack([good, cough]), 0.0).all()  # disabled
+
+
+def test_enroll_uses_overlapping_windows_over_long_speech():
+    store = ProfileStore()
+    audio = np.concatenate([timeline((0.5, 8.5, 0.3, 220.0)), silence(1.0)])
+    res = ops.enroll_audio(audio, "Alice", store, FakeEmbedder(), vad_factory=EnergyVad,
+                           window_s=2.5, hop_s=1.0)
+    assert res.used >= 6  # one 8 s utterance -> many 2.5 s windows
+    assert 7.5 < res.speech_s < 9.0
+    assert len(store.find_by_name("Alice").embeddings) == res.total

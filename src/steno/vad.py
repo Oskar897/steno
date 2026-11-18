@@ -66,6 +66,37 @@ def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
 
 
+class AutoGain:
+    """Slowly adapting input gain for the VAD, for quiet far-field microphones.
+
+    Silero VAD misses a lot of speech when the whole recording is quiet (a laptop mic
+    across a room: RMS of a few thousandths). The gain lifts the 90th percentile of the
+    recent 0.1 s block levels to ``target`` RMS, never attenuates and is capped at
+    ``max_gain`` so that a silent room is not turned into loud noise. It only changes
+    what the VAD sees; the audio that goes on to ASR and the speaker model is untouched.
+    """
+
+    BLOCK = SAMPLE_RATE // 10
+
+    def __init__(self, target: float = 0.05, max_gain: float = 8.0, history_s: float = 30.0):
+        self.target = target
+        self.max_gain = max_gain
+        self._levels: deque[float] = deque(maxlen=max(10, int(history_s * 10)))
+        self._carry = np.zeros(0, dtype=np.float32)
+        self.gain = 1.0
+
+    def update(self, samples: np.ndarray) -> float:
+        data = np.concatenate([self._carry, np.asarray(samples, dtype=np.float32)])
+        n = len(data) // self.BLOCK
+        self._carry = data[n * self.BLOCK :].copy()
+        for block in data[: n * self.BLOCK].reshape(n, self.BLOCK):
+            self._levels.append(rms(block))
+        if len(self._levels) >= 20:  # 2 s of history before the gain moves
+            level = float(np.percentile(np.fromiter(self._levels, dtype=np.float64), 90))
+            self.gain = float(np.clip(self.target / max(level, 1e-5), 1.0, self.max_gain))
+        return self.gain
+
+
 class SpeechSegmenter:
     """Feeds audio in, yields ``Utterance`` objects. One instance per stream."""
 
@@ -113,14 +144,16 @@ class SpeechSegmenter:
 
     # -- processing -------------------------------------------------------------
 
-    def feed(self, samples: np.ndarray) -> list[Utterance]:
+    def feed(self, samples: np.ndarray, gain: float = 1.0) -> list[Utterance]:
+        """Process ``samples``; ``gain`` scales the audio the VAD model sees (not the output)."""
         data = np.concatenate([self._carry, np.asarray(samples, dtype=np.float32)])
         n = len(data) // FRAME
         self._carry = data[n * FRAME :].copy()
         if n == 0:
             return []
         frames = data[: n * FRAME].reshape(n, FRAME)
-        probs = np.asarray(self.model(frames), dtype=np.float32)
+        seen = frames if gain == 1.0 else np.clip(frames * gain, -1.0, 1.0)
+        probs = np.asarray(self.model(seen), dtype=np.float32)
         out: list[Utterance] = []
         for frame, p in zip(frames, probs, strict=True):
             self._step(frame.copy(), float(p), out)

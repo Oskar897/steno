@@ -217,3 +217,177 @@ def test_embedding_failure_falls_back_to_inherit():
 def test_cosine_helper():
     assert abs(cosine(np.array([2.0, 0]), np.array([5.0, 0])) - 1.0) < 1e-6
     assert SR == 16000
+
+
+# ----------------------------------------------------------------------- anti-fragmentation gate
+
+
+def gated(**kw):
+    base = {"cluster_threshold": 0.5, "merge_threshold": 0.9, "assign_floor": 0.3,
+            "confirm_s": 3.5, "confirm_segments": 2, "ttl_segments": 3}
+    return SessionClusterer(**{**base, **kw})
+
+
+def test_gate_label_only_between_floor_and_threshold():
+    c = gated()
+    a, b = voice_vector(0), voice_vector(1)
+    assert c.observe(a, 4.0, 1)[0] == "S1"
+    uncertain = at_angle(a, b, 0.4)  # above the floor, below the join threshold
+    cid, score = c.observe(uncertain, 1.0, 2)
+    assert cid == "S1" and abs(score - 0.4) < 1e-5
+    assert c.count("S1") == 1 and c.speech_s("S1") == 4.0  # the centroid did not move
+    assert c.observe(at_angle(a, b, 0.8), 1.0, 2)[0] == "S1"
+    assert c.count("S1") == 2  # a confident window does join
+
+
+def test_gate_noise_cluster_is_merged_away_at_the_end():
+    c = gated()
+    a, b = voice_vector(0), voice_vector(1)
+    c.observe(a, 4.0, 1)
+    c.observe(a, 4.0, 2)
+    cid, _ = c.observe(b, 1.5, 3)  # a one-off noise: far from everybody
+    assert cid == "S2" and not c.confirmed("S2") and c.confirmed("S1")
+    c.settle()  # not expired yet
+    assert c.cluster_ids == ["S1", "S2"]
+    c.settle(final=True)
+    assert c.cluster_ids == ["S1"] and c.resolve("S2") == "S1"
+    assert c.pop_merges() == [("S2", "S1")]
+
+
+def test_gate_new_speaker_is_confirmed_by_enough_speech_from_two_segments():
+    c = gated()
+    a, b = voice_vector(0), voice_vector(1)
+    c.observe(a, 4.0, 1)
+    c.observe(a, 4.0, 2)
+    c.observe(b, 2.0, 3)
+    assert not c.confirmed("S2")  # 2 s from one segment
+    c.observe(voice_vector(1, 0.05, 4), 2.0, 4)
+    assert c.confirmed("S2")
+    c.settle(final=True)
+    assert c.cluster_ids == ["S1", "S2"] and c.pop_merges() == []
+
+
+def test_gate_one_long_monologue_alone_is_not_confirmed_but_never_lost():
+    c = gated()
+    c.observe(voice_vector(0), 10.0, 1)  # one segment only: below confirm_segments
+    assert not c.confirmed("S1")
+    c.settle(final=True)  # nothing confirmed: the best-supported cluster stays
+    assert c.cluster_ids == ["S1"]
+
+
+def test_gate_expired_tentative_cluster_merges_into_the_nearest_confirmed_one():
+    c = gated(ttl_segments=2)
+    a, b = voice_vector(0), voice_vector(1)
+    for _ in (1, 2):
+        c.begin_segment()
+        c.observe(a, 4.0)
+    c.begin_segment()
+    assert c.observe(b, 1.0)[0] == "S2"
+    c.begin_segment()  # one segment old
+    assert c.cluster_ids == ["S1", "S2"]
+    c.begin_segment()  # two segments untouched: expired
+    assert c.cluster_ids == ["S1"] and c.resolve("S2") == "S1"
+
+
+def test_gate_max_speakers_assigns_to_nearest_instead_of_opening_another():
+    c = gated(max_speakers=2, confirm_s=0.0, confirm_segments=1)
+    c.observe(voice_vector(0), 2.0, 1)
+    c.observe(voice_vector(1), 2.0, 2)
+    cid, _ = c.observe(voice_vector(2), 2.0, 3)
+    assert cid in ("S1", "S2") and c.cluster_ids == ["S1", "S2"]
+
+
+# --------------------------------------------------------------------------- turns inside a segment
+
+
+def tones(*parts):
+    """Concatenate tone bursts: (freq, seconds) pairs."""
+    return np.concatenate([tone(sec, 0.3, freq) for freq, sec in parts])
+
+
+def turn_cfg(**kw):
+    return SpeakersConfig(**{"snap_boundaries": False, **kw})
+
+
+def test_interjection_inside_a_long_segment_becomes_its_own_turn(tmp_path):
+    labels = SessionLabels(tmp_path)
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), None, labels)
+    audio = tones((220.0, 4.0), (330.0, 2.0), (220.0, 4.0))  # A, B interjects, A again
+    turns = t.identify_turns("mic", audio)
+    ids = [x.label.speaker_id for x in turns]
+    assert ids == ["S1", "S2", "S1"]
+    assert turns[0].t_start == 0.0 and turns[-1].t_end == 10.0
+    assert all(a.t_end == b.t_start for a, b in zip(turns, turns[1:], strict=False))
+    assert 3.0 <= turns[0].t_end <= 4.5 and 5.5 <= turns[1].t_end <= 7.0
+    assert all(x.label.provisional and x.label.embedding is not None for x in turns)
+
+
+def test_single_window_flip_is_smoothed_away():
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), None)
+    audio = tones((220.0, 4.0), (330.0, 0.6), (220.0, 4.0))  # a blip shorter than a window
+    assert [x.label.speaker_id for x in t.identify_turns("mic", audio)] == ["S1"]
+
+
+def test_short_segment_is_one_turn_and_too_short_inherits():
+    emb = FakeEmbedder()
+    t = SpeakerTracker(emb, turn_cfg())
+    one = t.identify_turns("mic", tones((220.0, 1.2)))
+    assert len(one) == 1 and one[0].label.speaker_id == "S1"
+    assert (one[0].t_start, one[0].t_end) == (0.0, 1.2)
+    short = t.identify_turns("mic", tones((330.0, 0.5)))
+    assert len(short) == 1 and short[0].label.speaker_id == "S1" and short[0].label.conf == 0.0
+    assert short[0].label.embedding is None
+    assert len(emb.calls) == 1
+
+
+def test_tentative_speaker_confirmed_by_two_segments_survives_close(tmp_path):
+    labels = SessionLabels(tmp_path)
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), None, labels)
+    t.identify_turns("mic", tones((220.0, 5.0)))
+    t.identify_turns("mic", tones((220.0, 4.0), (330.0, 2.5), (220.0, 3.0)))
+    t.identify_turns("mic", tones((330.0, 2.5), (220.0, 3.0)))
+    t.close()
+    data = labels.load()
+    assert set(data["clusters"]) == {"S1", "S2"} and data["merged"] == {}
+
+
+def test_unconfirmed_noise_speaker_is_merged_at_close(tmp_path):
+    labels = SessionLabels(tmp_path)
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), None, labels)
+    t.identify_turns("mic", tones((220.0, 5.0)))
+    t.identify_turns("mic", tones((220.0, 4.0), (440.0, 1.5), (220.0, 3.0)))  # one-off
+    t.identify_turns("mic", tones((220.0, 5.0)))
+    assert "S2" in labels.load()["clusters"]  # shown as its own speaker for now ...
+    t.close()
+    data = labels.load()
+    assert data["merged"] == {"S2": "S1"}  # ... and folded into S1 once the session ends
+    assert labels.display_name("S2") == "Speaker 1"
+
+
+def test_window_embeddings_are_stored_with_session_times(tmp_path):
+    from steno.profiles import SessionWindows
+
+    windows = SessionWindows(tmp_path)
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), None, None, None, windows)
+    t.identify_turns("mic", tones((220.0, 3.0)), t_start=100.0)
+    t.close()
+    ws = SessionWindows.load(tmp_path)
+    assert len(ws) == 3 and ws.stream == ["mic"] * 3
+    assert ws.t0[0] == 100.0 and ws.t1[-1] == 103.0
+    assert ws.emb.shape == (3, 16) and abs(float(np.linalg.norm(ws.emb[0])) - 1.0) < 1e-5
+
+
+def test_window_s_zero_falls_back_to_one_label_per_segment():
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(window_s=0.0))
+    turns = t.identify_turns("mic", tones((220.0, 4.0), (330.0, 2.0)))
+    assert len(turns) == 1 and (turns[0].t_start, turns[0].t_end) == (0.0, 6.0)
+
+
+def test_profile_windows_get_the_profile_and_cluster_windows_the_rest():
+    store = ProfileStore()
+    alice = store.create("Alice", np.vstack([voice_vector(0, 0.05, s) for s in range(4)]))
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), store)
+    turns = t.identify_turns("mic", tones((220.0, 4.0), (330.0, 2.0), (220.0, 4.0)))
+    assert [x.label.speaker_id for x in turns] == [f"P:{alice.id}", "S1", f"P:{alice.id}"]
+    assert [x.label.provisional for x in turns] == [False, True, False]
+    assert turns[0].label.name == "Alice"
