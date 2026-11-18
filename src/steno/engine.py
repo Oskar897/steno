@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from steno import paths
-from steno.asr import Transcriber
+from steno.asr import AsrResult, Transcriber
 from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource, StreamRecorder
 from steno.config import Config
 from steno.labels import SessionLabels
@@ -60,7 +60,7 @@ from steno.vad import (
     VadParams,
     rms,
 )
-from steno.windows import Turn, split_by_turns
+from steno.windows import Turn, Word, assign_words, split_by_turns
 
 log = logging.getLogger(__name__)
 
@@ -312,6 +312,9 @@ class Engine:
                 self._pipeline.join(timeout=5)
         if self._asr is not None:
             self._asr.join()
+        self._writer.set_meta(
+            "stream_origins", {n: round(s.origin or 0.0, 3) for n, s in self._streams.items()}
+        )
         self._writer.close()
 
     # -- pipeline thread --------------------------------------------------------
@@ -407,26 +410,29 @@ class Engine:
                 if self._abort.is_set():
                     continue
                 try:
-                    text, lang, words = self._transcribe(job)
+                    res = self._transcribe(job)
                 except Exception:
                     log.exception("Transcription failed for utterance at %.1fs", job.t_start)
                     continue
+                text, words = res.text, res.words
                 if not text.strip(" .,!?-…"):
                     continue
                 turns = self._identify(job)
                 if turns is None:
-                    self._write(job, 0.0, job.t_end - job.t_start, None, text.strip(), lang)
+                    self._write(job, 0.0, job.t_end - job.t_start, None, text.strip(), res,
+                                words or None)
                     continue
-                pieces = split_by_turns(
-                    text.strip(), words, [Turn(x.t_start, x.t_end, "") for x in turns]
-                )
+                spans = [Turn(x.t_start, x.t_end, "") for x in turns]
+                pieces = split_by_turns(text.strip(), words, spans)
+                parts = assign_words(words, spans) if words and len(turns) > 1 else None
                 for index, piece in pieces:
                     turn = turns[index]
                     if len(turns) > 1 and words:  # the cut is real: a turn spans only its part
                         t0, t1 = turn.t_start, turn.t_end
                     else:
                         t0, t1 = 0.0, job.t_end - job.t_start
-                    self._write(job, t0, t1, turn.label, piece, lang)
+                    own = parts[index] if parts is not None else words
+                    self._write(job, t0, t1, turn.label, piece, res, own or None)
         finally:
             if self._tracker is not None:
                 try:
@@ -435,13 +441,18 @@ class Engine:
                     log.exception("Could not save session embeddings")
             self._done.set()
 
-    def _transcribe(self, job: _Job) -> tuple[str, str, list | None]:
-        """``(text, language, words)``; ``words`` is None for backends without timestamps."""
-        fn = getattr(self.transcriber, "transcribe_words", None)
-        if fn is not None and self._tracker is not None and job.stream not in self._forced:
-            return fn(job.audio)
+    def _transcribe(self, job: _Job) -> AsrResult:
+        """Text, language and (for backends that offer them) word timestamps and confidence."""
+        if job.stream not in self._forced:
+            detailed = getattr(self.transcriber, "transcribe_detailed", None)
+            if detailed is not None:
+                return detailed(job.audio)
+            fn = getattr(self.transcriber, "transcribe_words", None)
+            if fn is not None:
+                text, lang, words = fn(job.audio)
+                return AsrResult(text, lang, list(words or []))
         text, lang = self.transcriber.transcribe(job.audio)  # type: ignore[arg-type]
-        return text, lang, None
+        return AsrResult(text, lang, [])
 
     def _identify(self, job: _Job) -> list[TurnLabel] | None:
         if self._tracker is None or job.stream in self._forced:
@@ -452,7 +463,10 @@ class Engine:
             log.exception("Speaker identification failed for utterance at %.1fs", job.t_start)
             return None
 
-    def _write(self, job: _Job, t0: float, t1: float, label, text: str, lang: str) -> None:
+    def _write(
+        self, job: _Job, t0: float, t1: float, label, text: str, res: AsrResult,
+        words: list[Word] | None = None,
+    ) -> None:
         assert self._writer is not None
         seg = self._writer.append(
             t_start=job.t_start + t0,
@@ -460,10 +474,15 @@ class Engine:
             source=job.stream,
             speaker=label.name if label else self._labels.get(job.stream, job.stream),
             text=text,
-            lang=lang,
+            lang=res.lang,
             speaker_id=label.speaker_id if label else None,
             speaker_conf=label.conf if label else None,
             provisional=label.provisional if label else None,
+            avg_logprob=res.avg_logprob,
+            words=(
+                [[job.t_start + w.start, job.t_start + w.end, w.text] for w in words]
+                if words else None
+            ),
         )
         if label is not None and self._tracker is not None:
             self._tracker.record(seg.seq, label)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -24,6 +25,24 @@ from steno.windows import Word
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+
+
+@dataclass(frozen=True)
+class AsrResult:
+    """Text, language, word timestamps and confidence of one transcribed clip."""
+
+    text: str
+    lang: str
+    words: list[Word]
+    avg_logprob: float | None = None  # duration-weighted mean over the model's segments
+
+
+def weighted_logprob(items: list[tuple[float, float]]) -> float | None:
+    """Mean of ``(avg_logprob, duration)`` pairs weighted by duration; None without items."""
+    if not items:
+        return None
+    total = sum(max(d, 1e-3) for _, d in items)
+    return sum(lp * max(d, 1e-3) for lp, d in items) / total
 
 
 @runtime_checkable
@@ -94,7 +113,12 @@ class WhisperTranscriber:
         return text, info.language or (self._language or "")
 
     def transcribe_words(self, audio: np.ndarray) -> tuple[str, str, list[Word]]:
-        """Like ``transcribe`` plus word timestamps (seconds from the start of ``audio``).
+        """Like ``transcribe`` plus word timestamps (seconds from the start of ``audio``)."""
+        res = self.transcribe_detailed(audio)
+        return res.text, res.lang, res.words
+
+    def transcribe_detailed(self, audio: np.ndarray, beam_size: int | None = None) -> AsrResult:
+        """``transcribe_words`` plus the model's average log-probability.
 
         Goes through faster-whisper's ``BatchedInferencePipeline`` with a single clip
         covering the whole utterance. The plain ``WhisperModel.transcribe`` with
@@ -108,7 +132,7 @@ class WhisperTranscriber:
         segments, info = self._pipeline.transcribe(
             samples,
             language=self._language,
-            beam_size=self._beam_size,
+            beam_size=beam_size or self._beam_size,
             word_timestamps=True,
             clip_timestamps=[{"start": 0.0, "end": len(samples) / 16000}],
             batch_size=1,
@@ -122,7 +146,14 @@ class WhisperTranscriber:
             for w in (s.words or [])
             if w.word.strip()
         ]
-        return text, info.language or (self._language or ""), words
+        logprob = weighted_logprob(
+            [
+                (float(s.avg_logprob), float(s.end - s.start))
+                for s in segments
+                if getattr(s, "avg_logprob", None) is not None
+            ]
+        )
+        return AsrResult(text, info.language or (self._language or ""), words, logprob)
 
 
 def _make_faster_whisper(cfg: AsrConfig) -> Transcriber:

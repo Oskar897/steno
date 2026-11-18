@@ -230,3 +230,43 @@ def test_fetch_new_can_resolve_segments_for_display():
     )
     assert [s.speaker for s in seen] == ["X"]
     assert transcript.read_cursor(w.dir, "claude") == 1
+
+
+def test_words_and_avg_logprob_roundtrip_as_optional_fields():
+    w = make_writer()
+    add(w, "plain")
+    w.append(t_start=2, t_end=3, source="mic", speaker="Me", text="hej du", lang="sv",
+             avg_logprob=-0.34567, words=[[2.004, 2.5, "hej"], [2.5, 2.91234, "du"]])
+    w.close()
+    lines = (w.dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    assert "words" not in lines[0] and "avg_logprob" not in lines[0]
+    second = json.loads(lines[1])
+    assert second["avg_logprob"] == -0.346
+    assert second["words"] == [[2.0, 2.5, "hej"], [2.5, 2.91, "du"]]
+    segs = transcript.read_segments(w.dir)
+    assert segs[0].words is None and segs[0].avg_logprob is None
+    assert segs[1].words == [[2.0, 2.5, "hej"], [2.5, 2.91, "du"]] and segs[1].avg_logprob == -0.346
+
+
+def test_malformed_words_field_is_ignored_not_fatal():
+    seg = transcript.Segment.from_dict(
+        {"seq": 1, "t_start": 0, "t_end": 1, "wall": "w", "source": "mic", "speaker": "A",
+         "text": "x", "lang": "sv", "words": [[0, 1]]}
+    )
+    assert seg.words is None
+
+
+def test_read_segments_can_read_final_jsonl_and_flag_roundtrips(tmp_path):
+    seg = transcript.Segment(1, 0.0, 1.0, "w", "mic", "A", "x", "sv", final=True)
+    (tmp_path / "final.jsonl").write_text(seg.to_json() + "\n", encoding="utf-8")
+    assert json.loads(seg.to_json())["final"] is True
+    assert transcript.read_segments(tmp_path, name="final.jsonl")[0].final is True
+    assert transcript.read_segments(tmp_path) == []  # the live file is a different one
+
+
+def test_writer_set_meta_lands_in_session_json():
+    w = make_writer()
+    w.set_meta("stream_origins", {"mic": 0.12})
+    w.close()
+    meta = json.loads((w.dir / "session.json").read_text(encoding="utf-8"))
+    assert meta["stream_origins"] == {"mic": 0.12}

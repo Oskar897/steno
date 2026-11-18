@@ -28,7 +28,9 @@ SESSION_ID_FORMAT = "%Y%m%d-%H%M%S"
 
 _FIELD_ORDER = ("v", "seq", "t_start", "t_end", "wall", "source", "speaker", "text", "lang")
 #: Written only when speaker recognition produced them (layer 2).
-_OPTIONAL_FIELDS = ("speaker_id", "speaker_conf", "provisional")
+_OPTIONAL_FIELDS = (
+    "speaker_id", "speaker_conf", "provisional", "avg_logprob", "words", "final",
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,9 @@ class Segment:
     speaker_id: str | None = None  # "S1" (session cluster), "P:<profile id>", "U" (unknown)
     speaker_conf: float | None = None
     provisional: bool | None = None
+    avg_logprob: float | None = None  # ASR confidence of the utterance the line came from
+    words: list[list] | None = None  # [[start, end, word], ...] in session seconds
+    final: bool | None = None  # True in final.jsonl (written by `steno finalize`)
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -71,7 +76,24 @@ class Segment:
                 None if data.get("speaker_conf") is None else float(data["speaker_conf"])
             ),
             provisional=None if data.get("provisional") is None else bool(data["provisional"]),
+            avg_logprob=(
+                None if data.get("avg_logprob") is None else float(data["avg_logprob"])
+            ),
+            words=_parse_words(data.get("words")),
+            final=None if data.get("final") is None else bool(data["final"]),
         )
+
+
+def _parse_words(raw: Any) -> list[list] | None:
+    """``[[start, end, word], ...]`` from JSON; None when absent or malformed."""
+    if not isinstance(raw, list):
+        return None
+    out: list[list] = []
+    for item in raw:
+        if not (isinstance(item, list | tuple) and len(item) == 3):
+            return None
+        out.append([float(item[0]), float(item[1]), str(item[2])])
+    return out
 
 
 def format_clock(seconds: float) -> str:
@@ -170,6 +192,8 @@ class SessionWriter:
         speaker_id: str | None = None,
         speaker_conf: float | None = None,
         provisional: bool | None = None,
+        avg_logprob: float | None = None,
+        words: list[list] | None = None,
     ) -> Segment:
         with self._lock:
             if self._closed:
@@ -188,6 +212,11 @@ class SessionWriter:
                 speaker_id=speaker_id,
                 speaker_conf=None if speaker_conf is None else round(speaker_conf, 3),
                 provisional=provisional,
+                avg_logprob=None if avg_logprob is None else round(avg_logprob, 3),
+                words=(
+                    None if not words
+                    else [[round(a, 2), round(b, 2), str(w)] for a, b, w in words]
+                ),
             )
             self._jsonl.write((seg.to_json() + "\n").encode("utf-8"))
             self._jsonl.flush()
@@ -195,6 +224,11 @@ class SessionWriter:
             self._md.write((format_line(seg) + "\n\n").encode("utf-8"))
             self._md.flush()
             return seg
+
+    def set_meta(self, key: str, value: Any) -> None:
+        """Add a key to session.json (written when the session closes)."""
+        with self._lock:
+            self._meta[key] = value
 
     def close(self) -> None:
         """Write ``ended_at`` and close files. Idempotent."""
@@ -218,9 +252,14 @@ class SessionWriter:
 # --------------------------------------------------------------------------- reading
 
 
-def read_segments(session_dir: Path, after_seq: int = 0) -> list[Segment]:
-    """Segments with ``seq > after_seq``. Ignores a trailing partial line and corrupt lines."""
-    path = Path(session_dir) / TRANSCRIPT_NAME
+def read_segments(
+    session_dir: Path, after_seq: int = 0, name: str = TRANSCRIPT_NAME
+) -> list[Segment]:
+    """Segments with ``seq > after_seq``. Ignores a trailing partial line and corrupt lines.
+
+    ``name`` selects another file of the session with the same format (``final.jsonl``).
+    """
+    path = Path(session_dir) / name
     try:
         raw = path.read_bytes()
     except FileNotFoundError:

@@ -60,6 +60,32 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--speakers", type=int, metavar="N",
                    help="force exactly N speakers instead of estimating the count")
 
+    p = sub.add_parser(
+        "finalize", help="post-meeting pass: re-diarize the kept audio, repair ASR, write final.*")
+    p.add_argument("session", nargs="?", default="latest",
+                   help="'latest' (default) or a session id (needs --keep-audio)")
+    p.add_argument("--speakers", type=int, metavar="N",
+                   help="force exactly N speakers instead of estimating the count")
+    p.add_argument("--full-asr", action="store_true",
+                   help="transcribe every line again with [post] asr_model, not only the "
+                        "low-confidence ones")
+    p.add_argument("--llm-fix", action="store_true",
+                   help="let Claude propose small corrections of obvious misrecognitions "
+                        "(sends the transcript text to the Claude CLI)")
+
+    p = sub.add_parser("show", help="print a session transcript with current speaker names")
+    p.add_argument("session", nargs="?", default="latest")
+    p.add_argument("--final", action="store_true", help="the final transcript (final.jsonl)")
+
+    p = sub.add_parser("summary", help="summarise a session with Claude (writes summary.md)")
+    p.add_argument("session", nargs="?", default="latest")
+
+    p = sub.add_parser("todo", help="extract explicit commitments with Claude (todo.md/.json)")
+    p.add_argument("session", nargs="?", default="latest")
+    who = p.add_mutually_exclusive_group()
+    who.add_argument("--person", metavar="NAME", help="only this person's tasks")
+    who.add_argument("--all", action="store_true", help="everyone's tasks, grouped (default)")
+
     p = sub.add_parser("transcribe-file", help="transcribe an audio file into a new session")
     p.add_argument("audio")
     p.add_argument("--source", choices=["mic", "loopback"], default="loopback",
@@ -113,7 +139,8 @@ def cmd_devices(args: argparse.Namespace) -> int:
 
 
 def _run_engine(
-    cfg: Config, sources, speaker_labels=None, *, finite: bool, keep_audio: bool = False
+    cfg: Config, sources, speaker_labels=None, *, finite: bool, keep_audio: bool = False,
+    auto_finalize: bool = False,
 ) -> int:
     from steno.asr import create_transcriber
     from steno.engine import Engine
@@ -149,6 +176,16 @@ def _run_engine(
     except KeyboardInterrupt:
         engine.stop(drain=False)
     print(f"Saved session {session_dir.name}", file=sys.stderr)
+    if auto_finalize:
+        if keep_audio:
+            print("Finalizing (Ctrl+C to skip; `steno finalize` runs it later) ...",
+                  file=sys.stderr, flush=True)
+            try:
+                _finalize(session_dir, cfg)
+            except KeyboardInterrupt:
+                print("\nFinalize skipped.", file=sys.stderr)
+        else:
+            print("[post] auto needs --keep-audio; finalize skipped.", file=sys.stderr)
     return 130 if interrupted and not finite else 0
 
 
@@ -162,7 +199,7 @@ def cmd_record(args: argparse.Namespace, cfg: Config) -> int:
         return 2
     try:
         return _run_engine(cfg, create_capture_sources(mic=mic, loopback=loopback), finite=False,
-                           keep_audio=args.keep_audio)
+                           keep_audio=args.keep_audio, auto_finalize=cfg.post.auto)
     except AudioError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -330,6 +367,110 @@ def cmd_refine(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def _progress_printer():
+    """stderr progress for finalize: a line per stage and per 10 % step."""
+    state = {"stage": "", "step": -1}
+
+    def show(stage: str, done: int, total: int) -> None:
+        step = int(10 * done / total) if total else 0
+        if stage != state["stage"] or step != state["step"]:
+            state.update(stage=stage, step=step)
+            tail = f" {done}/{total}" if total else ""
+            print(f"  {stage}{tail}", file=sys.stderr, flush=True)
+
+    return show
+
+
+def _finalize(session_dir, cfg: Config, *, speakers=None, full_asr=False, llm_fix=False) -> int:
+    from steno import finalize, llm
+    from steno.segmentation import SegmentationError
+    from steno.speakers import SpeakerError
+
+    post_edit = (lambda segs: llm.llm_fix(segs, cfg.llm)) if llm_fix else None
+    try:
+        res = finalize.finalize_session(
+            session_dir, cfg, _store(), num_speakers=speakers, full_asr=full_asr,
+            post_edit=post_edit, progress=_progress_printer())
+    except (finalize.FinalizeError, SpeakerError, SegmentationError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Finalized {session_dir.name}: {res.segments} lines (live: {res.live_segments}), "
+          f"{len(res.speakers)} speaker(s); {res.redone}/{res.flagged} line(s) transcribed again; "
+          f"{res.seconds:.0f} s for {res.audio_s / 60:.1f} min of audio.")
+    for sid, name, secs in res.speakers:
+        print(f"  {name:<20} {sid:<12} {secs:6.0f} s")
+    if res.llm_fix is not None:
+        fix = res.llm_fix
+        print(f"  llm-fix: {fix.get('applied', 0)} of {fix.get('proposed', 0)} edit(s) applied, "
+              f"{len(fix.get('rejected', []))} rejected, "
+              f"{fix.get('failed_batches', 0)} batch(es) failed")
+    return 0
+
+
+def cmd_finalize(args: argparse.Namespace, cfg: Config) -> int:
+    session_dir = _session_or_error(args.session)
+    if session_dir is None:
+        return 1
+    try:
+        return _finalize(session_dir, cfg, speakers=args.speakers, full_asr=args.full_asr,
+                         llm_fix=args.llm_fix)
+    except KeyboardInterrupt:
+        print("\nInterrupted; nothing was written.", file=sys.stderr)
+        return 130
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    from steno import finalize
+
+    session_dir = _session_or_error(args.session)
+    if session_dir is None:
+        return 1
+    if args.final:
+        segments = finalize.read_final(session_dir)
+        if not segments:
+            print("error: no final transcript; run `steno finalize` first", file=sys.stderr)
+            return 1
+    else:
+        segments = labels.resolve_segments(session_dir, transcript.read_segments(session_dir))
+    if segments:
+        print(transcript.render_markdown(segments))
+    return 0
+
+
+def _llm_command(args: argparse.Namespace, action) -> int:
+    from steno import llm
+
+    session_dir = _session_or_error(args.session)
+    if session_dir is None:
+        return 1
+    try:
+        return action(session_dir, llm)
+    except llm.LlmError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_summary(args: argparse.Namespace, cfg: Config) -> int:
+    def run(session_dir, llm) -> int:
+        path, kind = llm.summarize(session_dir, cfg.llm)
+        print(f"({kind} transcript; saved as {path.name})", file=sys.stderr)
+        print(path.read_text(encoding="utf-8"), end="")
+        return 0
+
+    return _llm_command(args, run)
+
+
+def cmd_todo(args: argparse.Namespace, cfg: Config) -> int:
+    def run(session_dir, llm) -> int:
+        items, dropped, kind = llm.extract_todos(session_dir, cfg.llm, person=args.person)
+        print(f"({kind} transcript; {len(items)} item(s), {dropped} dropped without evidence; "
+              f"saved as {llm.TODO_MD_NAME} and {llm.TODO_JSON_NAME})", file=sys.stderr)
+        print((session_dir / llm.TODO_MD_NAME).read_text(encoding="utf-8"), end="")
+        return 0
+
+    return _llm_command(args, run)
+
+
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -352,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_name(args)
         if args.command == "people":
             return cmd_people(args)
+        if args.command == "show":
+            return cmd_show(args)
         cfg = _apply_overrides(load_config(args.config), args)
         if args.command == "record":
             return cmd_record(args, cfg)
@@ -361,6 +504,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_enroll(args, cfg)
         if args.command == "refine":
             return cmd_refine(args, cfg)
+        if args.command == "finalize":
+            return cmd_finalize(args, cfg)
+        if args.command == "summary":
+            return cmd_summary(args, cfg)
+        if args.command == "todo":
+            return cmd_todo(args, cfg)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

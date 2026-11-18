@@ -12,21 +12,47 @@ uv sync --all-extras
 uv run python scripts/benchmark_asr.py --self-test
 uv run python scripts/benchmark_asr.py --audio talk.wav --reference talk.txt
 uv run python scripts/benchmark_asr.py --audio talk.wav --models kb-whisper-small,whisper-small --threads 6
+uv run python scripts/benchmark_asr.py --dataset fleurs --n 40 --n-en 20 --models kb-whisper-small,kb-whisper-small@5
 ```
 
-Models (`--models`, comma-separated): `kb-whisper-base`, `kb-whisper-small`,
-`whisper-small`, `parakeet-tdt-0.6b-v3`, `whisper-large-v3-turbo`. Downloads go to
-the Steno models dir (`steno.paths.models_dir()`); the turbo model is ~1.6 GB and
-parakeet ~490 MB.
+Models (`--models`, comma-separated; `name@N` sets the Whisper beam size, default 1):
+`kb-whisper-base`, `kb-whisper-small`, `kb-whisper-medium`, `kb-whisper-large`,
+`whisper-small`, `whisper-large-v3-turbo`, `parakeet-tdt-0.6b-v3` (sherpa-onnx int8),
+`qwen3-asr-0.6b` (sherpa-onnx int8, 30 languages incl. Swedish). Downloads go to the Steno
+models dir (`steno.paths.models_dir()`); sizes: kb-whisper-small ~0.5 GB, medium ~1.5 GB, large
+~3 GB, turbo ~1.6 GB, parakeet ~0.5 GB, qwen3 ~0.9 GB.
 
 Output goes to `<data_dir>/benchmarks/<timestamp>/` (override with `--out`): a
-markdown table on stdout, `results.json` and one hypothesis `.txt` per run. Nothing
-is written inside the repository, and audio/transcripts must never be committed.
+markdown table on stdout, `results.json` (rewritten after every model) and one hypothesis
+`.txt` per run (one line per utterance in dataset mode). Nothing is written inside the
+repository, and audio/transcripts must never be committed.
 
 The recommendation is the lowest WER among runs with RTF < 0.5, which leaves CPU
-headroom for live use next to a call app. Whisper runs use greedy decoding
-(`beam_size=1`), `vad_filter=True`, int8; `[auto]` runs use language detection to
-judge Swedish/English code-switching.
+headroom for live use next to a call app (in dataset mode: on the Swedish set). Whisper
+runs use `vad_filter=True`, int8; `[auto]` runs use language detection to judge
+Swedish/English code-switching.
+
+### Dataset mode (`--dataset fleurs|fleurs-sv|fleurs-en`)
+
+Scores each model on a reproducible subset of [Google FLEURS](https://huggingface.co/datasets/google/fleurs)
+test data (CC-BY-4.0): `--n` utterances of Swedish (`sv_se`, default 60) and `--n-en` of
+English (`en_us`, default 30). Utterances with distinct sentences and 3-29 s length are
+picked with a fixed seed (a smaller `--n` is a prefix of a larger one). The audio archive
+(~440 MB sv, ~290 MB en) is streamed once and only the selected wavs are kept, under
+`<data_dir>/eval/asr/<dataset>/`; later runs are offline.
+
+* Whisper models get the dataset's language forced (`sv` / `en`); parakeet and qwen3 detect it.
+  The English set shows how much a Swedish fine-tune degrades on English speech.
+* Each utterance is transcribed separately; WER/CER are corpus-level (errors summed over
+  utterances / reference length) after `normalize_text`. RTF = summed transcription time
+  (incl. VAD) / summed audio duration; model load and a 5 s warm-up are excluded.
+  Peak RSS is the maximum over the timed sets and includes the model.
+* The normaliser does not convert between digits and spelled-out numbers, so a model that
+  writes "2000" against a reference with "tvåtusen" (or the reverse) is penalised.
+* FLEURS is clean read speech: it ranks models but does not predict WER on meetings
+  (overlap, room noise, spontaneous speech, code-switching).
+* No public Swedish-English code-switching test set with audio was found; check your own
+  recordings with `--audio`/`--reference` for that.
 
 ## eval_diarization.py
 
