@@ -14,6 +14,7 @@ import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -103,7 +104,7 @@ class WhisperTranscriber:
 
         log.info("Loading ASR model %s", self._model_id)
         self._model = WhisperModel(
-            self._model_id,
+            resolve_model(self._model_id),
             device="cpu",
             compute_type=self._compute_type,
             cpu_threads=self._cpu_threads,
@@ -178,6 +179,7 @@ class WhisperTranscriber:
         batch_size: int = 4,
         beam_size: int | None = None,
         progress: Callable[[float, float], None] | None = None,
+        detect_english: bool = False,
     ) -> tuple[list[LongSegment], str]:
         """Transcribe a whole recording in one go: ``(segments, language)``.
 
@@ -185,13 +187,22 @@ class WhisperTranscriber:
         30 s windows are decoded ``batch_size`` at a time (much faster per audio second than
         clip-by-clip decoding, and the model sees whole sentences instead of cut ones).
         ``progress(seconds_done, seconds_total)`` is called after every segment.
+
+        ``detect_english`` (with language ``sv``): every 30 s chunk is checked for English
+        from the encoder output the decoder needs anyway (no extra encoder pass) and an
+        English chunk is transcribed as English instead of being translated into Swedish.
+        Only Swedish and English are chosen between (see ``SvEnLanguage``).
         """
         self.load()
         assert self._pipeline is not None
         samples = np.asarray(audio, dtype=np.float32)
         total = len(samples) / SAMPLE_RATE
+        per_chunk = detect_english and self._language == "sv"
+        if per_chunk and not isinstance(self._model.model, SvEnLanguage):
+            self._model.model = SvEnLanguage(self._model.model)
         segments, info = self._pipeline.transcribe(
             samples,
+            multilingual=per_chunk,
             language=self._language,
             beam_size=beam_size or self._beam_size,
             word_timestamps=True,
@@ -217,6 +228,51 @@ class WhisperTranscriber:
         if progress is not None:
             progress(total, total)
         return out, info.language or (self._language or "")
+
+
+def resolve_model(model_id: str) -> str:
+    """``org/name`` -> ``<models dir>/org_name`` when that folder already holds the model.
+
+    The benchmark scripts download models into such plain folders; without this,
+    faster-whisper would download a second copy into its own cache layout.
+    """
+    if "/" not in model_id or Path(model_id).exists():
+        return model_id
+    folder = paths.models_dir() / model_id.replace("/", "_")
+    return str(folder) if (folder / "model.bin").is_file() else model_id
+
+
+#: Languages whose probability counts against English in ``SvEnLanguage``: Whisper often
+#: labels Swedish speech as Norwegian, Danish or Icelandic.
+NORDIC = ("sv", "no", "nn", "da", "is")
+
+
+#: ... and it must also be at least this likely (a chunk heard as German is not English).
+MIN_ENGLISH = 0.5
+
+
+class SvEnLanguage:
+    """Wraps a CTranslate2 Whisper model so that language detection only picks sv or en.
+
+    English wins only when it is likely and beats the Nordic languages together; anything
+    else (a Swedish chunk detected as Icelandic, say) is transcribed as Swedish.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def detect_language(self, *args, **kwargs):
+        out = []
+        for probs in self._inner.detect_language(*args, **kwargs):
+            p = {tok.strip("<|>"): float(v) for tok, v in probs}
+            p_en = p.get("en", 0.0)
+            p_nordic = sum(p.get(code, 0.0) for code in NORDIC)
+            english = p_en >= MIN_ENGLISH and p_en > p_nordic
+            out.append([("<|en|>", p_en)] if english else [("<|sv|>", p_nordic)])
+        return out
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
 
 
 def _make_faster_whisper(cfg: AsrConfig) -> Transcriber:

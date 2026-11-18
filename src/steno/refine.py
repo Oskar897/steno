@@ -65,6 +65,15 @@ class _Aborted(Exception):
     pass
 
 
+class _Requeue(Exception):
+    """The window is given up at stop so the cheaper fallback can do it within the budget."""
+
+
+#: Seconds of decoding per second of speech assumed for ``[refine] model`` before the first
+#: window has been measured (turbo on a 4-core laptop CPU is about this).
+DEFAULT_RATE = 1.1
+
+
 # --------------------------------------------------------------------------- audio ring
 
 
@@ -404,6 +413,10 @@ class Refiner:
         self._flushing = False
         self._abort = threading.Event()
         self._thread: threading.Thread | None = None
+        self._rate: float | None = None  # measured decode seconds per speech second (model)
+        self._tail_fallback = False  # at stop: the rest goes to the fallback (stop_budget_s)
+        self._current: tuple[_Job, float, bool] | None = None  # (job, started, primary model)
+        self._yielded = 0.0  # seconds the current window waited for the live model
         self.stats = RefineStats()
         self.name = getattr(transcriber, "name", "refine") if transcriber else ""
 
@@ -426,6 +439,13 @@ class Refiner:
                     raise
                 log.exception("Could not load the refine model; only diarization runs")
                 self._tr = None
+        if self._tr is not None and self._fallback_factory and self.cfg.stop_budget_s > 0:
+            try:  # loaded up front: at stop there is no time to load it
+                self._fallback = self._fallback_factory()
+                self._fallback.load()  # type: ignore[attr-defined]
+            except Exception:
+                log.exception("Could not load the refine fallback model")
+                self._fallback, self._fallback_factory = None, None
 
     @property
     def active(self) -> bool:
@@ -453,6 +473,7 @@ class Refiner:
         """Refine what is still pending, then stop the worker. False if ``timeout`` ran out."""
         with self._lock:
             self._flushing = True
+            self._plan_tail()
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout)
@@ -512,6 +533,27 @@ class Refiner:
 
     # -- scheduling -----------------------------------------------------------------
 
+    def estimate_tail_s(self) -> float:
+        """Expected seconds for ``[refine] model`` to refine what is left (caller holds lock)."""
+        rate = self._rate if self._rate is not None else DEFAULT_RATE
+        left = sum(speech_seconds(v) for v in self._pending.values()) * rate
+        if self._current is not None and self._current[2]:
+            job, started, _ = self._current
+            left += max(0.0, speech_seconds(job.lines) * rate - (time.perf_counter() - started))
+        return left
+
+    def _plan_tail(self) -> None:
+        """At stop: hand the rest to the fallback if the main model would exceed the budget."""
+        budget = self.cfg.stop_budget_s
+        if budget <= 0 or self._fallback is None or self._using_fallback:
+            return
+        estimate = self.estimate_tail_s()
+        if estimate > budget:
+            self._tail_fallback = True
+            log.info("Stop: ~%.0f s of refining left with %s (budget %.0f s); using %s",
+                     estimate, getattr(self._tr, "name", "?"), budget,
+                     getattr(self._fallback, "name", "?"))
+
     def _degrade(self) -> None:
         """Fall back to the cheaper model, or skip the oldest speech (caller holds the lock)."""
         cfg = self.cfg
@@ -528,7 +570,9 @@ class Refiner:
             except Exception:
                 log.exception("Could not load the refine fallback model")
                 self._fallback_factory = None
-        elif self._using_fallback and windows < 1.0:
+        if self._tail_fallback and not self._using_fallback:
+            self._using_fallback = True
+        elif self._using_fallback and windows < 1.0 and not self._tail_fallback:
             self._using_fallback = False
             log.info("Refine has caught up: back to %s", getattr(self._tr, "name", "?"))
         if windows > cfg.skip_after_windows:
@@ -572,11 +616,17 @@ class Refiner:
             if job is not None:
                 try:
                     self._run(job)
+                except _Requeue:
+                    with self._lock:  # back to the front; the fallback takes it next
+                        self._pending.setdefault(job.source, [])[:0] = job.lines
+                    continue
                 except _Aborted:
                     break
                 except Exception:
                     self.stats.failed += 1
                     log.exception("Refining a window failed; the drafts stay")
+                finally:
+                    self._current = None
             # speakers get their turn between text windows (a window is short, its model fast)
             while not self._live_busy() and self._diarize_step() and job is None:
                 pass
@@ -604,8 +654,12 @@ class Refiner:
         while self._live_busy() and waited < MAX_YIELD_S and not self._abort.is_set():
             time.sleep(0.05)
             waited += 0.05
+        self._yielded += waited
         if self._abort.is_set():
             raise _Aborted
+        current = self._current
+        if self._tail_fallback and current is not None and current[2]:
+            raise _Requeue
 
     def _run(self, job: _Job) -> None:
         ring = self._rings.get(job.source)
@@ -620,13 +674,20 @@ class Refiner:
         if len(audio) < MIN_AUDIO_S * SAMPLE_RATE:
             return
         audio = mute_outside(audio, a0, [(ln.t_start, ln.t_end) for ln in lines], MASK_PAD_S)
-        tr = self._fallback if self._using_fallback else self._tr
+        primary = not self._using_fallback
+        tr = self._tr if primary else self._fallback
         started = time.perf_counter()
+        self._current = (job, started, primary)
+        self._yielded = 0.0
         segments, lang = tr.transcribe_longform(  # type: ignore[attr-defined]
             audio, batch_size=self.cfg.batch_size, beam_size=self.cfg.beam_size,
-            progress=self._tick,
+            progress=self._tick, detect_english=self.cfg.detect_english,
         )
         compute = time.perf_counter() - started
+        speech = speech_seconds(lines)
+        if primary and speech > 0:  # the speed at stop, when the live model no longer competes
+            rate = max(compute - self._yielded, 0.0) / speech
+            self._rate = rate if self._rate is None else 0.7 * self._rate + 0.3 * rate
         words: list[Word] = []
         logprob: dict[int, float] = {}
         for s in segments:

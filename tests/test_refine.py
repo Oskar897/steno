@@ -18,6 +18,7 @@ from steno.refine import (
     AudioRing,
     LiveLine,
     Refiner,
+    _Requeue,
     accept_revision,
     assign_words_to_lines,
     mute_outside,
@@ -158,8 +159,10 @@ class FakeLongform:
     def load(self):
         self.loaded = True
 
-    def transcribe_longform(self, audio, *, batch_size=4, beam_size=1, progress=None):
-        self.calls.append({"batch_size": batch_size, "beam_size": beam_size, "len": len(audio)})
+    def transcribe_longform(self, audio, *, batch_size=4, beam_size=1, progress=None,
+                            detect_english=False):
+        self.calls.append({"batch_size": batch_size, "beam_size": beam_size, "len": len(audio),
+                           "detect_english": detect_english})
         self.audio.append(np.asarray(audio))
         if self.fail_first:
             self.fail_first -= 1
@@ -325,6 +328,67 @@ def test_refiner_degrades_to_the_fallback_model_and_skips_the_oldest_speech():
     assert not r._using_fallback
 
 
+def stop_budget_refiner(rate: float, budget: float = 5.0):
+    main, fallback = FakeLongform(), FakeLongform()
+    fallback.name = "fake-fallback"
+    out = Collector()
+    r = Refiner(cfg_refine(window_speech_s=100.0, stop_budget_s=budget), main, out,
+                fallback_factory=lambda: fallback)
+    r.load()
+    assert fallback.loaded  # loaded up front, there is no time for it at stop
+    audio = np.concatenate([timeline(*[(i * 3.0 + 0.5, i * 3.0 + 2.5, 0.3) for i in range(3)]),
+                            silence(1.0)])
+    feed(r, audio)
+    for i in range(3):  # 6 s of speech, below the window size: all of it is the stop tail
+        r.note_line(seg(i + 1, i * 3.0 + 0.5, i * 3.0 + 2.5))
+    r._rate = rate
+    return r, main, fallback, out
+
+
+def test_stop_tail_goes_to_the_fallback_when_the_main_model_would_exceed_the_budget():
+    r, main, fallback, out = stop_budget_refiner(rate=2.0)  # 6 s x 2.0 = 12 s > 5 s
+    r.start()
+    assert r.finish(timeout=10)
+    assert fallback.calls and not main.calls and set(out.models) == {"fake-fallback"}
+    assert all(c["detect_english"] for c in fallback.calls)
+
+
+def test_stop_tail_stays_on_the_main_model_within_the_budget():
+    r, main, fallback, out = stop_budget_refiner(rate=0.5)  # 6 s x 0.5 = 3 s <= 5 s
+    r.start()
+    assert r.finish(timeout=10)
+    assert main.calls and not fallback.calls and set(out.models) == {"fake-longform"}
+
+
+def test_stop_gives_up_a_running_main_model_window_for_the_fallback():
+    r, main, fallback, out = stop_budget_refiner(rate=2.0)
+    r._flushing = True
+    job = r._next_job()
+    assert job is not None and not r._using_fallback
+    r._current = (job, time.perf_counter(), True)  # the main model is decoding this window
+    r._plan_tail()
+    with pytest.raises(_Requeue):
+        r._tick(1.0, 6.0)
+    r._current = None
+    r._pending.setdefault(job.source, [])[:0] = job.lines  # what the worker loop does
+    nxt = r._next_job()
+    assert r._using_fallback and [ln.seq for ln in nxt.lines] == [ln.seq for ln in job.lines]
+
+
+def test_the_measured_speed_ignores_time_spent_waiting_for_the_live_draft():
+    busy = {"on": True}
+    tr, out = FakeLongform(), Collector()
+    r = Refiner(cfg_refine(window_speech_s=1.0, stop_budget_s=0), tr, out,
+                live_busy=lambda: busy["on"])
+    r.load()
+    feed(r, np.concatenate([burst_audio(), silence(1.0)]))
+    r.note_line(seg(1, 1.0, 2.5))
+    job = r._next_job()
+    threading.Timer(0.4, lambda: busy.update(on=False)).start()
+    r._run(job)
+    assert r._rate is not None and r._rate < 0.2  # the 0.4 s wait is not decoding time
+
+
 def test_refiner_yields_to_the_live_draft_between_segments():
     busy = {"on": True}
     tr, out = FakeLongform(), Collector()
@@ -465,8 +529,10 @@ def test_engine_stop_without_drain_aborts_the_refiner(tmp_path):
 
 def test_refine_config_defaults_and_validation():
     cfg = Config()
-    assert cfg.refine.enabled and cfg.refine.model == "KBLab/kb-whisper-small"
-    assert cfg.refine.window_speech_s == 25.0 and cfg.refine.fallback_model == ""
+    assert cfg.refine.enabled and cfg.refine.model == "deepdml/faster-whisper-large-v3-turbo-ct2"
+    assert cfg.refine.window_speech_s == 25.0
+    assert cfg.refine.fallback_model == "KBLab/kb-whisper-small"
+    assert cfg.refine.stop_budget_s == 12.0 and cfg.refine.detect_english
     with pytest.raises(ConfigError):
         config_from_dict({"refine": {"window_speech_s": 0}})
     with pytest.raises(ConfigError):

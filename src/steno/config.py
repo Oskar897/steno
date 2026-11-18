@@ -154,10 +154,17 @@ class RefineConfig:
     context in the background and replace the live draft text (``revisions.jsonl``)."""
 
     enabled: bool = True
-    model: str = "KBLab/kb-whisper-small"  # "deepdml/faster-whisper-large-v3-turbo-ct2" is better
-    # Model used instead while the worker is far behind ("" = none; switching back when it
-    # has caught up). Only worth setting for a model slower than about 0.3 x real time.
-    fallback_model: str = ""
+    model: str = "deepdml/faster-whisper-large-v3-turbo-ct2"
+    # Cheaper model used instead while the worker is far behind (switching back when it has
+    # caught up) and for the tail at stop when `model` would exceed stop_budget_s ("" = none).
+    fallback_model: str = "KBLab/kb-whisper-small"
+    # At stop: refine the remaining speech with `model` only if that is expected to take at
+    # most this many seconds (from the measured speed), else with fallback_model. 0 = always
+    # `model`.
+    stop_budget_s: float = 12.0
+    # [asr] language "sv": 30 s chunks that are English are transcribed as English instead
+    # of being translated into Swedish (free: uses the encoder output the decoder needs).
+    detect_english: bool = True
     window_speech_s: float = 25.0  # refine a stream once this much unrefined speech is there
     max_wait_s: float = 60.0  # ... or once its oldest unrefined line is this old (stream time)
     pad_s: float = 0.5  # audio context before the first and after the last line of a window

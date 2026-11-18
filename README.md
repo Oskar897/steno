@@ -68,7 +68,8 @@ The live draft transcribes one utterance at a time, so it lacks context (kb-whis
 166 s Swedish + English test: WER 30 %). A background worker (`[refine]`) keeps the last 15
 minutes of each stream in memory and, every ~25 s of accumulated speech, decodes that window
 again as long-form audio (whole sentences, 30 s chunks, its own VAD) with `[refine] model`
-(default kb-whisper-small; `deepdml/faster-whisper-large-v3-turbo-ct2` is better but 3-4x slower).
+(default `deepdml/faster-whisper-large-v3-turbo-ct2`, with `[refine] detect_english`: 30 s
+chunks that are English stay English instead of being translated into Swedish).
 The better text replaces the draft of the lines it covers: speakers stay attached, the live
 JSONL is never rewritten (revisions are appended to `revisions.jsonl`, see
 [docs/formats.md](docs/formats.md)), and `transcript.md` always shows the best text. Mic speech
@@ -76,7 +77,7 @@ that the echo gate dropped does not come back (only words inside existing lines 
 It tries not to compete with the draft: one job at a time, its own thread at below-normal
 priority (the model's internal worker threads keep normal priority), and it yields to the draft
 queue between model segments. If it falls behind (more than `max_backlog_windows`
-of unrefined speech) it switches to `[refine] fallback_model` if you set one, and beyond
+of unrefined speech) it switches to `[refine] fallback_model` (kb-whisper-small), and beyond
 `skip_after_windows` it skips the oldest speech (the draft stays) and logs a warning.
 `steno new --consumer claude` delivers each new line once, with the refined text if it exists,
 and an earlier line again, under "Corrections", only when its text changed beyond case and
@@ -139,10 +140,24 @@ Measured on a laptop CPU (i5-1235U, 12 threads, no GPU), see
 | refine decoding per speech second / lag | - | 0.29 / 11 s | 1.10 / 34 s |
 | stop to finished transcript | 5 s | 14 s | 36 s |
 
-The stop time is the draft queue plus the last refine window plus `finalize` (0.1-0.4 s); it
-does not grow with the meeting. With turbo the worker is slower than real time while the live
-draft, the speaker model and the diarizer share the CPU, so the draft slows down (+2 s) and the
-stop takes 25-36 s: kb-whisper-small is the default for that reason. Diarization error rate on
+The 9 % above is that run's scoring; the same 166 s scored offline gives turbo 19 % (English
+sentences translated, since fixed with `detect_english`), so compare columns, not runs.
+Those runs are back-to-back sentences (1 s gaps), harder than a meeting. With 3 s gaps (about
+two thirds speech, closer to a real meeting), turbo as refine model with the defaults:
+
+| 3 s gaps, real-time replay | 3.6 min | 7.2 min |
+|---|---:|---:|
+| WER draft / refined | 30 % / 16 % | 32 % / 14 % |
+| draft latency, median / p90 | 3.2 / 3.9 s | 3.8 / 4.9 s |
+| refine decoding per speech second | 0.51 | 0.56 |
+| stop to finished transcript | 14 s | 7 s |
+
+Same 3.6 min run: without `detect_english` 17 % refined WER; without the stop budget 16 %
+but 22 s to stop. The stop time is the draft queue plus the remaining refine work plus
+`finalize` (0.1-0.4 s); it does not grow with the meeting. `[refine] stop_budget_s` (12 s)
+caps the refine part: when the measured speed of `model` says the rest would take longer, the
+rest (including a window that is being decoded) goes to `fallback_model`. Lone English
+sentences inside Swedish speech are still written as Swedish (language is chosen per 30 s chunk). Diarization error rate on
 the 3 x 10 min AMI far-field test (pooled): live 31 %, `steno refine` 31 %, window
 clustering 31 %, incremental pyannote during the meeting 20 % (about 0.05 x the audio length of
 background CPU), `--thorough` 18 %. Looping one recording gives bit-identical embeddings, which

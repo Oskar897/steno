@@ -112,9 +112,15 @@ auto_update_dup = 0.93          # skip samples this similar (cosine) to one alre
 # and replaces the draft text of the covered lines (revisions.jsonl; speakers stay attached).
 # Stopping then only refines the last window, so the finished transcript is ready in seconds.
 enabled = true
-model = "KBLab/kb-whisper-small"   # "deepdml/faster-whisper-large-v3-turbo-ct2": better, ~3-4x slower
-                             # (1.6 GB download on first use; a model folder path also works)
-fallback_model = ""          # used instead while far behind (switches back when caught up); "" = none
+model = "deepdml/faster-whisper-large-v3-turbo-ct2"  # ~1.6 GB download on first use; much better
+                             # than kb-whisper-small on English terms, ~1 s per second of speech
+fallback_model = "KBLab/kb-whisper-small"  # used while far behind (back when caught up) and
+                             # for the stop tail below; "" = none
+stop_budget_s = 12.0         # at stop: the rest goes to fallback_model when `model` would take
+                             # longer than this (estimated from its measured speed); 0 = never
+detect_english = true        # [asr] language "sv": English 30 s chunks stay English instead of
+                             # being translated (no extra cost); lone English sentences inside
+                             # Swedish speech are still transcribed as Swedish
 window_speech_s = 25.0       # refine a stream once this much unrefined speech has accumulated
 max_wait_s = 60.0            # ... or once its oldest unrefined line is this old (stream time)
 pad_s = 0.5                  # audio context before the first / after the last line of a window
