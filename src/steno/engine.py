@@ -8,6 +8,15 @@
 UI or a WebSocket server can all drive it: ``subscribe(callback)`` to receive
 each final ``Segment``, ``start()`` / ``stop()`` to control it.
 
+Speaker recognition (layer 2, ``[speakers]``): when an ``embedder`` is given, the
+ASR thread identifies the speaker of every transcribed segment right after ASR
+(one worker keeps segments in time order, which the live clustering relies on) and
+writes ``speaker_id`` / ``speaker_conf`` / ``provisional`` next to the display
+label; see ``steno.speakers``. Without an embedder (or with ``[speakers] enabled =
+false``) the fixed per-stream labels from ``[audio]`` are used. Subscribers receive
+the full ``Segment`` including those fields. Embeddings are stored encrypted in the
+session directory; profiles are never modified by the engine.
+
 Echo heuristic (``[echo]`` config): when the speakers play the remote side, the
 microphone picks it up again, quieter. A mic utterance is dropped when it overlaps
 (>= 30 % of its duration) a loopback utterance and its RMS is below
@@ -30,9 +39,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from steno import paths
 from steno.asr import Transcriber
-from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource
+from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource, StreamRecorder
 from steno.config import Config
+from steno.labels import SessionLabels
+from steno.profiles import ProfileStore, SessionEmbeddings
+from steno.speakers import Embedder, SpeakerLabel, SpeakerTracker
 from steno.transcript import Segment, SessionWriter
 from steno.vad import SileroVad, SpeechProbModel, SpeechSegmenter, Utterance, VadParams, rms
 
@@ -125,6 +138,9 @@ class Engine:
         sessions_root: Path | None = None,
         speaker_labels: dict[str, str] | None = None,
         vad_factory: Callable[[], SpeechProbModel] = SileroVad,
+        embedder: Embedder | None = None,
+        profile_store: ProfileStore | None = None,
+        keep_audio: bool = False,
     ):
         self.config = config
         self.transcriber = transcriber
@@ -135,7 +151,13 @@ class Engine:
             SOURCE_LOOPBACK: config.audio.loopback_speaker_label,
             **(speaker_labels or {}),
         }
+        self._forced = set(speaker_labels or {})  # explicit labels bypass speaker recognition
         self._vad_factory = vad_factory
+        self._embedder = embedder if config.speakers.enabled else None
+        self._profile_store = profile_store
+        self._tracker: SpeakerTracker | None = None
+        self._keep_audio = keep_audio
+        self._recorders: dict[str, StreamRecorder] = {}
         self._subscribers: list[SegmentCallback] = []
         self._sub_lock = threading.Lock()
 
@@ -190,6 +212,8 @@ class Engine:
         if self._writer is not None:
             raise RuntimeError("engine already started")
         self.transcriber.load()
+        if self._embedder is not None:
+            self._embedder.load()  # may download the model; fail before capture starts
         params = VadParams(
             threshold=self.config.vad.threshold,
             min_silence_ms=self.config.vad.min_silence_ms,
@@ -204,8 +228,24 @@ class Engine:
             root=self._sessions_root,
             model=self.transcriber.name,
             sources=[s.name for s in self.sources],
-            extra={"language": self.config.asr.language},
+            extra={
+                "language": self.config.asr.language,
+                "speakers": self._embedder.name if self._embedder is not None else None,
+            },
         )
+        if self._embedder is not None:
+            labels = SessionLabels(self._writer.dir)
+            labels.init()
+            self._tracker = SpeakerTracker(
+                self._embedder,
+                self.config.speakers,
+                self._profile_store or ProfileStore(paths.profiles_dir()),
+                labels,
+                SessionEmbeddings(self._writer.dir),
+            )
+        if self._keep_audio:
+            for name in self._streams:
+                self._recorders[name] = StreamRecorder(self._writer.dir, name)
         self._pipeline = threading.Thread(target=self._pipeline_loop, name="vad", daemon=True)
         self._asr = threading.Thread(target=self._asr_loop, name="asr", daemon=True)
         self._pipeline.start()
@@ -272,6 +312,9 @@ class Engine:
                     continue
                 if stream.origin is None:
                     stream.origin = chunk.t_start
+                recorder = self._recorders.get(chunk.source)
+                if recorder is not None and chunk.samples.size:
+                    recorder.write(chunk.samples)
                 if chunk.samples.size:
                     for utt in stream.segmenter.feed(chunk.samples):
                         self._on_utterance(stream, utt)
@@ -289,6 +332,8 @@ class Engine:
         except Exception:
             log.exception("Pipeline thread crashed")
         finally:
+            for recorder in self._recorders.values():
+                recorder.close()
             self._asr_q.put(_Job(math.inf, next(self._counter)))  # sentinel
 
     def _on_utterance(self, stream: _Stream, utt: Utterance) -> None:
@@ -349,17 +394,37 @@ class Engine:
                     continue
                 if not text.strip(" .,!?-…"):
                     continue
+                label = self._identify(job)
                 seg = self._writer.append(
                     t_start=job.t_start,
                     t_end=job.t_end,
                     source=job.stream,
-                    speaker=self._labels.get(job.stream, job.stream),
+                    speaker=label.name if label else self._labels.get(job.stream, job.stream),
                     text=text.strip(),
                     lang=lang,
+                    speaker_id=label.speaker_id if label else None,
+                    speaker_conf=label.conf if label else None,
+                    provisional=label.provisional if label else None,
                 )
+                if label is not None and self._tracker is not None:
+                    self._tracker.record(seg.seq, label)
                 self._notify(seg)
         finally:
+            if self._tracker is not None:
+                try:
+                    self._tracker.close()
+                except Exception:
+                    log.exception("Could not save session embeddings")
             self._done.set()
+
+    def _identify(self, job: _Job) -> SpeakerLabel | None:
+        if self._tracker is None or job.stream in self._forced:
+            return None
+        try:
+            return self._tracker.identify(job.stream, job.audio)  # type: ignore[arg-type]
+        except Exception:
+            log.exception("Speaker identification failed for utterance at %.1fs", job.t_start)
+            return None
 
     def _notify(self, seg: Segment) -> None:
         with self._sub_lock:

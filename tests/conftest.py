@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
+
+if sys.platform != "win32":
+    # No DPAPI here: biometric files fall back to plaintext, for tests only.
+    import os
+
+    os.environ.setdefault("STENO_INSECURE_TEST", "1")
 
 
 @pytest.fixture(autouse=True)

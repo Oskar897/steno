@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +27,8 @@ CURSORS_DIR = "cursors"
 SESSION_ID_FORMAT = "%Y%m%d-%H%M%S"
 
 _FIELD_ORDER = ("v", "seq", "t_start", "t_end", "wall", "source", "speaker", "text", "lang")
+#: Written only when speaker recognition produced them (layer 2).
+_OPTIONAL_FIELDS = ("speaker_id", "speaker_conf", "provisional")
 
 
 @dataclass(frozen=True)
@@ -40,10 +42,16 @@ class Segment:
     text: str
     lang: str
     v: int = SCHEMA_VERSION
+    speaker_id: str | None = None  # "S1" (session cluster), "P:<profile id>", "U" (unknown)
+    speaker_conf: float | None = None
+    provisional: bool | None = None
 
     def to_json(self) -> str:
         data = asdict(self)
         ordered = {k: data[k] for k in _FIELD_ORDER}
+        for key in _OPTIONAL_FIELDS:
+            if data[key] is not None:
+                ordered[key] = data[key]
         return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
 
     @classmethod
@@ -58,6 +66,11 @@ class Segment:
             speaker=str(data["speaker"]),
             text=str(data["text"]),
             lang=str(data["lang"]),
+            speaker_id=None if data.get("speaker_id") is None else str(data["speaker_id"]),
+            speaker_conf=(
+                None if data.get("speaker_conf") is None else float(data["speaker_conf"])
+            ),
+            provisional=None if data.get("provisional") is None else bool(data["provisional"]),
         )
 
 
@@ -78,7 +91,7 @@ def render_markdown(segments: Iterable[Segment]) -> str:
     return "\n".join(format_line(s) for s in segments)
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
@@ -134,7 +147,7 @@ class SessionWriter:
             "steno_version": __version__,
             **(extra or {}),
         }
-        _atomic_write_text(session_dir / META_NAME, json.dumps(meta, indent=2) + "\n")
+        atomic_write_text(session_dir / META_NAME, json.dumps(meta, indent=2) + "\n")
         return cls(session_dir, started, meta)
 
     @property
@@ -154,6 +167,9 @@ class SessionWriter:
         speaker: str,
         text: str,
         lang: str,
+        speaker_id: str | None = None,
+        speaker_conf: float | None = None,
+        provisional: bool | None = None,
     ) -> Segment:
         with self._lock:
             if self._closed:
@@ -169,6 +185,9 @@ class SessionWriter:
                 speaker=speaker,
                 text=text,
                 lang=lang,
+                speaker_id=speaker_id,
+                speaker_conf=None if speaker_conf is None else round(speaker_conf, 3),
+                provisional=provisional,
             )
             self._jsonl.write((seg.to_json() + "\n").encode("utf-8"))
             self._jsonl.flush()
@@ -187,7 +206,7 @@ class SessionWriter:
             self._md.close()
             self._meta["ended_at"] = datetime.now().isoformat(timespec="seconds")
             self._meta["segments"] = self._seq
-            _atomic_write_text(self.dir / META_NAME, json.dumps(self._meta, indent=2) + "\n")
+            atomic_write_text(self.dir / META_NAME, json.dumps(self._meta, indent=2) + "\n")
 
     def __enter__(self) -> SessionWriter:
         return self
@@ -239,16 +258,26 @@ def read_cursor(session_dir: Path, consumer: str) -> int:
 def write_cursor(session_dir: Path, consumer: str, last_seq: int) -> None:
     path = _cursor_path(session_dir, consumer)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(path, json.dumps({"last_seq": int(last_seq)}) + "\n")
+    atomic_write_text(path, json.dumps({"last_seq": int(last_seq)}) + "\n")
 
 
-def fetch_new(session_dir: Path, consumer: str, *, peek: bool = False) -> list[Segment]:
-    """Segments the consumer has not seen yet; advances its cursor unless ``peek``."""
+def fetch_new(
+    session_dir: Path,
+    consumer: str,
+    *,
+    peek: bool = False,
+    resolve: Callable[[Path, list[Segment]], list[Segment]] | None = None,
+) -> list[Segment]:
+    """Segments the consumer has not seen yet; advances its cursor unless ``peek``.
+
+    ``resolve`` may rewrite the segments for display (see ``steno.labels``), e.g. to
+    apply speaker names that were assigned after the segment was written.
+    """
     last = read_cursor(session_dir, consumer)
     segments = read_segments(session_dir, after_seq=last)
     if segments and not peek:
         write_cursor(session_dir, consumer, segments[-1].seq)
-    return segments
+    return resolve(Path(session_dir), segments) if resolve else segments
 
 
 # --------------------------------------------------------------------------- sessions

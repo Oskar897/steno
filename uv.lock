@@ -542,6 +542,7 @@ asr = [
 ]
 audio = [
     { name = "pyaudiowpatch", marker = "sys_platform == 'win32'" },
+    { name = "soundfile" },
     { name = "soxr" },
 ]
 bench = [
@@ -549,6 +550,9 @@ bench = [
     { name = "psutil" },
     { name = "sherpa-onnx" },
     { name = "soundfile" },
+]
+speakers = [
+    { name = "sherpa-onnx" },
 ]
 
 [package.dev-dependencies]
@@ -566,10 +570,12 @@ requires-dist = [
     { name = "psutil", marker = "extra == 'bench'", specifier = ">=5.9" },
     { name = "pyaudiowpatch", marker = "sys_platform == 'win32' and extra == 'audio'", specifier = ">=0.2.12" },
     { name = "sherpa-onnx", marker = "extra == 'bench'", specifier = ">=1.10" },
+    { name = "sherpa-onnx", marker = "extra == 'speakers'", specifier = "==2.0.1" },
+    { name = "soundfile", marker = "extra == 'audio'", specifier = ">=0.12" },
     { name = "soundfile", marker = "extra == 'bench'", specifier = ">=0.12" },
     { name = "soxr", marker = "extra == 'audio'", specifier = ">=0.3" },
 ]
-provides-extras = ["audio", "asr", "bench"]
+provides-extras = ["audio", "asr", "speakers", "bench"]
 
 [package.metadata.requires-dev]
 dev = [

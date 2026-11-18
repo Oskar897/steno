@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -198,3 +199,34 @@ def test_list_and_resolve_sessions():
     assert transcript.resolve_session("nope") is None
     assert transcript.resolve_session("../x") is None
     b.close()
+
+
+def test_optional_speaker_fields_roundtrip_and_stay_out_of_layer1_lines():
+    w = make_writer()
+    add(w, "plain")  # layer 1: no speaker fields
+    w.append(t_start=2, t_end=3, source="mic", speaker="Speaker 1", text="hej", lang="sv",
+             speaker_id="S1", speaker_conf=0.712345, provisional=True)
+    w.append(t_start=4, t_end=5, source="mic", speaker="Alice", text="tja", lang="sv",
+             speaker_id="P:1a2b3c4d", speaker_conf=0.9, provisional=False)
+    w.close()
+    lines = (w.dir / "transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    assert "speaker_id" not in lines[0]
+    second = json.loads(lines[1])
+    assert list(second)[-3:] == ["speaker_id", "speaker_conf", "provisional"]
+    assert second["speaker_conf"] == 0.712 and second["provisional"] is True
+
+    segs = transcript.read_segments(w.dir)
+    assert segs[0].speaker_id is None and segs[0].provisional is None
+    assert (segs[1].speaker_id, segs[1].speaker_conf, segs[1].provisional) == ("S1", 0.712, True)
+    assert segs[2].speaker_id == "P:1a2b3c4d" and segs[2].provisional is False
+
+
+def test_fetch_new_can_resolve_segments_for_display():
+    w = make_writer()
+    add(w, "a")
+    w.close()
+    seen = transcript.fetch_new(
+        w.dir, "claude", resolve=lambda d, segs: [replace(s, speaker="X") for s in segs]
+    )
+    assert [s.speaker for s in seen] == ["X"]
+    assert transcript.read_cursor(w.dir, "claude") == 1

@@ -15,9 +15,16 @@ dependencies = [
 audio = [
     "pyaudiowpatch>=0.2.12; sys_platform == 'win32'",
     "soxr>=0.3",
+    "soundfile>=0.12",  # `steno record --keep-audio`
 ]
 asr = [
     "faster-whisper>=1.1",
+]
+# Speaker recognition (layer 2). Pinned exactly: embedding behaviour (notably its
+# sensitivity to segment length) differs between releases, so upgrade deliberately
+# and re-run tests/test_speaker_model.py with the model downloaded.
+speakers = [
+    "sherpa-onnx==2.0.1",
 ]
 bench = [
     "sherpa-onnx>=1.10",

@@ -34,6 +34,7 @@ class AudioConfig:
     sample_rate: int = 16000
     capture_mic: bool = True
     capture_loopback: bool = True
+    # Fallback labels, used only when [speakers] is disabled (or for an explicit --speaker).
     mic_speaker_label: str = "Me"
     loopback_speaker_label: str = "Remote"
 
@@ -66,11 +67,29 @@ class EchoConfig:
 
 
 @dataclass(frozen=True)
+class SpeakersConfig:
+    """Speaker recognition (layer 2). All thresholds are cosine similarities of
+    L2-normalised embeddings and are UNCALIBRATED starting points: tune them on
+    your own microphone and meeting rooms."""
+
+    enabled: bool = True
+    model: str = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+    num_threads: int = 2
+    min_embed_s: float = 1.0  # shorter segments inherit the previous speaker of their stream
+    accept_threshold: float = 0.55  # profile match: best score must reach this ...
+    margin: float = 0.05  # ... and beat the second-best person by this much
+    cluster_threshold: float = 0.5  # live: join a session cluster at/above this, else new
+    merge_threshold: float = 0.7  # live: merge two clusters whose centroids reach this
+    refine_threshold: float = 0.45  # `steno refine`: average-linkage stop similarity
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     vad: VadConfig = field(default_factory=VadConfig)
     echo: EchoConfig = field(default_factory=EchoConfig)
+    speakers: SpeakersConfig = field(default_factory=SpeakersConfig)
 
 
 def repo_root() -> Path | None:

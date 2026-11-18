@@ -28,3 +28,10 @@ def models_dir() -> Path:
     path = data_dir() / "models"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def profiles_dir() -> Path:
+    """Encrypted voice profiles (biometric data, see ``steno.secure``)."""
+    path = data_dir() / "profiles"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

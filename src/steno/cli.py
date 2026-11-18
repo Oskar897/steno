@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import replace
 
-from steno import transcript
+from steno import labels, transcript
 from steno.config import Config, ConfigError, load_config
 
 
@@ -24,6 +24,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("record", help="record mic and/or system audio and transcribe live")
     p.add_argument("--no-mic", action="store_true")
     p.add_argument("--no-loopback", action="store_true")
+    p.add_argument("--keep-audio", action="store_true",
+                   help="save each stream as 16 kHz FLAC in the session dir (sensitive data)")
     _add_asr_overrides(p)
 
     p = sub.add_parser("new", help="print transcript text not yet seen by a consumer")
@@ -32,6 +34,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--peek", action="store_true", help="do not advance the cursor")
 
     sub.add_parser("sessions", help="list recorded sessions")
+
+    p = sub.add_parser("enroll", help="record your voice from the mic and save/extend a profile")
+    p.add_argument("name")
+    p.add_argument("--seconds", type=float, default=20.0, help="recording length (default 20)")
+
+    p = sub.add_parser("name", help="name a speaker cluster of a session and learn the voice")
+    p.add_argument("session", help="'latest' or a session id")
+    p.add_argument("speaker", help='cluster, e.g. S2 or "Speaker 2"')
+    p.add_argument("person", help="name to give")
+
+    p = sub.add_parser("people", help="manage enrolled voice profiles")
+    people = p.add_subparsers(dest="people_command", required=True)
+    people.add_parser("list", help="list enrolled people")
+    pd = people.add_parser("delete", help="delete a person and their voice data")
+    pd.add_argument("name")
+    pr = people.add_parser("rename", help="rename a person")
+    pr.add_argument("old")
+    pr.add_argument("new")
+
+    p = sub.add_parser("refine", help="re-cluster a session offline and re-match to profiles")
+    p.add_argument("session", nargs="?", default="latest",
+                   help="'latest' (default) or a session id")
 
     p = sub.add_parser("transcribe-file", help="transcribe an audio file into a new session")
     p.add_argument("audio")
@@ -85,15 +109,24 @@ def cmd_devices(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_engine(cfg: Config, sources, labels=None, *, finite: bool) -> int:
+def _run_engine(
+    cfg: Config, sources, speaker_labels=None, *, finite: bool, keep_audio: bool = False
+) -> int:
     from steno.asr import create_transcriber
     from steno.engine import Engine
+    from steno.speakers import SpeakerError, create_embedder
 
     transcriber = create_transcriber(cfg.asr)
-    engine = Engine(cfg, transcriber, sources, speaker_labels=labels)
+    embedder = create_embedder(cfg.speakers) if cfg.speakers.enabled else None
+    engine = Engine(cfg, transcriber, sources, speaker_labels=speaker_labels, embedder=embedder,
+                    keep_audio=keep_audio)
     engine.subscribe(lambda seg: print(_fmt_segment(seg), flush=True))
     print(f"Loading model {transcriber.name} ...", file=sys.stderr, flush=True)
-    session_dir = engine.start()
+    try:
+        session_dir = engine.start()
+    except SpeakerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(f"Session {session_dir.name}", file=sys.stderr, flush=True)
     interrupted = False
     try:
@@ -125,7 +158,8 @@ def cmd_record(args: argparse.Namespace, cfg: Config) -> int:
         print("error: nothing to record (both streams disabled)", file=sys.stderr)
         return 2
     try:
-        return _run_engine(cfg, create_capture_sources(mic=mic, loopback=loopback), finite=False)
+        return _run_engine(cfg, create_capture_sources(mic=mic, loopback=loopback), finite=False,
+                           keep_audio=args.keep_audio)
     except AudioError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -142,8 +176,8 @@ def cmd_transcribe_file(args: argparse.Namespace, cfg: Config) -> int:
     except Exception as exc:
         print(f"error: cannot decode {args.audio}: {exc}", file=sys.stderr)
         return 1
-    labels = {args.source: args.speaker} if args.speaker else None
-    return _run_engine(cfg, [ArraySource(args.source, audio)], labels, finite=True)
+    forced = {args.source: args.speaker} if args.speaker else None
+    return _run_engine(cfg, [ArraySource(args.source, audio)], forced, finite=True)
 
 
 def cmd_new(args: argparse.Namespace) -> int:
@@ -151,7 +185,9 @@ def cmd_new(args: argparse.Namespace) -> int:
     if session_dir is None:
         print(f"(no such session: {args.session})", file=sys.stderr)
         return 0
-    segments = transcript.fetch_new(session_dir, args.consumer, peek=args.peek)
+    segments = transcript.fetch_new(
+        session_dir, args.consumer, peek=args.peek, resolve=labels.resolve_segments
+    )
     if segments:
         print(transcript.render_markdown(segments))
     return 0
@@ -165,6 +201,121 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     for s in sessions:
         state = "recording" if s.recording else "ended"
         print(f"{s.id}  {s.segments:>4} segments  {state:<9}  {s.model}  [{', '.join(s.sources)}]")
+    return 0
+
+
+def _store():
+    from steno.profiles import ProfileStore
+
+    return ProfileStore()
+
+
+def _session_or_error(spec: str):
+    session_dir = transcript.resolve_session(spec)
+    if session_dir is None:
+        print(f"error: no such session: {spec}", file=sys.stderr)
+    return session_dir
+
+
+def cmd_enroll(args: argparse.Namespace, cfg: Config) -> int:
+    from steno import ops
+    from steno.audio import AudioError, CaptureSource, record_seconds
+    from steno.speakers import SpeakerError, create_embedder
+
+    if args.seconds < 3:
+        print("error: --seconds must be at least 3", file=sys.stderr)
+        return 2
+    try:
+        embedder = create_embedder(cfg.speakers)
+        embedder.load()
+        print(
+            f"Recording {args.seconds:g} s from the microphone for '{args.name}'. Speak normally "
+            "(read aloud, in the language you use in meetings). Voiceprints are biometric data; "
+            "only enrol people who agreed.", file=sys.stderr, flush=True)
+        audio = record_seconds(CaptureSource("mic"), args.seconds)
+        result = ops.enroll_audio(audio, args.name, _store(), embedder,
+                                  min_chunk_s=cfg.speakers.min_embed_s)
+    except (AudioError, SpeakerError, ops.OpsError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "Created" if result.created else "Extended"
+    print(f"{verb} profile '{result.profile.name}' ({result.used} chunk(s) added, "
+          f"{result.total} stored).")
+    return 0
+
+
+def cmd_name(args: argparse.Namespace) -> int:
+    from steno import ops
+    from steno.profiles import ProfileError
+
+    session_dir = _session_or_error(args.session)
+    if session_dir is None:
+        return 1
+    try:
+        res = ops.name_cluster(session_dir, args.speaker, args.person, _store())
+    except (ops.OpsError, ProfileError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    verb = "created" if res.created else "extended"
+    print(f"{res.cluster_id} is now '{res.profile.name}' (profile {verb}, learned from "
+          f"{res.used} segment(s), {res.skipped} too short or without embedding).")
+    if not res.markdown_updated:
+        print("transcript.md is in use (still recording); `steno new` shows the new name.",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_people(args: argparse.Namespace) -> int:
+    from steno.profiles import ProfileError
+
+    store = _store()
+    try:
+        if args.people_command == "list":
+            people = store.list()
+            if not people:
+                print("(no enrolled people)", file=sys.stderr)
+            for p in people:
+                print(f"{p.name}  [{p.id}]  {len(p.embeddings)} embeddings  updated {p.updated}")
+        elif args.people_command == "delete":
+            profile = store.delete(args.name)
+            print(f"Deleted '{profile.name}' and their voice data. Old transcripts keep the "
+                  "name as plain text.")
+        elif args.people_command == "rename":
+            profile = store.rename(args.old, args.new)
+            n = _rename_in_sessions(profile.id, profile.name)
+            print(f"Renamed to '{profile.name}' ({n} session(s) updated).")
+    except ProfileError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _rename_in_sessions(profile_id: str, name: str) -> int:
+    count = 0
+    for info in transcript.list_sessions():
+        if labels.SessionLabels(info.dir).rename_profile(profile_id, name):
+            labels.regenerate_markdown(info.dir)
+            count += 1
+    return count
+
+
+def cmd_refine(args: argparse.Namespace, cfg: Config) -> int:
+    from steno import ops
+
+    session_dir = _session_or_error(args.session)
+    if session_dir is None:
+        return 1
+    try:
+        res = ops.refine_session(session_dir, cfg.speakers, _store())
+    except ops.OpsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Refined {session_dir.name}: {res.embedded}/{res.segments} segments embedded, "
+          f"{len(res.speakers)} speaker(s).")
+    for sid, name, n in sorted(res.speakers, key=lambda t: -t[2]):
+        print(f"  {name:<20} {sid:<12} {n} segment(s)")
+    if not res.markdown_updated:
+        print("transcript.md is in use and was not regenerated.", file=sys.stderr)
     return 0
 
 
@@ -186,11 +337,19 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_new(args)
         if args.command == "sessions":
             return cmd_sessions(args)
+        if args.command == "name":
+            return cmd_name(args)
+        if args.command == "people":
+            return cmd_people(args)
         cfg = _apply_overrides(load_config(args.config), args)
         if args.command == "record":
             return cmd_record(args, cfg)
         if args.command == "transcribe-file":
             return cmd_transcribe_file(args, cfg)
+        if args.command == "enroll":
+            return cmd_enroll(args, cfg)
+        if args.command == "refine":
+            return cmd_refine(args, cfg)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

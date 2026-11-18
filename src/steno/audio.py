@@ -16,6 +16,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -340,6 +341,53 @@ class ArraySource:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+
+class StreamRecorder:
+    """Writes one stream's 16 kHz mono audio to ``audio-<stream>.flac`` (``--keep-audio``).
+
+    Raw audio is sensitive: it stays in the session directory under the user data
+    dir, never in the repository.
+    """
+
+    def __init__(self, session_dir, stream: str):
+        try:
+            import soundfile
+        except ImportError as exc:
+            raise AudioError("Keeping audio needs the 'audio' extra (soundfile)") from exc
+        self.path = Path(session_dir) / f"audio-{stream}.flac"
+        self._file = soundfile.SoundFile(
+            str(self.path), mode="w", samplerate=TARGET_RATE, channels=1,
+            format="FLAC", subtype="PCM_16",
+        )
+
+    def write(self, samples: np.ndarray) -> None:
+        self._file.write(np.clip(samples, -1.0, 1.0))
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
+
+
+def record_seconds(source: AudioSource, seconds: float) -> np.ndarray:
+    """Capture ``seconds`` of one live source into an array (used by ``steno enroll``)."""
+    sink: queue.Queue[AudioChunk] = queue.Queue()
+    source.start(sink, time.monotonic())
+    parts: list[np.ndarray] = []
+    deadline = time.monotonic() + seconds
+    try:
+        while time.monotonic() < deadline:
+            try:
+                chunk = sink.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if chunk.samples.size:
+                parts.append(chunk.samples)
+            if chunk.eof:
+                break
+    finally:
+        source.stop()
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
 
 def load_audio_file(path: str) -> np.ndarray:

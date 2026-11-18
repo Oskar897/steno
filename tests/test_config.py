@@ -61,3 +61,12 @@ def test_invalid_toml(tmp_path):
     f.write_text("[asr\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(f)
+
+
+def test_speakers_section_defaults_and_override():
+    assert Config().speakers.enabled is True
+    assert Config().speakers.accept_threshold == 0.55 and Config().speakers.margin == 0.05
+    cfg = config_from_dict({"speakers": {"enabled": False, "accept_threshold": 1}})
+    assert cfg.speakers.enabled is False and cfg.speakers.accept_threshold == 1.0
+    with pytest.raises(ConfigError):
+        config_from_dict({"speakers": {"min_embed_s": "long"}})
