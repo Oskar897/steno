@@ -102,6 +102,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="show the edits Claude proposes and which pass validation; write nothing")
 
+    p = sub.add_parser("app", help="open the desktop app (projects, recording, meetings)")
+    p.add_argument("--debug", action="store_true", help="enable the web inspector")
+
     p = sub.add_parser("ui", help="open the local web UI (record, transcripts, speakers, people)")
     p.add_argument("--port", type=int, default=0,
                    help="port on 127.0.0.1 (default: a random free one)")
@@ -607,6 +610,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_clean(args, cfg)
         if args.command == "ui":
             return cmd_ui(args, cfg)
+        if args.command == "app":
+            from steno.ui.window import run_app
+
+            return run_app(cfg, debug=args.debug)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2

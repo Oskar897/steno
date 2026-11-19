@@ -26,6 +26,10 @@ asr = [
 speakers = [
     "sherpa-onnx==2.0.1",
 ]
+# Desktop window (`steno app`): WebView2 via pythonnet on Windows.
+app = [
+    "pywebview>=5.3",
+]
 bench = [
     "sherpa-onnx>=1.10",
     "jiwer>=3.0",

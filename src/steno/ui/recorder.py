@@ -8,11 +8,13 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from steno import labels
+from steno import labels, projects
 from steno.config import Config
 from steno.engine import Engine
 from steno.transcript import Segment
@@ -26,6 +28,7 @@ EngineFactory = Callable[[Config, bool, bool, bool], Engine]
 LEVEL_FLOOR_DB = -60.0
 ACTIVE_LEVEL = 0.35  # normalised level above which a stream counts as "active"
 ACTIVE_HOLD_S = 0.6
+MIRROR_EVERY_S = 2.0  # transcript.md in the meeting folder is rewritten at most this often
 
 
 class RecorderError(RuntimeError):
@@ -52,13 +55,21 @@ def default_engine_factory(cfg: Config, keep_audio: bool, mic: bool, loopback: b
 
 
 class _TapQueue:
-    """Looks like the engine's audio queue; reports every chunk before forwarding it."""
+    """Looks like the engine's audio queue; reports every chunk before forwarding it.
 
-    def __init__(self, inner, on_chunk: Callable[[str, np.ndarray], None]):
+    While ``paused()`` the samples are replaced by silence: the stream clock keeps running
+    (kept audio stays aligned) and the engine simply hears nobody.
+    """
+
+    def __init__(self, inner, on_chunk: Callable[[str, np.ndarray], None],
+                 paused: Callable[[], bool] = lambda: False):
         self._inner = inner
         self._on_chunk = on_chunk
+        self._paused = paused
 
     def put(self, chunk, *args, **kwargs) -> None:
+        if self._paused() and chunk.samples.size:
+            chunk = dc_replace(chunk, samples=np.zeros_like(chunk.samples))
         try:
             if chunk.samples.size:
                 self._on_chunk(chunk.source, chunk.samples)
@@ -71,13 +82,15 @@ class _TapQueue:
 
 
 class _TappedSource:
-    def __init__(self, source, on_chunk: Callable[[str, np.ndarray], None]):
+    def __init__(self, source, on_chunk: Callable[[str, np.ndarray], None],
+                 paused: Callable[[], bool] = lambda: False):
         self._source = source
         self._on_chunk = on_chunk
+        self._paused = paused
         self.name = source.name
 
     def start(self, sink, t0: float) -> None:
-        self._source.start(_TapQueue(sink, self._on_chunk), t0)
+        self._source.start(_TapQueue(sink, self._on_chunk, self._paused), t0)
 
     def stop(self) -> None:
         self._source.stop()
@@ -119,6 +132,10 @@ class Recorder:
         self.speaker = ""
         self.last_segment_at: float | None = None
         self.segments = 0
+        self.paused = False
+        self.project: projects.Project | None = None
+        self._title: str | None = None
+        self._mirror_dirty = False
         self._engine: Engine | None = None
         self._unsubscribe: Callable[[], None] | None = None
         self._unsubscribe_rev: Callable[[], None] | None = None
@@ -148,6 +165,8 @@ class Recorder:
             engine = self._engine
             return {
                 "state": self.state,
+                "paused": self.paused,
+                "project": self.project.id if self.project is not None else None,
                 "error": self.error,
                 "session": self.session_id,
                 "keep_audio": self.keep_audio,
@@ -163,7 +182,8 @@ class Recorder:
 
     # -- control ------------------------------------------------------------------
 
-    def start(self, *, keep_audio: bool, mic: bool, loopback: bool) -> None:
+    def start(self, *, keep_audio: bool, mic: bool, loopback: bool,
+              project: projects.Project | None = None, title: str | None = None) -> None:
         if not (mic or loopback):
             raise RecorderError("nothing to record: enable the microphone or system audio")
         with self._lock:
@@ -175,6 +195,9 @@ class Recorder:
             self.sources = [n for n, on in (("mic", mic), ("loopback", loopback)) if on]
             self.speaker = ""
             self.segments = 0
+            self.paused = False
+            self.project = project
+            self._title = title
             self.last_segment_at = None
             self._t0 = None
             self._levels = {n: _Level() for n in self.sources}
@@ -187,7 +210,8 @@ class Recorder:
     def _start_worker(self, keep_audio: bool, mic: bool, loopback: bool) -> None:
         try:
             engine = self._factory(self._cfg, keep_audio, mic, loopback)
-            engine.sources = [_TappedSource(s, self._on_chunk) for s in engine.sources]
+            engine.sources = [_TappedSource(s, self._on_chunk, lambda: self.paused)
+                              for s in engine.sources]
             self._engine = engine  # segment callbacks need it from the first line on
             self._unsubscribe = engine.subscribe(self._on_segment)
             if hasattr(engine, "subscribe_revisions"):
@@ -203,12 +227,47 @@ class Recorder:
                 self._t0 = None
             self._publish_status()
             return
+        if self.project is not None:
+            try:
+                projects.create_meeting(self.project, session_dir, self._title)
+            except Exception:  # recording goes on; the session stays in the inbox
+                log.exception("Could not create the meeting folder")
         with self._lock:
             self.session_id = session_dir.name
             self._t0 = time.monotonic()
             self.state = "recording"
         self._publish_status()
         self._bus.publish("sessions", {"session": session_dir.name})
+        self._bus.publish("projects", {"session": session_dir.name})
+        threading.Thread(target=self._mirror_loop, args=(session_dir,), name="ui-rec-mirror",
+                         daemon=True).start()
+
+    def pause(self) -> None:
+        with self._lock:
+            if self.state != "recording":
+                raise RecorderError("not recording")
+            if self.paused:
+                raise RecorderError("already paused")
+            self.paused = True
+        self._publish_status()
+
+    def resume(self) -> None:
+        with self._lock:
+            if self.state != "recording" or not self.paused:
+                raise RecorderError("not paused")
+            self.paused = False
+        self._publish_status()
+
+    def _mirror_loop(self, session_dir: Path) -> None:
+        """Keep ``transcript.md`` in the meeting folder current while recording."""
+        while self.state in ("recording", "stopping") and self.session_id == session_dir.name:
+            time.sleep(MIRROR_EVERY_S)
+            if self._mirror_dirty:
+                self._mirror_dirty = False
+                try:
+                    projects.sync(session_dir, recording=True, docs=False)
+                except Exception:
+                    log.debug("meeting folder sync failed", exc_info=True)
 
     def stop(self, *, drain: bool = True) -> None:
         with self._lock:
@@ -232,7 +291,14 @@ class Recorder:
             error = str(exc).strip() or type(exc).__name__
         self._drop_subscriptions()
         session, keep = self.session_id, self.keep_audio
+        if engine is not None and self.project is not None:
+            try:  # the finished text, and the index without the "recording" mark
+                projects.sync(engine.session_dir)
+                projects.write_index(self.project)
+            except Exception:
+                log.exception("Could not update the meeting folder")
         with self._lock:
+            self.paused = False
             self.state = "error" if error else "idle"
             self.error = error
             self._engine = None
@@ -283,12 +349,14 @@ class Recorder:
         self.speaker = shown.speaker
         self.last_segment_at = time.monotonic()
         self.segments += 1
+        self._mirror_dirty = True
         session = engine.session_id if engine is not None else self.session_id
         self._bus.publish("segment", {"session": session, "segment": segment_dict(shown)})
 
     def _on_revision(self, seg: Segment) -> None:
         """A refined line: same ``seq``, better text. The page swaps the text in place."""
         engine = self._engine
+        self._mirror_dirty = True
         session = engine.session_id if engine is not None else self.session_id
         self._bus.publish("revision", {"session": session, "seq": seg.seq, "text": seg.text})
 

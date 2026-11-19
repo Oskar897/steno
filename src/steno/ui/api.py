@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from steno import __version__, labels, transcript
+from steno import __version__, labels, projects, transcript
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
@@ -26,6 +26,9 @@ MAX_NAME_LEN = 80
 MAX_SPEAKERS = 20
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _PROFILE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+_PROJECT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+MAX_PATH_LEN = 1000
+DOCS = {"summary": "summary.md", "todo": "todo.md"}
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -99,10 +102,39 @@ class UiApp:
         self.bus = EventBus()
         self._store_factory = store_factory
         self.recorder = Recorder(cfg, self.bus, engine_factory)
-        self.jobs = JobManager(self.bus, runners or default_runners(cfg, store_factory))
+        self.jobs = JobManager(self.bus, self._with_sync(
+            runners or default_runners(cfg, store_factory)))
         self.recorder.on_stopped = self._after_recording
 
     # -- helpers ------------------------------------------------------------------
+
+    def _with_sync(self, runners: dict[str, Runner]) -> dict[str, Runner]:
+        """After every job, copy its results into the meeting folder."""
+
+        def wrap(fn: Runner) -> Runner:
+            def run(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
+                result = fn(session_dir, params, progress)
+                try:
+                    projects.sync(session_dir,
+                                  recording=session_dir.name == self.recorder.active_session())
+                    project = projects.project_of(session_dir)
+                    if project is not None:
+                        projects.write_index(project, self.recorder.active_session())
+                except Exception:
+                    log.exception("Could not update the meeting folder")
+                self.bus.publish("projects", {"session": session_dir.name})
+                return result
+            return run
+
+        return {kind: wrap(fn) for kind, fn in runners.items()}
+
+    def _project(self, pid: str) -> projects.Project:
+        if not _PROJECT_ID_RE.match(pid or ""):
+            raise ApiError(404, "no such project")
+        try:
+            return projects.get_project(pid)
+        except projects.ProjectError as exc:
+            raise ApiError(404, str(exc)) from exc
 
     def _session_dir(self, session_id: str) -> Path:
         if not _SESSION_ID_RE.match(session_id):
@@ -158,11 +190,120 @@ class UiApp:
         keep = body.get("keep_audio", False)
         if not all(isinstance(v, bool) for v in (mic, loopback, keep)):
             raise ApiError(400, "mic, loopback and keep_audio must be true or false")
+        pid = body.get("project")
+        project = self._project(pid) if pid and pid != "inbox" else None
+        title = body.get("title")
+        title = clean_name(title, "title") if isinstance(title, str) and title.strip() else None
         try:
-            self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback)
+            self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback, project=project,
+                                title=title)
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
+
+    def record_pause(self) -> dict[str, Any]:
+        try:
+            self.recorder.pause()
+        except RecorderError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return {"recorder": self.recorder.snapshot()}
+
+    def record_resume(self) -> dict[str, Any]:
+        try:
+            self.recorder.resume()
+        except RecorderError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return {"recorder": self.recorder.snapshot()}
+
+    # -- projects -----------------------------------------------------------------
+
+    def projects_list(self) -> dict[str, Any]:
+        out = []
+        for p in projects.list_projects():
+            meetings = projects.list_meetings(p)
+            out.append({"id": p.id, "name": p.name, "path": str(p.path),
+                        "meetings": len(meetings),
+                        "last_at": _started_at(meetings[-1].session) if meetings else None})
+        return {"projects": out, "inbox": len(projects.inbox_sessions())}
+
+    def project_add(self, body: dict[str, Any]) -> dict[str, Any]:
+        path = body.get("path")
+        if not isinstance(path, str) or not path.strip() or len(path) > MAX_PATH_LEN:
+            raise ApiError(400, "path must be a folder path")
+        name = body.get("name")
+        if name is not None:
+            name = clean_name(name, "name")
+        try:
+            p = projects.add_project(path.strip(), name=name, create=bool(body.get("create")))
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(400, f"cannot use that folder: {exc}") from exc
+        self.bus.publish("projects", {})
+        return {"project": {"id": p.id, "name": p.name, "path": str(p.path), "meetings": 0,
+                            "last_at": None}}
+
+    def project_remove(self, pid: str) -> dict[str, Any]:
+        self._project(pid)
+        projects.remove_project(pid)
+        self.bus.publish("projects", {})
+        return {"ok": True}
+
+    def project_meetings(self, pid: str) -> dict[str, Any]:
+        live = self.recorder.active_session()
+        if pid == "inbox":
+            items = [(s.dir, projects.meeting_title(s.dir), "") for s in projects.inbox_sessions()]
+        else:
+            items = []
+            for m in projects.list_meetings(self._project(pid)):
+                d = transcript.resolve_session(m.session)
+                if d is not None:
+                    items.append((d, m.title, str(m.folder)))
+        out = []
+        for d, title, folder in items:
+            info = transcript.load_session_info(d)
+            out.append({
+                "session": info.id, "title": title, "folder": folder,
+                "started_at": info.started_at, "ended_at": info.ended_at,
+                "recording": info.id == live, "segments": info.segments,
+                "has_summary": (d / "summary.md").is_file(),
+                "has_todo": (d / "todo.md").is_file(),
+                "has_clean": (d / "clean.jsonl").is_file(),
+            })
+        return {"meetings": out}
+
+    def meeting_rename(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        title = clean_name(body.get("title"), "title")
+        try:
+            m = projects.rename_meeting(d, title)
+        except OSError as exc:
+            raise ApiError(409, f"cannot rename the meeting folder: {exc}") from exc
+        self.bus.publish("projects", {"session": session_id})
+        return {"title": m.title, "folder": str(m.folder)}
+
+    def meeting_move(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        if session_id == self.recorder.active_session():
+            raise ApiError(409, "stop the recording before moving it")
+        if body.get("project") == "inbox":
+            raise ApiError(400, "meetings can be moved to a project, not back to the inbox")
+        project = self._project(str(body.get("project") or ""))
+        try:
+            m = projects.move_meeting(d, project)
+        except OSError as exc:
+            raise ApiError(409, f"cannot move the meeting folder: {exc}") from exc
+        self.bus.publish("projects", {"session": session_id})
+        return {"title": m.title, "folder": str(m.folder), "project": project.id}
+
+    def session_doc(self, session_id: str, kind: str) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        if kind not in DOCS:
+            raise ApiError(404, "no such document")
+        text = _read_text(d / DOCS[kind])
+        if text is None:
+            raise ApiError(404, f"this meeting has no {kind} yet")
+        return {"markdown": text}
 
     def record_stop(self) -> dict[str, Any]:
         try:
@@ -210,9 +351,16 @@ class UiApp:
         else:
             segments = labels.resolve_segments(d, transcript.read_best(d))
             kind = "live"
+        if view is None:  # the cleaned text while it still matches what it was made from
+            cleaned = clean.clean_overlay(d, segments) if segments else None
+            if cleaned is not None:
+                segments, kind = cleaned, "clean"
         clean_info = clean.status(d)
+        project = projects.project_of(d)
         return {
             "id": info.id,
+            "title": projects.meeting_title(d),
+            "project": project.id if project is not None else None,
             "started_at": info.started_at,
             "ended_at": info.ended_at,
             "model": info.model,
@@ -365,3 +513,8 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
         return None
+
+
+def _started_at(session_id: str) -> str | None:
+    d = transcript.resolve_session(session_id)
+    return transcript.load_session_info(d).started_at if d is not None else None

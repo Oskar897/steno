@@ -21,65 +21,70 @@ function h(tag, props, ...kids) {
   return el;
 }
 
-function pad2(n) { return String(n).padStart(2, "0"); }
+const pad2 = (n) => String(n).padStart(2, "0");
 function clock(sec) {
-  const t = Math.max(0, Math.floor(sec));
+  const t = Math.max(0, Math.floor(sec || 0));
   const hh = Math.floor(t / 3600), mm = Math.floor((t % 3600) / 60), ss = t % 60;
   return hh ? `${hh}:${pad2(mm)}:${pad2(ss)}` : `${pad2(mm)}:${pad2(ss)}`;
 }
 function clockHms(sec) {
-  const t = Math.max(0, Math.floor(sec));
+  const t = Math.max(0, Math.floor(sec || 0));
   return `${pad2(Math.floor(t / 3600))}:${pad2(Math.floor((t % 3600) / 60))}:${pad2(t % 60)}`;
 }
-function when(iso) { return iso ? iso.replace("T", " ").slice(0, 16) : ""; }
-function clusterNo(id) { const m = /^[SR](\d+)$/.exec(id || ""); return m ? Number(m[1]) : null; }
-
-function store(key, value) {
-  try {
-    if (value === undefined) return sessionStorage.getItem(key);
-    if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value);
-  } catch (e) { /* storage unavailable: keep working without it */ }
-  return null;
+const when = (iso) => (iso ? iso.replace("T", " ").slice(0, 16) : "");
+function durationOf(info) {
+  const a = Date.parse(info.started_at), b = Date.parse(info.ended_at);
+  return a && b && b >= a ? (b - a) / 1000 : null;
 }
-function pref(key, value) {
+const clusterNo = (id) => { const m = /^[SR](\d+)$/.exec(id || ""); return m ? Number(m[1]) : null; };
+function debounced(fn, ms) {
+  let t = null;
+  return () => { clearTimeout(t); t = setTimeout(() => guarded(fn), ms); };
+}
+
+function remember(key, value) {  // per-session (token) or persistent (prefs) storage, never fatal
   try {
     if (value === undefined) return localStorage.getItem(key);
-    localStorage.setItem(key, value);
+    if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value);
+  } catch (e) { /* storage unavailable */ }
+  return null;
+}
+function tokenStore(value) {
+  try {
+    if (value === undefined) return sessionStorage.getItem("steno-token");
+    sessionStorage.setItem("steno-token", value);
   } catch (e) { /* ignore */ }
   return null;
 }
 
 // ---------------------------------------------------------------- state and API
 
+const PAGE = 3;  // meetings loaded into the feed at first, and per "Show older"
 const S = {
   token: null,
-  status: { recorder: {}, job: null, config: {} },
-  jobs: [],
-  view: "live",
-  open: null,          // detail of the transcript on screen
-  openId: null,
-  loading: null,       // session id being fetched (segments are buffered meanwhile)
-  buffer: [],
-  browseId: null,      // session opened from the Sessions list
-  stick: true,         // transcript follows new lines until the user scrolls up
-  unseen: 0,
-  naming: null,        // speaker being named
-  tab: "summary",
-  sessions: [],
-  people: [],
-  connected: false,
-  fatal: false,
+  status: { recorder: {}, job: null, jobs: [], config: {} },
+  projects: [], inbox: 0,
+  view: "project",        // "project" | "people"
+  sel: null,              // project id or "inbox"
+  meetings: [],           // list for the selected project, oldest first
+  shown: PAGE,
+  feed: new Map(),        // session id -> {info, detail, docs, open, el, ...}
+  loadingFeed: false, buffer: [], unknown: new Set(),
+  stick: true, unseen: 0,
+  opts: { mic: true, loop: true, keep: false },
+  people: [], connected: false, fatal: false,
+  jobStates: new Map(),
 };
 
 function initToken() {
   const url = new URL(location.href);
   const fromUrl = url.searchParams.get("token");
   if (fromUrl) {
-    store("steno-token", fromUrl);
+    tokenStore(fromUrl);
     S.token = fromUrl;
     history.replaceState(null, "", url.pathname);  // keep the token out of the address bar
   } else {
-    S.token = store("steno-token");
+    S.token = tokenStore();
   }
 }
 
@@ -91,428 +96,590 @@ async function api(method, path, body) {
   }
   let res;
   try { res = await fetch(path, opts); }
-  catch (e) { throw new Error("Cannot reach Steno. Is `steno ui` still running?"); }
+  catch (e) { throw new Error("Cannot reach Steno. Is it still running?"); }
   let data = null;
   try { data = await res.json(); } catch (e) { /* not JSON */ }
   if (res.status === 401) {
     S.fatal = true;
-    throw new Error("Access token rejected. Open the address printed by `steno ui` again.");
+    throw new Error("Access token rejected. Open Steno again from its own window or address.");
   }
-  if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `Request failed (${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
+const missing = (e) => e && e.status === 404;  // endpoint or item not there (yet): not an error to show
 
-function showError(err) {
-  $("alert-text").textContent = err instanceof Error ? err.message : String(err);
-  $("alert").hidden = false;
+function toast(text, kind) {
+  const el = h("div", { class: "toast" + (kind ? " " + kind : ""), text: String(text) });
+  el.addEventListener("click", () => el.remove());
+  $("toasts").append(el);
+  while ($("toasts").children.length > 4) $("toasts").firstChild.remove();
+  setTimeout(() => el.remove(), kind === "error" ? 9000 : 5000);
 }
-function clearError() { $("alert").hidden = true; }
 async function guarded(fn) {
-  try { return await fn(); } catch (e) { showError(e); return null; }
+  try { return await fn(); } catch (e) { toast(e instanceof Error ? e.message : e, "error"); return null; }
 }
 
-// ---------------------------------------------------------------- views
+// ---------------------------------------------------------------- modal dialogs
 
-function setView(view) {
-  S.view = view;
-  document.querySelectorAll(".nav-item").forEach((b) => {
-    if (b.dataset.view === view) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+function pickerAvailable() {
+  return !!(window.pywebview && window.pywebview.api && window.pywebview.api.pick_folder);
+}
+async function pickFolder() {  // path | null (cancelled) | undefined (no native picker)
+  if (!pickerAvailable()) return undefined;
+  try { return (await window.pywebview.api.pick_folder()) || null; } catch (e) { return null; }
+}
+
+/* fields: [{key, label, value, placeholder, browse, options:[{value,label}]}] -> values | null */
+function formModal({ title, text, fields = [], ok = "OK" }) {
+  return new Promise((resolve) => {
+    const dlg = $("modal");
+    const inputs = {};
+    const finish = (v) => { resolve(v); if (dlg.open) dlg.close(); };
+    const rows = fields.map((f) => {
+      let input;
+      if (f.options) {
+        input = h("select", null, f.options.map((o) => h("option", { value: o.value, text: o.label })));
+        input.value = f.value ?? f.options[0].value;
+      } else {
+        input = h("input", { class: "text", type: "text", value: f.value || "", placeholder: f.placeholder || "", autocomplete: "off" });
+      }
+      inputs[f.key] = input;
+      const browse = f.browse && pickerAvailable()
+        ? h("button", { class: "btn", type: "button", text: "Browse",
+          onclick: async () => { const p = await pickFolder(); if (p) input.value = p; } }) : null;
+      return h("label", null, f.label, h("div", { class: "inrow" }, input, browse));
+    });
+    const form = h("form", { class: "mform", onsubmit: (ev) => {
+      ev.preventDefault();
+      finish(Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.value.trim()])));
+    } },
+    h("h3", { text: title }), text ? h("p", { text }) : null, rows,
+    h("div", { class: "btns" },
+      h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) }),
+      h("button", { class: "btn solid", type: "submit", text: ok })));
+    dlg.replaceChildren(form);
+    dlg.addEventListener("close", () => resolve(null), { once: true });  // Escape
+    dlg.showModal();
+    const first = form.querySelector("input, select");
+    if (first) first.focus();
   });
-  guarded(enterView);
 }
 
-async function enterView() {
-  clearError();
-  const live = S.view === "live";
-  const sessions = S.view === "sessions";
-  $("recorder").hidden = !live;
-  $("people-view").hidden = S.view !== "people";
-  $("sessions-view").hidden = !(sessions && !S.browseId);
-  $("transcript-wrap").hidden = !(live || (sessions && S.browseId));
-  $("sess-back").hidden = !sessions;
-  $("sess-kind").textContent = live ? "Live transcript" : "Session";
-  if (live) {
-    renderRecorder();
-    const id = S.status.recorder.session;
-    if (id) await openSession(id, { follow: true });
-    else { clearTranscript("Start a recording and the transcript appears here as you speak."); }
-  } else if (sessions) {
-    if (S.browseId) await openSession(S.browseId, { follow: false });
-    else { clearTranscript(); renderSide(); await loadSessions(); }
-  } else {
-    clearTranscript();
-    renderSide();
-    await loadPeople();
-  }
-  renderStatusbar();
-}
+// ---------------------------------------------------------------- projects and sidebar
 
-function clearTranscript(emptyText) {
-  S.open = null; S.openId = null; S.unseen = 0;
-  $("transcript").replaceChildren();
-  const e = $("transcript-empty");
-  e.textContent = emptyText || "";
-  e.hidden = !emptyText;
-  $("jump").hidden = true;
-  $("sess-id").textContent = "";
-  $("fin-run").hidden = true;
-  $("fin-speakers").parentElement.hidden = true;
-  $("view-toggle").hidden = true;
-  renderSide();
-}
+const curProject = () => S.projects.find((p) => p.id === S.sel) || null;
+const projectName = (id) => (id === "inbox" || !id ? "Inbox" : (S.projects.find((p) => p.id === id) || {}).name || "project");
 
-// ---------------------------------------------------------------- recorder
-
-function renderRecorder() {
+function recProjectId() {
   const r = S.status.recorder || {};
-  const cfg = S.status.config || {};
-  const box = $("recorder");
-  const state = r.state || "idle";
-  box.classList.toggle("is-recording", state === "recording");
-  box.classList.toggle("is-busy", state === "starting" || state === "stopping");
-  box.classList.toggle("is-error", state === "error");
-  const labels = { idle: "Idle", starting: "Loading models", recording: "Recording", stopping: "Finishing", error: "Error" };
-  $("rec-label").textContent = labels[state] || state;
-  $("rec-clock").textContent = clockHms(r.elapsed_s || 0);
-  const btn = $("rec-toggle");
-  const active = state === "starting" || state === "recording" || state === "stopping";
-  btn.textContent = state === "recording" ? "Stop recording"
-    : state === "starting" ? "Loading models..." : state === "stopping" ? "Finishing..." : "Start recording";
-  btn.disabled = state === "starting" || state === "stopping";
-  btn.classList.toggle("primary", state !== "recording");
-  $("rec-opts").querySelectorAll("input").forEach((i) => { i.disabled = active; });
-  if (!active && !box.dataset.init && cfg.capture_mic !== undefined) {
-    box.dataset.init = "1";
-    $("opt-mic").checked = !!cfg.capture_mic;
-    $("opt-loop").checked = !!cfg.capture_loopback;
-    $("opt-keep").checked = pref("steno-keep-audio") === "1";
+  if (!r.session || r.state === "idle" || r.state === "error") return null;
+  const key = r.project;
+  if (!key) return "inbox";
+  const p = S.projects.find((x) => x.id === key || x.path === key);
+  return p ? p.id : key;
+}
+
+async function loadProjects() {
+  try {
+    const d = await api("GET", "/api/projects");
+    S.projects = (d.projects || []).slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+    S.inbox = d.inbox || 0;
+  } catch (e) {
+    if (!missing(e)) throw e;
+    S.projects = []; S.inbox = 0;
   }
-  if (active) {  // show what the running recording uses
-    $("opt-mic").checked = (r.sources || []).includes("mic");
-    $("opt-loop").checked = (r.sources || []).includes("loopback");
-    $("opt-keep").checked = !!r.keep_audio;
+  const changed = ensureSelection();
+  renderSide(); renderTop();
+  if (changed) { S.shown = PAGE; S.stick = true; await loadFeed(); }
+}
+
+function ensureSelection() {  // returns true when the selected project had to change
+  if (S.view === "people") return false;
+  const valid = S.sel === "inbox" ? S.inbox > 0 : S.projects.some((p) => p.id === S.sel);
+  if (valid) return false;
+  const saved = remember("steno-project");
+  const pick = [recProjectId(), saved, (S.projects[0] || {}).id, S.inbox > 0 ? "inbox" : null]
+    .find((id) => id && (id === "inbox" ? S.inbox > 0 : S.projects.some((p) => p.id === id)));
+  const next = pick || null;
+  const changed = next !== S.sel;
+  S.sel = next;
+  if (changed) { S.feed.clear(); S.meetings = []; S.unknown.clear(); }
+  return changed;
+}
+
+function selectProject(id) {
+  S.view = "project"; S.sel = id; S.shown = PAGE; S.stick = true; S.unseen = 0;
+  S.feed.clear(); S.meetings = []; S.unknown.clear();
+  remember("steno-project", id);
+  showView(); renderSide(); renderTop(); renderFeed();
+  guarded(loadFeed);
+}
+
+function showPeople() {
+  S.view = "people";
+  showView(); renderSide();
+  guarded(loadPeople);
+}
+
+function showView() {
+  $("view-project").hidden = S.view !== "project";
+  $("view-people").hidden = S.view !== "people";
+}
+
+function renderSide() {
+  const live = recProjectId();
+  const item = (id, name, count) => h("button", {
+    class: "pitem" + (S.view === "project" && S.sel === id ? " active" : ""), type: "button",
+    onclick: () => selectProject(id) },
+  h("span", { class: "pname", text: name }),
+  live === id ? h("i", { class: "dot", title: "Recording" }) : null,
+  h("span", { class: "pcount", text: String(count) }));
+  $("plist").replaceChildren(...S.projects.map((p) => item(p.id, p.name, p.meetings)));
+  $("inbox-slot").replaceChildren(...(S.inbox > 0 ? [item("inbox", "Inbox", S.inbox)] : []));
+  $("nav-people").classList.toggle("active", S.view === "people");
+  $("people-count").textContent = S.people.length ? String(S.people.length) : "";
+  renderSideFoot();
+}
+
+function renderSideFoot() {
+  const cfg = S.status.config || {}, r = S.status.recorder || {};
+  const lines = [];
+  if (r.state === "recording") lines.push(h("div", null, h("b", { text: r.paused ? "PAUSED " : "REC " }), clockHms(r.elapsed_s)));
+  lines.push(h("div", null, "ASR ", h("b", { text: cfg.asr_model || "-" })));
+  lines.push(h("div", null, "LLM ", h("b", { text: cfg.llm_model || "-" })));
+  lines.push(h("div", null, S.connected ? "CONNECTED" : "RECONNECTING", S.status.version ? ` · v${S.status.version}` : ""));
+  $("side-foot").replaceChildren(...lines);
+}
+
+async function newProject() {
+  const picked = await pickFolder();
+  if (picked === null) return;
+  const v = await formModal({
+    title: "New project",
+    text: "A project is a folder on disk. Meetings are saved in <folder>/Steno/.",
+    fields: [
+      { key: "path", label: "Parent folder", value: picked || "", placeholder: "Path of the folder to create it in", browse: true },
+      { key: "name", label: "Project name", placeholder: "Name of the new folder" }],
+    ok: "Create",
+  });
+  if (!v) return;
+  if (!v.path || !v.name) { toast("Choose a parent folder and enter a name.", "error"); return; }
+  const res = await guarded(() => api("POST", "/api/projects", { path: v.path, name: v.name, create: true }));
+  if (res) await afterProjectAdded(res.project);
+}
+
+async function addProject() {
+  let path = await pickFolder();
+  if (path === null) return;
+  if (path === undefined) {
+    const v = await formModal({ title: "Add existing folder", fields: [{ key: "path", label: "Folder path", placeholder: "Path of an existing folder" }], ok: "Add" });
+    path = v && v.path;
   }
-  const meters = $("rec-meters");
-  meters.hidden = !(state === "recording" || state === "stopping");
-  for (const name of ["mic", "loopback"]) {
-    const m = $("meter-" + name);
-    const lv = (r.levels || {})[name];
-    m.hidden = !lv;
-    if (lv) {
-      m.querySelector(".bar i").style.setProperty("--w", String(lv.level));
-      m.classList.toggle("active", !!lv.active);
+  if (!path) return;
+  const res = await guarded(() => api("POST", "/api/projects", { path }));
+  if (res) await afterProjectAdded(res.project);
+}
+
+async function afterProjectAdded(project) {
+  await guarded(loadProjects);
+  if (project && project.id) selectProject(project.id);
+}
+
+async function forgetProject() {
+  const p = curProject();
+  if (!p) return;
+  const ok = await formModal({ title: "Forget project", text: `Remove "${p.name}" from Steno? Its folder and meetings stay on disk.`, ok: "Forget" });
+  if (!ok) return;
+  if (await guarded(() => api("DELETE", `/api/projects/${encodeURIComponent(p.id)}`))) {
+    S.sel = null; S.feed.clear();
+    await guarded(loadProjects);
+    renderTop(); renderFeed();
+  }
+}
+
+// ---------------------------------------------------------------- top bar: recording controls and status strip
+
+function renderTop() {
+  const r = S.status.recorder || {}, st = r.state || "idle";
+  const active = st === "starting" || st === "recording" || st === "stopping";
+  const proj = curProject();
+  $("proj-name").textContent = S.sel === "inbox" ? "Inbox" : proj ? proj.name : "";
+  $("btn-forget").hidden = !proj;
+  const noProject = !S.sel;
+  $("rec-title").hidden = active;
+  $("rec-title").disabled = noProject;
+  const rec = $("btn-rec");
+  rec.hidden = st === "recording";
+  rec.disabled = noProject || st === "starting" || st === "stopping";
+  $("btn-rec-label").textContent = st === "starting" ? "Loading models..." : st === "stopping" ? "Finishing..." : "Record";
+  $("btn-pause").hidden = st !== "recording";
+  $("btn-pause").textContent = r.paused ? "Resume" : "Pause";
+  $("btn-stop").hidden = st !== "recording";
+  const src = r.sources || [];
+  const on = active ? { mic: src.includes("mic"), loop: src.includes("loopback"), keep: !!r.keep_audio } : S.opts;
+  for (const [id, key] of [["tgl-mic", "mic"], ["tgl-loop", "loop"], ["tgl-keep", "keep"]]) {
+    $(id).setAttribute("aria-pressed", String(!!on[key]));
+    $(id).disabled = active;
+  }
+  $("empty").hidden = !(S.view === "project" && !S.sel && S.projects.length === 0 && S.inbox === 0);
+  $("feed").parentElement.hidden = !$("empty").hidden;
+  renderStrip();
+  updateButtons();
+}
+
+function meter(label, lv) {
+  if (!lv) return null;
+  const n = Math.min(5, Math.round(Math.sqrt(Math.max(0, lv.level || 0)) * 5));
+  return h("span", { class: "lab" }, label + " ", h("span", { class: "on", text: "▮".repeat(n) }), h("span", { class: "off", text: "▯".repeat(5 - n) }));
+}
+
+function renderStrip() {
+  const r = S.status.recorder || {}, st = r.state || "idle", cfg = S.status.config || {};
+  const live = st === "recording" || st === "stopping";
+  const out = [];
+  if (live) {
+    out.push(h("span", { class: "lab" + (r.paused ? " paused" : "") }, h("i", { class: "dot" }), `${r.paused ? "PAUSED" : "REC"} ${clockHms(r.elapsed_s)}`));
+  }
+  const word = { idle: "READY", starting: "LOADING MODELS", stopping: `FINISHING${r.backlog ? " · " + r.backlog + " PENDING" : ""}`, error: "ERROR" }[st]
+    || (r.paused ? "PAUSED" : r.backlog > 0 ? "TRANSCRIBING" : "LISTENING");
+  out.push(h("span", { class: "lab" + (st === "error" ? " err" : "") }, "STATUS: " + word));
+  if (live) {
+    const lv = r.levels || {};
+    out.push(meter("MIC", lv.mic), meter("SYS", lv.loopback));
+    if (r.speaker) out.push(h("span", { class: "lab", text: "SPEAKER: " + r.speaker }));
+    if (r.backlog > 0 && st === "recording") out.push(h("span", { class: "lab", text: `REFINING: ${cfg.asr_model || "ASR"} · ${r.backlog} QUEUED` }));
+    const rp = recProjectId();
+    if (rp && rp !== S.sel) {
+      out.push(h("span", { class: "lab link", text: "IN " + projectName(rp), onclick: () => selectProject(rp) }));
     }
   }
-  let now = r.speaker || "-";
-  if (r.idle_s != null && r.speaker) now += `  (${Math.round(r.idle_s)} s ago)`;
-  if (state === "stopping") now = `transcribing ${r.backlog || 0} pending`;
-  else if (state === "recording" && r.backlog > 2) now += `  [${r.backlog} waiting]`;
-  $("rec-speaker").textContent = now;
+  const job = S.status.job;
+  if (job && job.state === "running") out.push(h("span", { class: "lab", text: `JOB: ${jobLabel(job)}${job.stage ? " · " + job.stage : ""}${job.total ? " " + job.done + "/" + job.total : ""}` }));
+  $("strip").replaceChildren(...out.filter(Boolean));
 }
 
-async function toggleRecording() {
-  const r = S.status.recorder || {};
-  if (r.state === "recording") {
-    await guarded(() => api("POST", "/api/record/stop", {}));
-    return;
+async function startRecording() {
+  if (!S.sel) return;
+  remember("steno-opts", JSON.stringify(S.opts));
+  const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep };
+  const title = $("rec-title").value.trim();
+  if (title) body.title = title;
+  S.stick = true;
+  const res = await guarded(() => api("POST", "/api/record/start", body));
+  if (res) {
+    if (res.recorder) S.status.recorder = res.recorder;
+    $("rec-title").value = "";
+    renderTop(); renderSide();
+    scheduleFeed();
   }
-  pref("steno-keep-audio", $("opt-keep").checked ? "1" : "0");
-  clearError();
-  S.browseId = null;
-  const res = await guarded(() => api("POST", "/api/record/start", {
-    mic: $("opt-mic").checked, loopback: $("opt-loop").checked, keep_audio: $("opt-keep").checked,
-  }));
-  if (res) { S.status.recorder = res.recorder; clearTranscript("Loading models, this can take a moment on the first run..."); renderRecorder(); }
+}
+const recordCmd = (cmd) => guarded(() => api("POST", "/api/record/" + cmd, {})).then((res) => {
+  if (res && res.recorder) { S.status.recorder = res.recorder; renderTop(); }
+});
+
+// ---------------------------------------------------------------- feed: meetings smashed together
+
+let feedSeq = 0;
+const scheduleFeed = debounced(() => loadFeed(), 300);
+const scheduleProjects = debounced(() => loadProjects(), 300);
+
+async function loadFeed() {
+  if (S.view !== "project" || !S.sel) { renderFeed(); return; }
+  const my = ++feedSeq, sel = S.sel;
+  let list;
+  try { list = (await api("GET", `/api/projects/${encodeURIComponent(sel)}/meetings`)).meetings || []; }
+  catch (e) { if (!missing(e)) throw e; list = []; }
+  if (my !== feedSeq) return;
+  S.meetings = list;
+  const visible = list.slice(-S.shown);
+  S.loadingFeed = true; S.buffer = [];
+  try {
+    await Promise.all(visible.map((info) => ensureMeeting(info).catch((e) => { if (!missing(e)) toast(e.message, "error"); })));
+  } finally { S.loadingFeed = false; }
+  if (my !== feedSeq) return;
+  const keep = new Set(visible.map((i) => i.session));
+  for (const k of [...S.feed.keys()]) if (!keep.has(k)) S.feed.delete(k);
+  for (const ev of S.buffer) { const m = S.feed.get(ev.session); if (m && m.detail) appendSegment(m, ev.segment, true); }
+  S.buffer = [];
+  renderFeed();
 }
 
-// ---------------------------------------------------------------- transcript
+async function fetchDetail(m) {
+  try { m.detail = await api("GET", `/api/sessions/${encodeURIComponent(m.info.session)}`); }
+  catch (e) { if (!missing(e)) throw e; m.detail = m.detail || { segments: [], speakers: [] }; }
+  m.detail.segments = m.detail.segments || [];
+  m.detail.speakers = m.detail.speakers || [];
+  await loadDocs(m);
+}
 
-function speakerButton(seg) {
+async function loadDocs(m) {
+  for (const kind of ["summary", "todo"]) {
+    const has = m.info["has_" + kind] || (m.detail && m.detail[kind]);
+    let md = null;
+    if (has) {
+      try { md = (await api("GET", `/api/sessions/${encodeURIComponent(m.info.session)}/doc/${kind}`)).markdown || null; }
+      catch (e) { md = (m.detail && m.detail[kind]) || null; }
+    }
+    m.docs[kind] = md;
+  }
+}
+
+async function ensureMeeting(info) {
+  let m = S.feed.get(info.session);
+  if (!m) { m = { info, detail: null, docs: {}, open: {}, el: null, rows: new Map() }; S.feed.set(info.session, m); await fetchDetail(m); return; }
+  const stale = m.info.recording !== info.recording || m.info.ended_at !== info.ended_at
+    || m.info.has_summary !== info.has_summary || m.info.has_todo !== info.has_todo;
+  m.info = info;
+  if (stale || !m.detail) await fetchDetail(m);
+}
+
+function renderFeed() {
+  const feed = $("feed");
+  const prevTop = feed.scrollTop;
+  feed.replaceChildren();
+  if (!S.sel) { feed.append(h("p", { class: "hint", text: "No project selected." })); return; }
+  if (S.meetings.length > S.shown) {
+    feed.append(h("button", { class: "btn ghost small older", type: "button", text: `Show older meetings (${S.meetings.length - S.shown} more)`, onclick: showOlder }));
+  }
+  const visible = S.meetings.slice(-S.shown).map((i) => S.feed.get(i.session)).filter((m) => m && m.detail);
+  if (!visible.length) feed.append(h("p", { class: "hint", text: S.loadingFeed ? "Loading..." : "No meetings yet. Press Record to start one." }));
+  for (const m of visible) feed.append(buildMeeting(m));
+  if (S.stick) scrollToEnd(); else feed.scrollTop = prevTop;
+  updateLive(); renderJump();
+}
+
+async function showOlder() {
+  const feed = $("feed");
+  const below = feed.scrollHeight - feed.scrollTop;
+  S.shown += PAGE; S.stick = false;
+  await guarded(loadFeed);
+  feed.scrollTop = feed.scrollHeight - below;
+}
+
+function jobLabel(job) {
+  return { summary: "CLAUDE · SUMMARIZING", todo: "CLAUDE · EXTRACTING TO-DOS", clean: "CLAUDE · CLEANING UP", finalize: "FINALIZING" }[job.kind] || String(job.kind).toUpperCase();
+}
+
+function buildMeeting(m) {
+  const info = m.info, sid = info.session;
+  m.rows = new Map();
+  const titleBtn = h("button", { class: "mtitle" + (info.title ? "" : " untitled"), type: "button", title: "Click to rename", text: info.title || "Meeting", onclick: () => renameMeeting(m, titleBtn) });
+  m.durEl = h("span", { class: "mdur" });
+  m.btns = {};
+  const act = (kind, label, tip) => (m.btns[kind] = h("button", { class: "btn ghost small", type: "button", text: label, title: tip, "data-tip": tip, onclick: () => startJob(m, kind) }));
+  m.jobEl = h("div", { class: "mjob" });
+  m.docsEl = h("div", { class: "docs" });
+  m.linesEl = h("div", { class: "lines" });
+  m.el = h("section", { class: "meeting", "data-session": sid },
+    h("div", { class: "mhead" },
+      h("span", { class: "mdate", text: when(info.started_at) }), titleBtn, m.durEl,
+      h("span", { class: "mactions" },
+        act("summary", "Summary", "Summarize this meeting with Claude (transcript text only)"),
+        act("todo", "To-do", "Extract explicit commitments"),
+        act("clean", "Clean up", "Fix obvious transcription errors"),
+        h("button", { class: "btn ghost small", type: "button", text: "Move to project...", onclick: () => moveMeeting(m) }))),
+    m.jobEl, m.docsEl, m.linesEl);
+  renderDocs(m);
+  renderLines(m);
+  updateJobLines(); updateButtons(); updateLive();
+  return m.el;
+}
+
+function renderLines(m) {
+  m.linesEl.replaceChildren(); m.rows = new Map();
+  const segs = m.detail.segments;
+  const frag = document.createDocumentFragment();
+  segs.forEach((s, i) => frag.append(segRow(m, s, segs[i - 1])));
+  m.linesEl.append(frag);
+  syncEmptyNote(m);
+}
+
+function syncEmptyNote(m) {
+  const note = m.linesEl.querySelector(".empty-meeting");
+  if (m.detail.segments.length) { if (note) note.remove(); return; }
+  if (!note) m.linesEl.append(h("div", { class: "empty-meeting", text: m.info.recording ? "Listening... lines appear a few seconds after you speak." : "No transcript lines." }));
+}
+
+function canName(m, seg) {
   const n = clusterNo(seg.speaker_id);
-  const canName = n !== null && S.open && S.open.view === "live";
-  const unknown = n !== null && seg.speaker === `Speaker ${n}`;
-  const b = h("button", {
-    class: "who" + (unknown ? " unknown" : "") + (canName ? "" : " static"), type: "button",
-    title: canName ? "Name this speaker" : "",
-  }, seg.speaker + (unknown ? " ?" : ""));
-  if (canName) b.addEventListener("click", () => startNaming(seg.speaker_id, seg.speaker));
-  return b;
+  if (n === null) return false;
+  const sp = m.detail.speakers.find((x) => x.id === seg.speaker_id && x.name === seg.speaker);
+  return sp ? !!sp.can_name : m.detail.view !== "final";
 }
 
-function segRow(seg, prev) {
-  const newSpk = !prev || prev.speaker !== seg.speaker || prev.speaker_id !== seg.speaker_id;
-  const row = h("div", { class: "seg" + (seg.provisional ? " prov" : "") + (newSpk ? " new-spk" : ""), "data-seq": seg.seq },
-    h("time", { text: clock(seg.t_start) }),
-    h("div", { class: "body" }, newSpk ? [speakerButton(seg), h("br")] : null, h("p", { text: seg.text })));
+function segRow(m, seg, prev) {
+  const first = !prev || prev.speaker !== seg.speaker || prev.speaker_id !== seg.speaker_id;
+  const n = clusterNo(seg.speaker_id);
+  const unknown = n !== null && seg.speaker === `Speaker ${n}`;
+  const nameable = first && canName(m, seg);
+  const who = first && seg.speaker ? h("button", {
+    class: "who" + (unknown ? " unknown" : "") + (nameable ? " nameable" : ""), type: "button",
+    title: nameable ? "Name this speaker" : null, text: seg.speaker + (unknown && nameable ? " ?" : "") }) : null;
+  const p = h("p", { text: seg.text });
+  const row = h("div", { class: "seg" + (seg.provisional ? " prov" : "") + (first ? " first" : ""), "data-seq": seg.seq },
+    h("time", { class: "time", text: clock(seg.t_start) }), h("div", { class: "body" }, who, p));
+  if (who && nameable) who.addEventListener("click", () => openNamer(m, row, seg));
+  m.rows.set(seg.seq, p);
   return row;
 }
 
-function renderTranscript() {
-  const box = $("transcript");
-  const keepTop = $("tscroll").scrollTop;
-  box.replaceChildren();
-  const segs = S.open ? S.open.segments : [];
-  const frag = document.createDocumentFragment();
-  segs.forEach((s, i) => frag.append(segRow(s, segs[i - 1])));
-  box.append(frag);
-  const empty = $("transcript-empty");
-  const live = S.open && S.open.recording;
-  empty.hidden = segs.length > 0;
-  if (!segs.length) empty.textContent = live ? "Listening... lines appear here a few seconds after you speak." : "This session has no transcript lines.";
-  if (S.stick) scrollToEnd(); else $("tscroll").scrollTop = keepTop;
-}
-
-function appendSegment(seg) {
-  if (!S.open) return;
-  const segs = S.open.segments;
+function appendSegment(m, seg, silent) {
+  const segs = m.detail.segments;
   if (segs.length && seg.seq <= segs[segs.length - 1].seq) return;  // already have it
   const prev = segs[segs.length - 1];
   segs.push(seg);
-  $("transcript-empty").hidden = true;
-  $("transcript").append(segRow(seg, prev));
-  bumpSpeaker(seg);
-  if (S.stick) scrollToEnd();
-  else { S.unseen += 1; renderJump(); }
+  if (!m.linesEl) return;
+  m.linesEl.append(segRow(m, seg, prev));
+  syncEmptyNote(m);
+  if (silent) return;
+  if (S.stick) scrollToEnd(); else { S.unseen += 1; renderJump(); }
 }
 
-function reviseSegment(seq, text) {
-  if (!S.open || S.open.view !== "live") return;
-  const seg = S.open.segments.find((x) => x.seq === seq);
+function reviseSegment(m, seq, text) {
+  const seg = m.detail.segments.find((x) => x.seq === seq);
   if (!seg || seg.text === text) return;
   seg.text = text;
-  const p = document.querySelector(`#transcript .seg[data-seq="${seq}"] p`);
+  const p = m.rows && m.rows.get(seq);
   if (p) p.textContent = text;
 }
 
-function bumpSpeaker(seg) {
-  const list = S.open.speakers;
-  let e = list.find((x) => x.id === seg.speaker_id && x.name === seg.speaker);
-  if (!e) {
-    const n = clusterNo(seg.speaker_id);
-    e = { id: seg.speaker_id, name: seg.speaker, segments: 0, seconds: 0, provisional: false,
-          can_name: n !== null && S.open.view === "live",
-          named: !(n !== null && seg.speaker === `Speaker ${n}`) };
-    list.push(e);
-  }
-  e.segments += 1;
-  e.seconds += Math.max(0, seg.t_end - seg.t_start);
-  e.provisional = seg.provisional;
-  scheduleSide();
+async function refreshMeeting(session, openKind) {
+  const m = S.feed.get(session);
+  if (!m || !m.el) return;
+  await fetchDetail(m);
+  if (openKind && m.docs[openKind]) m.open[openKind] = true;
+  m.el.replaceWith(buildMeeting(m));
+  if (S.stick) scrollToEnd();
 }
 
-let sideTimer = null;
-function scheduleSide() {
-  if (sideTimer) return;
-  sideTimer = setTimeout(() => { sideTimer = null; renderSpeakers(); }, 400);
+function updateLive() {
+  const r = S.status.recorder || {};
+  for (const m of S.feed.values()) {
+    if (!m.durEl) continue;
+    if (m.info.recording || (r.session === m.info.session && r.state !== "idle")) {
+      m.durEl.replaceChildren(h("i", { class: "dot" }), r.session === m.info.session ? clockHms(r.elapsed_s) : "LIVE");
+    } else {
+      const d = durationOf(m.info);
+      m.durEl.textContent = d == null ? "" : clock(d);
+    }
+  }
 }
+
+function updateJobLines() {
+  const job = S.status.job;
+  for (const m of S.feed.values()) {
+    if (!m.jobEl) continue;
+    const mine = job && job.state === "running" && job.session === m.info.session;
+    m.jobEl.hidden = !mine;
+    m.jobEl.textContent = mine ? jobLabel(job) + (job.stage && job.stage !== "waiting for Claude" ? " · " + job.stage.toUpperCase() : "") + (job.total ? ` ${job.done}/${job.total}` : "") : "";
+  }
+}
+
+function updateButtons() {
+  const busy = !!(S.status.job && S.status.job.state === "running");
+  for (const m of S.feed.values()) {
+    for (const b of Object.values(m.btns || {})) { b.disabled = busy; b.title = busy ? "Another job is running" : b.dataset.tip; }
+  }
+}
+
+async function startJob(m, kind) {
+  const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/jobs`, { kind }));
+  if (res && res.job) { S.status.job = res.job; updateJobLines(); updateButtons(); renderStrip(); }
+}
+
+function renderDocs(m) {
+  m.docsEl.replaceChildren();
+  for (const kind of ["summary", "todo"]) {
+    const md = m.docs[kind];
+    if (!md) continue;
+    const det = h("details", { class: "doc" }, h("summary", { text: kind === "todo" ? "To-do" : "Summary" }), h("div", { class: "md" }, renderMarkdown(md)));
+    det.open = !!m.open[kind];
+    det.addEventListener("toggle", () => { m.open[kind] = det.open; });
+    m.docsEl.append(det);
+  }
+}
+
+function renameMeeting(m, btn) {
+  const input = h("input", { class: "text mtitle-in", type: "text", value: m.info.title || "", placeholder: "Meeting", maxlength: "80", "aria-label": "Meeting title" });
+  let done = false;
+  const finish = async (save) => {
+    if (done) return; done = true;
+    const title = input.value.trim();
+    if (save && title && title !== m.info.title) {
+      const res = await guarded(() => api("POST", `/api/meetings/${encodeURIComponent(m.info.session)}/rename`, { title }));
+      if (res) { m.info.title = title; btn.textContent = title; btn.classList.remove("untitled"); }
+    }
+    input.replaceWith(btn);
+  };
+  input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") finish(true); else if (ev.key === "Escape") finish(false); });
+  input.addEventListener("blur", () => finish(true));
+  btn.replaceWith(input);
+  input.focus(); input.select();
+}
+
+async function moveMeeting(m) {
+  const options = S.projects.map((p) => ({ value: p.id, label: p.name }));
+  const current = S.sel;
+  const v = await formModal({ title: "Move to project", text: "The meeting folder is moved to the project's Steno folder.", fields: [{ key: "project", label: "Project", options, value: current }], ok: "Move" });
+  if (!v || v.project === current) return;
+  const res = await guarded(() => api("POST", `/api/meetings/${encodeURIComponent(m.info.session)}/move`, { project: v.project }));
+  if (res) { toast(`Moved to ${projectName(v.project)}`); await guarded(loadProjects); await guarded(loadFeed); }
+}
+
+// ---------------------------------------------------------------- naming speakers
+
+async function openNamer(m, row, seg) {
+  document.querySelectorAll(".namer").forEach((n) => n.remove());
+  const n = clusterNo(seg.speaker_id);
+  const input = h("input", { class: "text", type: "text", list: "people-names", maxlength: "80", placeholder: `Name for Speaker ${n}`, "aria-label": "Speaker name", autocomplete: "off" });
+  const save = h("input", { type: "checkbox" });
+  const form = h("form", { class: "namer", onsubmit: async (ev) => {
+    ev.preventDefault();
+    const name = input.value.trim();
+    if (!name) return;
+    const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/name`, { speaker: seg.speaker_id, name, save_profile: save.checked }));
+    if (res) { toast(res.message || "Speaker named"); await guarded(() => refreshMeeting(m.info.session)); }
+  } }, input,
+  h("label", { title: "Store a voice profile on this computer so future meetings recognise this person" }, save, "Remember voice"),
+  h("button", { class: "btn small solid", type: "submit", text: "Save" }),
+  h("button", { class: "btn small", type: "button", text: "Cancel", onclick: () => form.remove() }));
+  row.after(form);
+  input.focus();
+  input.addEventListener("keydown", (ev) => { if (ev.key === "Escape") form.remove(); });
+  try {
+    const d = await api("GET", "/api/people");
+    $("people-names").replaceChildren(...d.people.map((p) => h("option", { value: p.name })));
+  } catch (e) { /* suggestions are optional */ }
+}
+
+// ---------------------------------------------------------------- scrolling
 
 function scrollToEnd() {
-  const sc = $("tscroll");
-  sc.scrollTop = sc.scrollHeight;
+  const f = $("feed");
+  f.scrollTop = f.scrollHeight;
   S.unseen = 0;
   renderJump();
 }
 function renderJump() {
-  const j = $("jump");
-  j.hidden = S.stick || S.unseen === 0;
-  j.textContent = `${S.unseen} new line${S.unseen === 1 ? "" : "s"} below`;
+  const f = $("feed"), j = $("jump");
+  const far = f.scrollHeight - f.scrollTop - f.clientHeight > 120;
+  j.hidden = S.stick || !far;
+  const recording = recProjectId() === S.sel && recProjectId() !== null;
+  j.textContent = S.unseen ? `${S.unseen} new line${S.unseen === 1 ? "" : "s"} - jump to live` : recording ? "Jump to live" : "Jump to latest";
 }
 function onScroll() {
-  const sc = $("tscroll");
-  S.stick = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 48;  // back at the end: follow again
-  if (S.stick) { S.unseen = 0; }
+  const f = $("feed");
+  S.stick = f.scrollHeight - f.scrollTop - f.clientHeight < 60;
+  if (S.stick) S.unseen = 0;
   renderJump();
 }
 
-// ---------------------------------------------------------------- sessions
+// ---------------------------------------------------------------- markdown (minimal; builds DOM, never HTML)
 
-async function openSession(id, opts) {
-  const follow = !!(opts && opts.follow);
-  const view = (opts && opts.view) || undefined;
-  S.loading = id; S.buffer = [];
-  let detail;
-  try {
-    detail = await api("GET", `/api/sessions/${encodeURIComponent(id)}` + (view ? `?view=${view}` : ""));
-  } catch (e) {
-    S.loading = null; S.buffer = [];
-    throw e;
-  }
-  S.loading = null;
-  const sameSession = S.openId === id;
-  S.open = detail; S.openId = id;
-  S.stick = follow ? true : (sameSession ? S.stick : false);
-  if (!sameSession) $("tscroll").scrollTop = 0;
-  const buffered = S.buffer; S.buffer = [];
-  renderHead();
-  renderTranscript();
-  for (const seg of buffered) appendSegment(seg);
-  renderSide();
-  renderStatusbar();
-}
-
-function renderHead() {
-  const d = S.open;
-  if (!d) return;
-  $("sess-id").textContent = d.id;
-  $("sess-kind").textContent = S.view === "live" ? (d.recording ? "Live transcript" : "Last recording") : "Session";
-  const tgl = $("view-toggle");
-  tgl.hidden = !d.has_final;
-  tgl.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === d.view)));
-  $("fin-run").hidden = false;
-  $("fin-speakers").parentElement.hidden = false;
-  updateButtons();
-}
-
-async function loadSessions() {
-  const data = await api("GET", "/api/sessions");
-  S.sessions = data.sessions;
-  const rows = $("sessions-rows");
-  rows.replaceChildren();
-  $("sessions-count").textContent = `${S.sessions.length} total`;
-  if (!S.sessions.length) rows.append(h("p", { class: "empty", text: "No sessions yet. Record something on the Live tab." }));
-  for (const s of S.sessions) {
-    const badges = h("span", { class: "badges" },
-      s.recording ? h("span", { class: "badge live", text: "recording" }) : null,
-      h("span", { class: "badge" + (s.has_final ? " on" : ""), text: "final" }),
-      h("span", { class: "badge" + (s.has_summary ? " on" : ""), text: "summary" }),
-      h("span", { class: "badge" + (s.has_todo ? " on" : ""), text: "to-do" }),
-      h("span", { class: "badge" + (s.has_audio ? " on" : ""), text: "audio" }));
-    const btn = h("button", { class: "row-item", type: "button" },
-      h("span", { class: "main-col" }, h("span", { class: "mono", text: s.id })),
-      h("span", { class: "sub", text: `${when(s.started_at)} - ${s.segments} line${s.segments === 1 ? "" : "s"} - ${(s.sources || []).join(" + ")}` }),
-      badges);
-    btn.addEventListener("click", () => { S.browseId = s.id; guarded(enterView); });
-    rows.append(btn);
-  }
-}
-
-// ---------------------------------------------------------------- side panel
-
-function renderSide() {
-  const has = !!S.open;
-  $("panel-speakers").hidden = !has;
-  $("panel-llm").hidden = !has;
-  $("panel-info").hidden = has;
-  renderSpeakers();
-  renderLlm();
-  renderJob();
-  renderResult();
-}
-
-function renderSpeakers() {
-  const d = S.open;
-  const list = $("spk-list");
-  list.replaceChildren();
-  if (!d) return;
-  for (const sp of d.speakers) {
-    const unknown = sp.can_name && !sp.named;
-    const meta = `${clock(sp.seconds)} - ${sp.segments} line${sp.segments === 1 ? "" : "s"}${sp.provisional ? " - provisional" : ""}`;
-    const row = h("li", { class: "spk-row" },
-      h("span", { class: "spk-name" + (unknown ? " unknown" : ""), text: sp.name }),
-      sp.can_name ? h("button", { class: "btn mini", type: "button", text: unknown ? "Name" : "Rename",
-        onclick: () => startNaming(sp.id, sp.name) }) : null,
-      h("span", { class: "spk-meta", text: meta }));
-    list.append(row);
-  }
-  $("spk-note").textContent = d.view === "final"
-    ? "Final labels cannot be named here. Switch to the Live transcript, name the speakers, then run Finalize again."
-    : (d.speakers.some((s) => s.can_name && !s.named) ? "Click an unnamed speaker, or a name in the transcript, to name it." : "");
-  const names = d.speakers.filter((s) => s.id && s.id !== "U" && (s.named || !s.can_name)).map((s) => s.name);
-  $("todo-people").replaceChildren(...names.map((n) => h("option", { value: n })));
-}
-
-function startNaming(id, current) {
-  S.naming = id;
-  const n = clusterNo(id);
-  $("name-title").textContent = `Name ${n !== null ? "Speaker " + n : "speaker"}`;
-  $("name-input").value = /^Speaker \d+$/.test(current) ? "" : current;
-  $("name-save").checked = false;
-  $("name-form").hidden = false;
-  $("name-input").focus();
-  $("name-form").scrollIntoView({ block: "nearest" });
-  guarded(async () => {  // suggestions: people who are already enrolled
-    const data = await api("GET", "/api/people");
-    $("people-names").replaceChildren(...data.people.map((p) => h("option", { value: p.name })));
-  });
-}
-
-async function submitName(ev) {
-  ev.preventDefault();
-  if (!S.naming || !S.open) return;
-  const id = S.open.id;
-  const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(id)}/name`, {
-    speaker: S.naming, name: $("name-input").value, save_profile: $("name-save").checked,
-  }));
-  if (res) {
-    $("name-form").hidden = true; S.naming = null;
-    toast(res.message);
-    await guarded(() => openSession(id, { view: S.open && S.open.view }));
-  }
-}
-
-function llmNotice() {
-  const cfg = S.status.config || {};
-  const src = S.open ? S.open.llm_source : "live";
-  const clean = S.open ? S.open.clean_source : "live";
-  return `Sent to Claude (${cfg.llm_model || "claude"}, via your own Claude Code login): only transcript text, never audio, never voice data. Clean up sends the ${clean} text; Summary and To-do send the ${src} text.`;
-}
-function cleanInfo() {
-  const c = S.open && S.open.clean;
-  if (!c) return "";
-  const stale = c.fresh ? "" : " The text has changed since; run Clean up again to use it.";
-  return `Last clean-up (${c.source} text): ${c.applied} of ${c.proposed} edit(s) applied to ${c.changed_lines} line(s), ${c.rejected} rejected.${stale}`;
-}
-function renderLlm() { $("llm-sent").textContent = llmNotice(); $("clean-info").textContent = cleanInfo(); updateButtons(); }
-
-function updateButtons() {
-  const busy = !!S.status.job;
-  const d = S.open;
-  const hint = busy ? "Another job is running" : "";
-  for (const id of ["btn-clean", "btn-summary", "btn-todo", "btn-todo-person"]) {
-    const b = $(id); b.disabled = busy || !d; b.title = hint;
-  }
-  const fin = $("fin-run");
-  let why = hint;
-  if (!why && d && d.recording) why = "Stop the recording first";
-  if (!why && d && !d.has_audio) why = "No kept audio: record with Keep audio";
-  fin.disabled = !d || !!why;
-  fin.title = why;
-}
-
-function renderJob() {
-  const card = $("job-card");
-  const job = S.status.job || S.jobs.find((j) => j.session === S.openId) || null;
-  $("panel-job").hidden = !job || !S.open;
-  card.replaceChildren();
-  if (!job) return;
-  const pct = job.total ? job.done / job.total : 0;
-  const state = job.state === "running" ? "running" : job.state === "done" ? "done" : "failed";
-  card.append(h("div", { class: "job" + (job.state === "error" ? " error" : "") },
-    h("div", { class: "head" }, h("span", { class: "eyebrow", text: job.kind }), h("span", { class: "eyebrow", text: state })),
-    h("div", { class: "mono dim", text: job.session }),
-    job.state === "running" ? [
-      h("div", { class: "bar" }, (() => { const i = h("i"); i.style.setProperty("--w", String(pct)); return i; })()),
-      h("div", { text: job.stage + (job.total ? ` ${job.done}/${job.total}` : "") })] : null,
-    job.state === "done" ? h("div", { text: job.message }) : null,
-    job.state === "error" ? h("div", { class: "err", role: "alert", text: job.error }) : null));
-}
-
-function renderResult() {
-  const d = S.open;
-  const panel = $("panel-result");
-  const has = d && (d.summary || d.todo);
-  panel.hidden = !has;
-  if (!has) return;
-  if (S.tab === "summary" && !d.summary) S.tab = "todo";
-  if (S.tab === "todo" && !d.todo) S.tab = "summary";
-  panel.querySelectorAll("[role=tab]").forEach((t) => {
-    t.setAttribute("aria-selected", String(t.dataset.tab === S.tab));
-    t.hidden = !d[t.dataset.tab];
-  });
-  $("result-md").replaceChildren(...renderMarkdown(d[S.tab] || ""));
-}
-
-// Minimal Markdown (headings, lists, quotes, bold/italic/code). Builds DOM nodes, never HTML.
 function inlineMd(text) {
   const out = [];
   const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*|_[^_\s][^_]*_)/g;
@@ -528,184 +695,118 @@ function inlineMd(text) {
   if (last < text.length) out.push(text.slice(last));
   return out;
 }
+
 function renderMarkdown(src) {
   const nodes = [];
-  let list = null;
-  for (const raw of src.split("\n")) {
+  let list = null, kind = null;
+  for (const raw of String(src).split("\n")) {
     const line = raw.replace(/\s+$/, "");
     let m;
     if (!line.trim()) { list = null; continue; }
-    if ((m = /^(#{1,3})\s+(.*)$/.exec(line))) { list = null; nodes.push(h("h" + m[1].length, null, inlineMd(m[2]))); }
-    else if ((m = /^\s*[-*]\s+(?:\[( |x)\]\s+)?(.*)$/.exec(line))) {
-      if (!list) { list = h("ul"); nodes.push(list); }
-      const box = m[1] === undefined ? "" : (m[1] === "x" ? "☑ " : "☐ ");
-      list.append(h("li", null, box, inlineMd(m[2])));
+    if ((m = /^(#{1,4})\s+(.*)$/.exec(line))) { list = null; nodes.push(h("h" + m[1].length, null, inlineMd(m[2]))); continue; }
+    if ((m = /^\s*(?:([-*])|(\d+)\.)\s+(?:\[( |x|X)\]\s+)?(.*)$/.exec(line))) {
+      const want = m[1] ? "ul" : "ol";
+      if (!list || kind !== want) { list = h(want); kind = want; nodes.push(list); }
+      const task = m[3] !== undefined;
+      list.append(h("li", { class: task ? "task" : null }, task ? (m[3] === " " ? "☐ " : "☑ ") : null, inlineMd(m[4])));
     } else if ((m = /^\s*>\s?(.*)$/.exec(line))) { list = null; nodes.push(h("blockquote", null, inlineMd(m[1]))); }
-    else if (/^\s{2,}\S/.test(line) && list && list.lastChild) { list.lastChild.append(" ", ...inlineMd(line.trim())); }
+    else if (/^\s{2,}\S/.test(line) && list && list.lastChild) list.lastChild.append(" ", ...inlineMd(line.trim()));
     else { list = null; nodes.push(h("p", null, inlineMd(line))); }
   }
   return nodes;
 }
 
-async function startJob(kind, extra) {
-  if (!S.open) return;
-  const id = S.open.id;
-  clearError();
-  const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(id)}/jobs`, { kind, ...extra }));
-  if (res) { S.status.job = res.job; S.jobs = [res.job, ...S.jobs.filter((j) => j.id !== res.job.id)]; renderJob(); updateButtons(); renderStatusbar(); }
-}
-
-function runFinalize() {
-  const v = $("fin-speakers").value.trim();
-  const extra = {};
-  if (v) {
-    const n = Number(v);
-    if (!Number.isInteger(n) || n < 1 || n > 20) { showError("Speakers must be a whole number from 1 to 20 (or empty for automatic)."); return; }
-    extra.speakers = n;
-  }
-  startJob("finalize", extra);
-}
-
 // ---------------------------------------------------------------- people
 
 async function loadPeople() {
-  const data = await api("GET", "/api/people");
+  let data;
+  try { data = await api("GET", "/api/people"); } catch (e) { if (!missing(e)) throw e; data = { people: [] }; }
   S.people = data.people;
-  const rows = $("people-rows");
-  rows.replaceChildren();
-  $("people-count").textContent = `${S.people.length} enrolled`;
-  $("people-empty").hidden = S.people.length > 0;
-  for (const p of S.people) rows.append(personRow(p));
+  const box = $("people");
+  box.replaceChildren();
+  if (!S.people.length) box.append(h("p", { class: "hint", text: "No voice profiles yet. Name a speaker in a meeting and choose \"Remember voice\"." }));
+  for (const p of S.people) box.append(personRow(p));
+  renderSide();
 }
 
 function personRow(p) {
-  const row = h("div", { class: "row-item person" });
-  const show = () => {
-    row.replaceChildren(
-      h("span", { class: "main-col" }, h("span", { text: p.name })),
-      h("span", { class: "sub", text: `${p.embeddings} voice samples - updated ${when(p.updated)}` }),
-      h("span", { class: "actions" },
-        h("button", { class: "btn mini", type: "button", text: "Rename", onclick: edit }),
-        h("button", { class: "btn mini danger", type: "button", text: "Delete", onclick: () => remove(p) })));
-  };
+  const row = h("div", { class: "person" });
+  const show = () => row.replaceChildren(
+    h("div", { class: "pn" }, h("div", { text: p.name }), h("div", { class: "sub", text: `${p.embeddings} voice sample${p.embeddings === 1 ? "" : "s"} · updated ${when(p.updated)}` })),
+    h("button", { class: "btn small", type: "button", text: "Rename", onclick: edit }),
+    h("button", { class: "btn small danger", type: "button", text: "Delete", onclick: () => removePerson(p) }));
   const edit = () => {
     const input = h("input", { class: "text", type: "text", value: p.name, maxlength: "80", "aria-label": "New name" });
-    const form = h("form", { onsubmit: async (ev) => {
+    row.replaceChildren(h("form", { onsubmit: async (ev) => {
       ev.preventDefault();
       const res = await guarded(() => api("POST", `/api/people/${p.id}/rename`, { name: input.value }));
       if (res) { toast(res.message); await guarded(loadPeople); }
-    } }, input, h("button", { class: "btn mini primary", type: "submit", text: "Save" }),
-    h("button", { class: "btn mini", type: "button", text: "Cancel", onclick: show }));
-    row.replaceChildren(h("span", { class: "main-col" }, form), h("span"), h("span"));
+    } }, input, h("button", { class: "btn small solid", type: "submit", text: "Save" }),
+    h("button", { class: "btn small", type: "button", text: "Cancel", onclick: show })));
     input.focus(); input.select();
   };
   show();
   return row;
 }
 
-function confirmDialog(title, text, okLabel) {
-  return new Promise((resolve) => {
-    const dlg = $("confirm");
-    $("confirm-title").textContent = title;
-    $("confirm-text").textContent = text;
-    $("confirm-ok").textContent = okLabel;
-    dlg.returnValue = "";  // Escape leaves the previous value in place otherwise
-    dlg.addEventListener("close", () => resolve(dlg.returnValue === "ok"), { once: true });
-    dlg.showModal();
-  });
-}
-
-async function remove(p) {
-  const ok = await confirmDialog("Delete person",
-    `Delete ${p.name} and their voice data? Old transcripts keep the name as plain text. This cannot be undone.`, "Delete");
+async function removePerson(p) {
+  const ok = await formModal({ title: "Delete person", text: `Delete ${p.name} and their voice data? Old transcripts keep the name as plain text. This cannot be undone.`, ok: "Delete" });
   if (!ok) return;
   const res = await guarded(() => api("DELETE", `/api/people/${p.id}`));
   if (res) { toast(res.message); await guarded(loadPeople); }
 }
 
-// ---------------------------------------------------------------- status bar, toast
-
-function renderStatusbar() {
-  const r = S.status.recorder || {};
-  const rec = $("sb-rec");
-  const labels = { recording: `REC ${clockHms(r.elapsed_s || 0)}`, starting: "STARTING", stopping: "FINISHING", error: "ERROR", idle: "IDLE" };
-  rec.textContent = labels[r.state] || "IDLE";
-  rec.classList.toggle("hot", r.state === "recording" || r.state === "stopping" || r.state === "starting");
-  const sid = (r.state === "recording" || r.state === "stopping") ? r.session : (S.openId || r.session);
-  $("sb-saved").textContent = sid ? `Saved in session ${sid}${r.keep_audio && r.session === sid ? " (audio kept)" : ""}` : "No session";
-  const job = S.status.job;
-  const jb = $("sb-job");
-  jb.textContent = job ? `JOB ${job.kind} - ${job.session} - ${job.stage}${job.total ? " " + job.done + "/" + job.total : ""}` : "No job running";
-  jb.classList.toggle("hot", !!job);
-  const c = $("sb-conn");
-  c.textContent = S.connected ? "Connected" : "Reconnecting";
-  c.classList.toggle("hot", !S.connected);
-}
-
-let toastTimer = null;
-function toast(text) {
-  const el = $("sb-job");
-  el.textContent = text;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(renderStatusbar, 6000);
-}
-
 // ---------------------------------------------------------------- live events (SSE over fetch)
 
 function handleEvent(name, data) {
-  if (name === "hello") { S.status = data; onStatus(true); return; }
-  if (name === "status") {
-    Object.assign(S.status, data);
-    onStatus(false);
-  } else if (name === "segment") {
-    if (data.session === S.openId && !S.loading) appendSegment(data.segment);
-    else if (data.session === S.loading) S.buffer.push(data.segment);
+  if (name === "hello") { S.status = data; onStatus(); return; }
+  if (name === "status") { Object.assign(S.status, data); onStatus(); return; }
+  if (name === "segment") {
+    const m = S.feed.get(data.session);
+    if (m && m.detail) appendSegment(m, data.segment);
+    else if (S.loadingFeed) S.buffer.push(data);
+    else if (S.view === "project" && S.sel && !S.meetings.some((x) => x.session === data.session) && !S.unknown.has(data.session)) {
+      S.unknown.add(data.session);  // a new meeting we have not listed yet (or one of another project)
+      scheduleFeed();
+    }
   } else if (name === "revision") {
-    if (data.session === S.openId && !S.loading) reviseSegment(data.seq, data.text);
+    const m = S.feed.get(data.session);
+    if (m && m.detail) reviseSegment(m, data.seq, data.text);
   } else if (name === "job") {
     onJob(data);
   } else if (name === "names") {
     if (S.view === "people") guarded(loadPeople);
-    if (S.openId && (data.session === S.openId || data.session === null) && !S.loading) {
-      guarded(() => openSession(S.openId, { view: S.open && S.open.view }));
-    }
-  } else if (name === "sessions") {
-    if (S.view === "sessions" && !S.browseId) guarded(loadSessions);
+    if (data.session) guarded(() => refreshMeeting(data.session));
+    else for (const id of S.feed.keys()) guarded(() => refreshMeeting(id));
+  } else if (name === "sessions" || name === "projects") {
+    scheduleProjects(); scheduleFeed();
   }
 }
 
-let lastRecState = null, lastRecSession = null;
-function onStatus(fresh) {
+let lastState = null, lastSession = null, lastError = null;
+function onStatus() {
   const r = S.status.recorder || {};
-  if (r.state === "error" && lastRecState !== "error" && r.error) showError(r.error);
-  if (S.view === "live") {
-    renderRecorder();
-    const changed = r.session && r.session !== lastRecSession;
-    if (r.session && (changed || fresh) && r.session !== S.openId && !S.loading) {
-      guarded(() => openSession(r.session, { follow: true }));
-    }
-    if (r.state === "recording" && lastRecState !== "recording") S.stick = true;
-    if (r.state === "idle" && lastRecState === "stopping" && S.openId === r.session) {
-      guarded(() => openSession(r.session, { view: S.open && S.open.view }));  // final bookkeeping: ended_at etc.
-    }
-  }
-  lastRecState = r.state;
-  lastRecSession = r.session || lastRecSession;
-  updateButtons();
-  renderStatusbar();
+  if (r.state === "error" && r.error && r.error !== lastError) toast(r.error, "error");
+  lastError = r.state === "error" ? r.error : null;
+  if (r.session && r.session !== lastSession) { scheduleFeed(); scheduleProjects(); }
+  if (r.state === "recording" && lastState !== "recording") S.stick = true;
+  if (r.state === "idle" && lastState && lastState !== "idle") { scheduleFeed(); scheduleProjects(); }
+  lastState = r.state;
+  if (r.session) lastSession = r.session;
+  renderTop(); renderSideFoot(); updateLive(); updateJobLines();
 }
 
 function onJob(job) {
-  const prev = S.jobs.find((j) => j.id === job.id);
-  S.jobs = [job, ...S.jobs.filter((j) => j.id !== job.id)].slice(0, 20);
-  S.status.job = job.state === "running" ? job : (S.status.job && S.status.job.id !== job.id ? S.status.job : null);
-  renderJob(); updateButtons(); renderStatusbar();
-  if (job.state !== "running" && (!prev || prev.state === "running")) {
-    if (job.state === "error") showError(`${job.kind} failed: ${job.error}`);
-    else toast(`${job.kind} done: ${job.message}`);
-    if (S.openId === job.session && !S.loading) {
-      const view = job.kind === "finalize" ? "final" : (S.open && S.open.view);
-      guarded(() => openSession(job.session, { view }));
+  const prev = S.jobStates.get(job.id);
+  S.jobStates.set(job.id, job.state);
+  if (job.state === "running") S.status.job = job;
+  else if (S.status.job && S.status.job.id === job.id) S.status.job = null;
+  updateJobLines(); updateButtons(); renderStrip();
+  if (job.state !== "running" && prev !== job.state) {
+    if (job.state === "error") toast(`${job.kind} failed: ${job.error}`, "error");
+    else {
+      toast(`${job.kind} done${job.message ? ": " + job.message : ""}`);
+      guarded(() => refreshMeeting(job.session, job.kind === "summary" || job.kind === "todo" ? job.kind : null));
     }
   }
 }
@@ -724,9 +825,9 @@ async function connect() {
   while (!S.fatal) {
     try {
       const res = await fetch("/api/events", { headers: { "X-Steno-Token": S.token || "" } });
-      if (res.status === 401) { S.fatal = true; showError("Access token rejected. Open the address printed by `steno ui` again."); break; }
+      if (res.status === 401) { S.fatal = true; toast("Access token rejected. Open Steno again.", "error"); break; }
       if (!res.ok || !res.body) throw new Error("events " + res.status);
-      S.connected = true; renderStatusbar();
+      S.connected = true; renderSideFoot();
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -738,52 +839,46 @@ async function connect() {
         while ((i = buf.indexOf("\n\n")) >= 0) { dispatch(buf.slice(0, i)); buf = buf.slice(i + 2); }
       }
     } catch (e) { /* fall through to reconnect */ }
-    S.connected = false; renderStatusbar();
+    S.connected = false; renderSideFoot();
     await new Promise((r) => setTimeout(r, 1500));
   }
 }
 
 // ---------------------------------------------------------------- init
 
+function markBrowserMode() { document.body.classList.toggle("browser", !window.pywebview); }
+
 function init() {
   initToken();
-  document.querySelectorAll(".nav-item").forEach((b) => b.addEventListener("click", () => {
-    if (b.dataset.view === "sessions") S.browseId = null;
-    setView(b.dataset.view);
-  }));
-  $("alert-close").addEventListener("click", clearError);
-  $("rec-toggle").addEventListener("click", toggleRecording);
-  $("tscroll").addEventListener("scroll", onScroll, { passive: true });
-  $("jump").addEventListener("click", () => { S.stick = true; scrollToEnd(); });
-  $("sess-back").addEventListener("click", () => { S.browseId = null; guarded(enterView); });
-  $("view-toggle").addEventListener("click", (ev) => {
-    const b = ev.target.closest("button[data-v]");
-    if (b && S.open && b.dataset.v !== S.open.view) guarded(() => openSession(S.open.id, { view: b.dataset.v }));
-  });
-  $("fin-run").addEventListener("click", runFinalize);
-  $("btn-clean").addEventListener("click", () => startJob("clean"));
-  $("btn-summary").addEventListener("click", () => startJob("summary"));
-  $("btn-todo").addEventListener("click", () => startJob("todo"));
-  $("btn-todo-person").addEventListener("click", () => {
-    const p = $("todo-person").value.trim();
-    if (!p) { showError("Enter a person's name first."); return; }
-    startJob("todo", { person: p });
-  });
-  $("name-form").addEventListener("submit", submitName);
-  $("name-cancel").addEventListener("click", () => { $("name-form").hidden = true; S.naming = null; });
-  $("panel-result").querySelectorAll("[role=tab]").forEach((t) => t.addEventListener("click", () => { S.tab = t.dataset.tab; renderResult(); }));
-
-  if (!S.token) {
-    S.fatal = true;
-    showError("No access token. Open the address printed by `steno ui`.");
-    return;
+  window.addEventListener("load", markBrowserMode);
+  window.addEventListener("pywebviewready", markBrowserMode);
+  $("btn-new").addEventListener("click", () => guarded(newProject));
+  $("empty-new").addEventListener("click", () => guarded(newProject));
+  $("btn-add").addEventListener("click", () => guarded(addProject));
+  $("empty-add").addEventListener("click", () => guarded(addProject));
+  $("btn-forget").addEventListener("click", () => guarded(forgetProject));
+  $("nav-people").addEventListener("click", showPeople);
+  $("btn-rec").addEventListener("click", () => startRecording());
+  $("btn-pause").addEventListener("click", () => recordCmd((S.status.recorder || {}).paused ? "resume" : "pause"));
+  $("btn-stop").addEventListener("click", () => recordCmd("stop"));
+  $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
+  for (const [id, key] of [["tgl-mic", "mic"], ["tgl-loop", "loop"], ["tgl-keep", "keep"]]) {
+    $(id).addEventListener("click", () => { S.opts[key] = !S.opts[key]; remember("steno-opts", JSON.stringify(S.opts)); renderTop(); });
   }
+  $("feed").addEventListener("scroll", onScroll, { passive: true });
+  $("jump").addEventListener("click", () => { S.stick = true; scrollToEnd(); });
+
+  if (!S.token) { S.fatal = true; toast("No access token. Open Steno from its own window or printed address.", "error"); return; }
   guarded(async () => {
     S.status = await api("GET", "/api/status");
-    S.jobs = S.status.jobs || [];
-    lastRecState = S.status.recorder.state;
-    lastRecSession = S.status.recorder.session;
-    setView("live");
+    lastState = (S.status.recorder || {}).state;
+    lastSession = (S.status.recorder || {}).session;
+    const cfg = S.status.config || {};
+    S.opts = { mic: cfg.capture_mic !== false, loop: cfg.capture_loopback !== false, keep: false };
+    try { Object.assign(S.opts, JSON.parse(remember("steno-opts") || "{}")); } catch (e) { /* ignore bad prefs */ }
+    S.opts.keep = false;  // never remembered: raw audio is sensitive
+    await loadProjects();
+    showView(); renderSide(); renderTop();
   });
   connect();
 }

@@ -21,7 +21,22 @@ recognition, built to work alongside [Claude Code](https://claude.com/claude-cod
 2. Speaker recognition: enrol voices, recognise them next time, name unknowns
 3. Post-meeting finalize (better speakers and text), summary and to-do list via Claude
    (small, fast model)
-4. Desktop app UI (first version: local web UI, `steno ui`)
+4. Desktop app (`steno app`): projects, recording, meetings, summary and to-do
+
+## Desktop app
+
+```powershell
+uv sync --all-extras
+uv run steno app
+```
+
+A project is a folder you pick; every meeting gets its own readable folder in
+`<project>/Steno/` with `transcript.md` (kept current while recording), and `summary.md` /
+`todo.md` when you ask for them. `Steno/` gets a `.gitignore` (everything ignored, so meeting
+text never lands in a git repo by accident), an `index.md` and a `CLAUDE.md` telling Claude
+Code to read summaries before whole transcripts. Machine files (JSONL, revisions, voice
+windows), kept audio and voice profiles stay in the global data dir. On Windows 11 the window
+uses the system Acrylic backdrop. `steno ui` serves the same page in a browser.
 
 ## Development
 

@@ -590,7 +590,9 @@ def test_clean_runner_and_session_payload(make_ui, monkeypatch):
     d = c.get(f"/api/sessions/{sid}")[1]
     assert d["clean"]["fresh"] and d["clean"]["applied"] == 1 and d["llm_source"] == "clean"
     assert c.get("/api/sessions")[1]["sessions"][0]["has_clean"]
-    assert [s["text"] for s in d["segments"]][0] == "Hello there everyone"  # view is unchanged
+    assert d["view"] == "clean" and d["segments"][0]["text"] == "Hello there everybody"
+    live = c.get(f"/api/sessions/{sid}?view=live")[1]
+    assert live["segments"][0]["text"] == "Hello there everyone"  # the live view is the draft
 
 
 def test_clean_is_a_job_kind(make_ui):

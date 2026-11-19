@@ -213,11 +213,27 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.job_list()
             if segs == ["people"]:
                 return app.people()
+            if segs == ["projects"]:
+                return app.projects_list()
+            if n == 3 and segs[0] == "projects" and segs[2] == "meetings":
+                return app.project_meetings(segs[1])
+            if n == 4 and segs[0] == "sessions" and segs[2] == "doc":
+                return app.session_doc(segs[1], segs[3])
         elif method == "POST":
             if segs == ["record", "start"]:
                 return app.record_start(body)
             if segs == ["record", "stop"]:
                 return app.record_stop()
+            if segs == ["record", "pause"]:
+                return app.record_pause()
+            if segs == ["record", "resume"]:
+                return app.record_resume()
+            if segs == ["projects"]:
+                return app.project_add(body)
+            if n == 3 and segs[0] == "meetings" and segs[2] == "rename":
+                return app.meeting_rename(segs[1], body)
+            if n == 3 and segs[0] == "meetings" and segs[2] == "move":
+                return app.meeting_move(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "name":
                 return app.name_speaker(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "jobs":
@@ -227,6 +243,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif method == "DELETE":
             if n == 2 and segs[0] == "people":
                 return app.person_delete(segs[1])
+            if n == 2 and segs[0] == "projects":
+                return app.project_remove(segs[1])
         raise ApiError(404, "no such endpoint")
 
     # -- static -------------------------------------------------------------------

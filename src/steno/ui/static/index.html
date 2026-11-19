@@ -7,160 +7,79 @@
 <title>Steno</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
 </head>
 <body>
-<div class="app" id="app">
+<div class="app">
 
-  <nav class="nav" aria-label="Main">
-    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>STENO<small>LOCAL</small></div>
-    <div class="nav-items">
-      <button class="nav-item" data-view="live"><span class="nav-no">01</span>Live</button>
-      <button class="nav-item" data-view="sessions"><span class="nav-no">02</span>Sessions</button>
-      <button class="nav-item" data-view="people"><span class="nav-no">03</span>People</button>
+  <aside class="side" aria-label="Projects">
+    <div class="brand"><i class="dot"></i>STENO<span class="dim">LOCAL</span></div>
+
+    <div class="side-label">Projects</div>
+    <nav class="plist" id="plist"></nav>
+    <div class="side-actions">
+      <button class="btn ghost" id="btn-new" type="button">+ New project</button>
+      <button class="btn ghost" id="btn-add" type="button">Add existing folder</button>
     </div>
-    <p class="nav-foot">Audio and voices stay on this computer.</p>
-  </nav>
+    <nav class="plist" id="inbox-slot"></nav>
 
-  <main class="main" id="main">
-    <div class="alert" id="alert" role="alert" hidden>
-      <span id="alert-text"></span>
-      <button class="btn mini" id="alert-close" type="button">Dismiss</button>
-    </div>
-
-    <!-- Live: recorder -->
-    <section class="recorder" id="recorder" aria-label="Recorder" hidden>
-      <div class="rec-top">
-        <div class="rec-state" id="rec-state">
-          <span class="rec-dot" id="rec-dot" aria-hidden="true"></span>
-          <span class="rec-label" id="rec-label">Idle</span>
-        </div>
-        <div class="rec-clock" id="rec-clock" aria-label="Elapsed time">00:00:00</div>
-        <div class="rec-actions">
-          <button class="btn primary big" id="rec-toggle" type="button">Start recording</button>
-        </div>
-      </div>
-      <div class="rec-opts" id="rec-opts">
-        <label class="check"><input type="checkbox" id="opt-mic"> Microphone</label>
-        <label class="check"><input type="checkbox" id="opt-loop"> System audio</label>
-        <label class="check" title="Needed by Finalize. Stores raw audio in the session folder (sensitive).">
-          <input type="checkbox" id="opt-keep"> Keep audio <span class="hint">(needed for Finalize)</span></label>
-      </div>
-      <div class="rec-meters" id="rec-meters" hidden>
-        <div class="meter" id="meter-mic"><span class="lbl">MIC</span><span class="bar"><i></i></span><span class="act" aria-hidden="true"></span></div>
-        <div class="meter" id="meter-loopback"><span class="lbl">SYSTEM</span><span class="bar"><i></i></span><span class="act" aria-hidden="true"></span></div>
-        <div class="rec-now"><span class="lbl">NOW</span> <span id="rec-speaker">-</span></div>
-      </div>
-    </section>
-
-    <!-- Sessions: list -->
-    <section class="list-view" id="sessions-view" aria-label="Sessions" hidden>
-      <header class="view-head"><h1 class="eyebrow">Sessions</h1><span class="dim" id="sessions-count"></span></header>
-      <div class="rows" id="sessions-rows"></div>
-    </section>
-
-    <!-- Transcript (live and past sessions) -->
-    <section class="transcript-wrap" id="transcript-wrap" aria-label="Transcript" hidden>
-      <header class="sess-head" id="sess-head">
-        <button class="btn mini" id="sess-back" type="button" hidden>&larr; Sessions</button>
-        <div class="sess-id"><span class="eyebrow" id="sess-kind">Transcript</span> <span class="mono" id="sess-id"></span></div>
-        <div class="sess-tools">
-          <span class="seg-toggle" id="view-toggle" role="group" aria-label="Transcript version" hidden>
-            <button type="button" data-v="live">Live</button><button type="button" data-v="final">Final</button>
-          </span>
-          <label class="inline" for="fin-speakers">Speakers
-            <input class="num" id="fin-speakers" type="number" min="1" max="20" placeholder="auto" inputmode="numeric"></label>
-          <button class="btn" id="fin-run" type="button">Finalize</button>
-        </div>
-      </header>
-      <div class="tscroll" id="tscroll" tabindex="0">
-        <div class="transcript" id="transcript"></div>
-        <p class="empty" id="transcript-empty" hidden></p>
-      </div>
-      <button class="jump" id="jump" type="button" hidden>New lines below</button>
-    </section>
-
-    <!-- People -->
-    <section class="list-view" id="people-view" aria-label="People" hidden>
-      <header class="view-head"><h1 class="eyebrow">People</h1><span class="dim" id="people-count"></span></header>
-      <div class="rows" id="people-rows"></div>
-      <p class="empty" id="people-empty" hidden>No one is enrolled yet. Name a speaker in a transcript and tick "Save voice", or run <code>steno enroll NAME</code>.</p>
-    </section>
-  </main>
-
-  <aside class="side" id="side" aria-label="Details">
-    <section class="panel" id="panel-speakers" hidden>
-      <h2 class="eyebrow">Speakers</h2>
-      <ul class="spk-list" id="spk-list"></ul>
-      <p class="note" id="spk-note"></p>
-      <form class="name-form" id="name-form" hidden>
-        <h3 class="eyebrow" id="name-title">Name speaker</h3>
-        <input class="text" id="name-input" type="text" maxlength="80" autocomplete="off" list="people-names" placeholder="Name" aria-label="Speaker name" required>
-        <datalist id="people-names"></datalist>
-        <label class="check"><input type="checkbox" id="name-save"> Save this voice to a profile</label>
-        <p class="note" id="name-consent">A voiceprint is biometric personal data (GDPR). Save it only if this person agreed. It is stored encrypted on this computer and never sent anywhere. Without the tick, the name applies to this session only.</p>
-        <div class="row">
-          <button class="btn primary" type="submit">Save name</button>
-          <button class="btn" type="button" id="name-cancel">Cancel</button>
-        </div>
-      </form>
-      <p class="note legend"><span class="swatch" aria-hidden="true"></span> Dashed rule: speaker not yet certain, may change.</p>
-    </section>
-
-    <section class="panel" id="panel-llm" hidden>
-      <h2 class="eyebrow">Clean up / Summary / To-do</h2>
-      <p class="sent" id="llm-sent"></p>
-      <div class="row">
-        <button class="btn" id="btn-clean" type="button">Clean up</button>
-        <button class="btn" id="btn-summary" type="button">Summary</button>
-        <button class="btn" id="btn-todo" type="button">To-do</button>
-      </div>
-      <div class="row">
-        <input class="text" id="todo-person" type="text" maxlength="80" list="todo-people" placeholder="Person" aria-label="Person for the to-do list" autocomplete="off">
-        <datalist id="todo-people"></datalist>
-        <button class="btn" id="btn-todo-person" type="button">To-do for person</button>
-      </div>
-      <p class="note" id="clean-info"></p>
-      <p class="note">Clean up asks Claude for small corrections of misheard words and punctuation in the text and saves them as a separate clean transcript; the original is never changed. Summary and To-do use the clean text when it is up to date. A per-person to-do replaces the saved to-do list; run "To-do" again for everyone.</p>
-    </section>
-
-    <section class="panel" id="panel-job" hidden>
-      <h2 class="eyebrow">Job</h2>
-      <div id="job-card"></div>
-    </section>
-
-    <section class="panel" id="panel-result" hidden>
-      <div class="tabs" role="tablist">
-        <button role="tab" data-tab="summary" type="button">Summary</button>
-        <button role="tab" data-tab="todo" type="button">To-do</button>
-      </div>
-      <div class="md" id="result-md"></div>
-    </section>
-
-    <section class="panel" id="panel-info">
-      <h2 class="eyebrow">Privacy</h2>
-      <p class="note">Recording, transcription and speaker recognition run on this computer. Only when you press Clean up, Summary or To-do, the transcript <em>text</em> is sent to Claude. Never audio, never voiceprints.</p>
-    </section>
+    <div class="grow"></div>
+    <nav class="plist"><button class="pitem" id="nav-people" type="button"><span class="pname">People</span><span class="pcount" id="people-count"></span></button></nav>
+    <div class="side-foot" id="side-foot"></div>
   </aside>
 
-  <footer class="statusbar" id="statusbar" role="status" aria-live="off">
-    <span class="sb-item" id="sb-rec">IDLE</span>
-    <span class="sb-item" id="sb-saved">No session</span>
-    <span class="sb-item grow" id="sb-job">No job running</span>
-    <span class="sb-item" id="sb-conn">Connecting</span>
-  </footer>
+  <main class="main">
+    <!-- project view -->
+    <section class="view" id="view-project" aria-label="Meetings">
+      <header class="top">
+        <div class="top-row">
+          <h1 id="proj-name"></h1>
+          <button class="btn ghost small" id="btn-forget" type="button" title="Forget this project (files stay on disk)">Forget</button>
+        </div>
+        <div class="rec-row">
+          <input class="text" id="rec-title" type="text" placeholder="Meeting" maxlength="80" aria-label="Meeting title" autocomplete="off">
+          <button class="btn rec" id="btn-rec" type="button"><i class="dot"></i><span id="btn-rec-label">Record</span></button>
+          <button class="btn" id="btn-pause" type="button" hidden>Pause</button>
+          <button class="btn solid" id="btn-stop" type="button" hidden>Stop</button>
+          <span class="toggles" id="toggles">
+            <button class="tgl" id="tgl-mic" type="button" aria-pressed="true">Mic</button>
+            <button class="tgl" id="tgl-loop" type="button" aria-pressed="true">System audio</button>
+            <button class="tgl" id="tgl-keep" type="button" aria-pressed="false" title="Keep the raw audio in the meeting folder (needed for a final transcript)">Keep audio</button>
+          </span>
+        </div>
+        <div class="strip" id="strip" aria-live="polite"></div>
+      </header>
+
+      <div class="feed-wrap">
+        <div class="feed" id="feed"></div>
+        <button class="pill" id="jump" type="button" hidden>Jump to live</button>
+      </div>
+
+      <div class="empty" id="empty" hidden>
+        <div class="card">
+          <h2>Create a project</h2>
+          <p>A project is a folder on disk. Meetings are saved in <code>&lt;folder&gt;/Steno/</code>, so they stay with the rest of your work.</p>
+          <div class="card-actions">
+            <button class="btn rec" id="empty-new" type="button">+ New project</button>
+            <button class="btn" id="empty-add" type="button">Add existing folder</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- people view -->
+    <section class="view" id="view-people" aria-label="People" hidden>
+      <header class="top">
+        <div class="top-row"><h1>People</h1></div>
+        <div class="strip"><span class="lab">VOICE PROFILES · STORED ON THIS COMPUTER</span></div>
+      </header>
+      <div class="feed-wrap"><div class="feed" id="people"></div></div>
+    </section>
+  </main>
 </div>
 
-<dialog class="dialog" id="confirm" aria-labelledby="confirm-title">
-  <form method="dialog">
-    <h2 class="eyebrow" id="confirm-title">Confirm</h2>
-    <p id="confirm-text"></p>
-    <div class="row end">
-      <button class="btn" value="cancel" id="confirm-cancel">Cancel</button>
-      <button class="btn danger" value="ok" id="confirm-ok">Delete</button>
-    </div>
-  </form>
-</dialog>
-
-<script src="/static/app.js" defer></script>
+<div class="toasts" id="toasts" role="status"></div>
+<dialog id="modal"></dialog>
+<datalist id="people-names"></datalist>
 </body>
 </html>
