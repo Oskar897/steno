@@ -105,6 +105,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("app", help="open the desktop app (projects, recording, meetings)")
     p.add_argument("--debug", action="store_true", help="enable the web inspector")
 
+    sub.add_parser("install-shortcuts",
+                   help="add Steno to the Start menu and the desktop (Windows)")
+
     p = sub.add_parser("ui", help="open the local web UI (record, transcripts, speakers, people)")
     p.add_argument("--port", type=int, default=0,
                    help="port on 127.0.0.1 (default: a random free one)")
@@ -610,6 +613,16 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_clean(args, cfg)
         if args.command == "ui":
             return cmd_ui(args, cfg)
+        if args.command == "install-shortcuts":
+            from steno import shortcuts
+
+            try:
+                for path in shortcuts.install():
+                    print(f"created {path}")
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            return 0
         if args.command == "app":
             from steno.ui.window import run_app
 

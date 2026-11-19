@@ -201,3 +201,13 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
   .side { max-height: 34vh; }
   .toggles { margin-left: 0; }
 }
+
+/* settings */
+.set-h { font-size: 13px; font-weight: 600; color: var(--text); margin: 22px 0 4px; }
+.set-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.set-row .pn { flex: 1; min-width: 0; }
+.set-row .sub { color: var(--faint); font-size: 12px; }
+.set-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+.set-area { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--mono); font-size: 12px; margin-top: 8px; }
+.set-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.set-hint { color: var(--faint); font-size: 12px; margin: 0 0 4px; max-width: 640px; line-height: 1.5; }

@@ -24,7 +24,7 @@
     <nav class="plist" id="inbox-slot"></nav>
 
     <div class="grow"></div>
-    <nav class="plist"><button class="pitem" id="nav-people" type="button"><span class="pname">People</span><span class="pcount" id="people-count"></span></button></nav>
+    <nav class="plist"><button class="pitem" id="nav-people" type="button"><span class="pname">People</span><span class="pcount" id="people-count"></span></button><button class="pitem" id="nav-settings" type="button"><span class="pname">Settings</span></button></nav>
     <div class="side-foot" id="side-foot"></div>
   </aside>
 
@@ -74,6 +74,15 @@
         <div class="strip"><span class="lab">VOICE PROFILES · STORED ON THIS COMPUTER</span></div>
       </header>
       <div class="feed-wrap"><div class="feed" id="people"></div></div>
+    </section>
+
+    <!-- settings view -->
+    <section class="view" id="view-settings" aria-label="Settings" hidden>
+      <header class="top">
+        <div class="top-row"><h1>Settings</h1></div>
+        <div class="strip"><span class="lab">SAVED ON THIS COMPUTER</span></div>
+      </header>
+      <div class="feed-wrap"><div class="feed" id="settings"></div></div>
     </section>
   </main>
 </div>

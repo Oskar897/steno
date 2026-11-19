@@ -198,7 +198,7 @@ async function loadProjects() {
 }
 
 function ensureSelection() {  // returns true when the selected project had to change
-  if (S.view === "people") return false;
+  if (S.view !== "project") return false;
   const valid = S.sel === "inbox" ? S.inbox > 0 : S.projects.some((p) => p.id === S.sel);
   if (valid) return false;
   const saved = remember("steno-project");
@@ -228,6 +228,52 @@ function showPeople() {
 function showView() {
   $("view-project").hidden = S.view !== "project";
   $("view-people").hidden = S.view !== "people";
+  $("view-settings").hidden = S.view !== "settings";
+}
+
+function showSettings() {
+  S.view = "settings";
+  showView(); renderSide();
+  guarded(loadSettings);
+}
+
+// ---------------------------------------------------------------- settings
+
+const AUTO = [
+  ["auto_clean", "Clean up automatically", "After a recording stops, Claude fixes misheard words and punctuation."],
+  ["auto_summary", "Summary automatically", "Then writes summary.md in the meeting folder."],
+  ["auto_todo", "To-do automatically", "Then writes todo.md with explicit commitments."],
+];
+
+async function loadSettings() {
+  let data;
+  try { data = await api("GET", "/api/settings"); } catch (e) { if (!missing(e)) throw e; data = { settings: {} }; }
+  const s = data.settings || {};
+  const box = $("settings");
+  box.replaceChildren();
+  box.append(h("h2", { class: "set-h", text: "After a meeting" }),
+    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Each step uses Claude (Haiku) and takes about 10-30 s. Off: use the buttons on each meeting." }));
+  for (const [key, label, sub] of AUTO) {
+    const box2 = h("input", { type: "checkbox", id: `set-${key}` });
+    box2.checked = !!s[key];
+    box2.addEventListener("change", async () => {
+      const res = await guarded(() => api("POST", "/api/settings", { [key]: box2.checked }));
+      if (!res) box2.checked = !box2.checked;
+    });
+    box.append(h("label", { class: "set-row", for: `set-${key}` },
+      h("div", { class: "pn" }, h("div", { text: label }), h("div", { class: "sub", text: sub })), box2));
+  }
+  const area = h("textarea", { class: "text set-area", id: "set-glossary", rows: "6", maxlength: "8000",
+    placeholder: "One per line, e.g.\nJira\nCanvas\nClaude Code", spellcheck: "false" });
+  area.value = (s.glossary || []).join("\n");
+  const save = h("button", { class: "btn small solid", type: "button", text: "Save glossary", onclick: async () => {
+    const terms = area.value.split("\n").map((t) => t.trim()).filter(Boolean);
+    const res = await guarded(() => api("POST", "/api/settings", { glossary: terms }));
+    if (res) { area.value = res.settings.glossary.join("\n"); toast(`Glossary saved (${res.settings.glossary.length} terms)`); }
+  } });
+  box.append(h("h2", { class: "set-h", text: "Glossary" }),
+    h("p", { class: "set-hint", text: "Words your meetings use: product names, course codes, names. Clean up uses them as the right spelling when the speech recognition misheard them (\"J här\" becomes \"Jira\")." }),
+    area, h("div", { class: "set-actions" }, save));
 }
 
 function renderSide() {
@@ -241,6 +287,7 @@ function renderSide() {
   $("plist").replaceChildren(...S.projects.map((p) => item(p.id, p.name, p.meetings)));
   $("inbox-slot").replaceChildren(...(S.inbox > 0 ? [item("inbox", "Inbox", S.inbox)] : []));
   $("nav-people").classList.toggle("active", S.view === "people");
+  $("nav-settings").classList.toggle("active", S.view === "settings");
   $("people-count").textContent = S.people.length ? String(S.people.length) : "";
   renderSideFoot();
 }
@@ -461,7 +508,7 @@ async function showOlder() {
 }
 
 function jobLabel(job) {
-  return { summary: "CLAUDE · SUMMARIZING", todo: "CLAUDE · EXTRACTING TO-DOS", clean: "CLAUDE · CLEANING UP", finalize: "FINALIZING" }[job.kind] || String(job.kind).toUpperCase();
+  return { summary: "CLAUDE · SUMMARIZING", todo: "CLAUDE · EXTRACTING TO-DOS", clean: "CLAUDE · CLEANING UP", finalize: "FINALIZING", auto: "AFTER MEETING" }[job.kind] || String(job.kind).toUpperCase();
 }
 
 function buildMeeting(m) {
@@ -858,6 +905,7 @@ function init() {
   $("empty-add").addEventListener("click", () => guarded(addProject));
   $("btn-forget").addEventListener("click", () => guarded(forgetProject));
   $("nav-people").addEventListener("click", showPeople);
+  $("nav-settings").addEventListener("click", showSettings);
   $("btn-rec").addEventListener("click", () => startRecording());
   $("btn-pause").addEventListener("click", () => recordCmd((S.status.recorder || {}).paused ? "resume" : "pause"));
   $("btn-stop").addEventListener("click", () => recordCmd("stop"));

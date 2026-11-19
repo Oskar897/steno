@@ -9,10 +9,11 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from steno import __version__, labels, projects, transcript
+from steno import __version__, labels, projects, settings, transcript
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
@@ -29,6 +30,9 @@ _PROFILE_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 MAX_PATH_LEN = 1000
 DOCS = {"summary": "summary.md", "todo": "todo.md"}
+AUTO_JOB = "auto"  # the jobs that run by themselves after a recording (Settings)
+STEP_LABELS = {"finalize": "finalize", "clean": "clean-up", "summary": "summary",
+               "todo": "to-do"}
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -102,8 +106,9 @@ class UiApp:
         self.bus = EventBus()
         self._store_factory = store_factory
         self.recorder = Recorder(cfg, self.bus, engine_factory)
-        self.jobs = JobManager(self.bus, self._with_sync(
-            runners or default_runners(cfg, store_factory)))
+        base = dict(runners or default_runners(cfg, store_factory))
+        base[AUTO_JOB] = self._auto_runner(base)
+        self.jobs = JobManager(self.bus, self._with_sync(base))
         self.recorder.on_stopped = self._after_recording
 
     # -- helpers ------------------------------------------------------------------
@@ -145,12 +150,42 @@ class UiApp:
         return d
 
     def _after_recording(self, session_id: str, keep_audio: bool) -> None:
-        if not (self.cfg.post.auto and keep_audio):
+        s = settings.load()
+        steps = ["finalize"] if self.cfg.post.auto and keep_audio else []
+        steps += [kind for kind, on in (("clean", s.auto_clean), ("summary", s.auto_summary),
+                                        ("todo", s.auto_todo)) if on]
+        steps = [k for k in steps if k in self.jobs.kinds]
+        if not steps:
             return
-        try:  # same as `[post] auto = true` in `steno record`
-            self.jobs.submit("finalize", session_id, self._session_dir(session_id), {})
+        try:  # finalize as with `[post] auto = true`, then the switches from Settings
+            self.jobs.submit(AUTO_JOB, session_id, self._session_dir(session_id),
+                             {"steps": steps})
         except (JobBusy, ApiError) as exc:
-            log.warning("auto-finalize skipped: %s", exc)
+            log.warning("automatic jobs after the recording skipped: %s", exc)
+
+    @staticmethod
+    def _auto_runner(base: dict[str, Runner]) -> Runner:
+        """Run ``params["steps"]`` one after the other; a failing step does not stop the rest."""
+
+        def run(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
+            done, failed = [], []
+            for step in params.get("steps", []):
+                def step_progress(stage: str, d: int = 0, t: int = 0, _step=step) -> None:
+                    progress(f"{STEP_LABELS.get(_step, _step)}: {stage}", d, t)
+
+                step_progress("starting")
+                try:
+                    base[step](session_dir, {}, step_progress)
+                    done.append(STEP_LABELS.get(step, step))
+                except Exception as exc:
+                    log.exception("automatic %s failed", step)
+                    failed.append(f"{STEP_LABELS.get(step, step)} ({exc})")
+            if failed and not done:
+                raise RuntimeError("failed: " + "; ".join(failed))
+            return "done: " + ", ".join(done) + (
+                f"; failed: {'; '.join(failed)}" if failed else "")
+
+        return run
 
     @staticmethod
     def _store_call(fn: Callable[[], Any]) -> Any:
@@ -214,6 +249,21 @@ class UiApp:
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
+
+    # -- settings -----------------------------------------------------------------
+
+    def settings_get(self) -> dict[str, Any]:
+        return {"settings": asdict(settings.load())}
+
+    def settings_set(self, body: dict[str, Any]) -> dict[str, Any]:
+        if "glossary" in body and not isinstance(body["glossary"], list | str):
+            raise ApiError(400, "glossary must be a list of words")
+        for key in ("auto_clean", "auto_summary", "auto_todo"):
+            if key in body and not isinstance(body[key], bool):
+                raise ApiError(400, f"{key} must be true or false")
+        s = settings.update(body)
+        self.bus.publish("settings", asdict(s))
+        return {"settings": asdict(s)}
 
     # -- projects -----------------------------------------------------------------
 
@@ -445,7 +495,7 @@ class UiApp:
     def start_job(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         d = self._session_dir(session_id)
         kind = body.get("kind")
-        if kind not in self.jobs.kinds:
+        if kind not in self.jobs.kinds or kind == AUTO_JOB:
             raise ApiError(400, f"unknown job kind (use one of: {', '.join(self.jobs.kinds)})")
         params: dict[str, Any] = {}
         if kind == "finalize":

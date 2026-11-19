@@ -108,6 +108,17 @@ def load_source(session_dir: Path) -> tuple[list[Segment], str]:
 # --------------------------------------------------------------------------- chunking
 
 
+def glossary_section(terms: list[str]) -> str:
+    """Prompt addition: the user's own terms, the right spelling of what was misheard."""
+    if not terms:
+        return ""
+    listed = "\n".join(f"- {t}" for t in terms)
+    return ("\n\nTerms used in these meetings (the user's own list). When the text has a "
+            "misrecognised form that clearly means one of them (for example a phonetic "
+            "spelling or a split word), replace it with the term spelled exactly like this:\n"
+            f"{listed}\n")
+
+
 def render_line(seg: Segment) -> str:
     return f"[{seg.seq}] {seg.speaker}: {seg.text}"
 
@@ -195,6 +206,7 @@ def validate_edit(
     original: dict[int, str],
     known_words: set[str],
     max_edit: float,
+    terms: frozenset[str] = frozenset(),
 ) -> tuple[bool, str]:
     """Is ``{id, old, new}`` a safe edit of the current text of its line? ``(ok, reason)``.
 
@@ -228,9 +240,10 @@ def validate_edit(
     new_cf = [w.casefold() for w in new_words]
     if len(new_words) > len(old_words) + MAX_ADDED_WORDS:
         return False, "adds content"
+    is_term = " ".join(new_cf) in terms  # a glossary term may replace a split mishearing
     if len(new_words) < len(old_words) and _collapse_repeats(old_cf) != new_cf and not _close(
         "".join(old_cf), "".join(new_cf), MERGE_SIMILARITY
-    ):
+    ) and not is_term:
         return False, "removes content"
 
     starts = not text[: m.start()].strip() or text[: m.start()].rstrip()[-1:] in (".", "!", "?")
@@ -267,13 +280,14 @@ def apply_edits(
     known_words: set[str],
     edits: list[Any],
     max_edit: float,
+    terms: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate and apply ``edits`` to ``texts`` (changed in place); ``(applied, rejected)``."""
     applied: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for edit in edits:
         view = {i: texts[i] for i in chunk_ids}
-        ok, reason = validate_edit(edit, view, original, known_words, max_edit)
+        ok, reason = validate_edit(edit, view, original, known_words, max_edit, terms)
         if not ok:
             item = {"reason": reason}
             if isinstance(edit, dict):
@@ -308,6 +322,7 @@ def clean_session(
     dry_run: bool = False,
     runner: Runner | None = None,
     progress: Progress | None = None,
+    glossary: list[str] | None = None,
 ) -> CleanResult:
     """Clean the session's best text; write ``clean.*`` unless ``dry_run``.
 
@@ -319,10 +334,16 @@ def clean_session(
     if not segments:
         raise LlmError("the session has no transcript text")
     started = time.monotonic()
-    prompt = llm.load_prompt("clean", cfg.language)
+    if glossary is None:
+        from steno import settings
+
+        glossary = settings.load().glossary
+    prompt = llm.load_prompt("clean", cfg.language) + glossary_section(glossary)
     original = {s.seq: s.text for s in segments}
     texts = dict(original)
     known = {w.casefold() for t in original.values() for w in _words(t)}
+    known |= {w.casefold() for term in glossary for w in _words(term)}  # may be introduced
+    terms = frozenset(" ".join(w.casefold() for w in _words(t)) for t in glossary)
     chunks = chunk_segments(segments)
     applied: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -341,7 +362,7 @@ def clean_session(
             last_error = exc
             continue
         ok, bad = apply_edits(
-            {s.seq for s in chunk}, texts, original, known, edits, cfg.fix_max_edit)
+            {s.seq for s in chunk}, texts, original, known, edits, cfg.fix_max_edit, terms)
         proposed += len(edits)
         applied += ok
         rejected += bad

@@ -215,6 +215,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.people()
             if segs == ["projects"]:
                 return app.projects_list()
+            if segs == ["settings"]:
+                return app.settings_get()
             if n == 3 and segs[0] == "projects" and segs[2] == "meetings":
                 return app.project_meetings(segs[1])
             if n == 4 and segs[0] == "sessions" and segs[2] == "doc":
@@ -230,6 +232,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.record_resume()
             if segs == ["projects"]:
                 return app.project_add(body)
+            if segs == ["settings"]:
+                return app.settings_set(body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "rename":
                 return app.meeting_rename(segs[1], body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "move":
