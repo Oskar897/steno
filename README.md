@@ -39,7 +39,7 @@ windows), kept audio and voice profiles stay in the global data dir. On Windows 
 uses the system Acrylic backdrop. `steno ui` serves the same page in a browser.
 
 `uv run steno install-shortcuts` adds Steno to the Start menu and the desktop (opens without
-a console; errors go to `%USERPROFILE%\.steno\logspp.log`). Only one app runs at a time;
+a console; errors go to `%USERPROFILE%\.steno\logs\app.log`). Only one app runs at a time;
 closing it during a recording asks first. In Settings: run clean-up, summary and to-do
 automatically after a recording (off by default), and a glossary of your own terms that the
 clean-up uses as the right spelling of misheard words.
