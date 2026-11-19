@@ -21,3 +21,5 @@ Final product is a desktop app; built in layers that are useful on their own.
 - Python 3.12, `uv`, src layout (`src/steno`). Lint with `ruff`, test with `pytest`.
 - Code, comments, docstrings and README in English.
 - Transcript format: append-only JSONL, one segment per line (see `docs/formats.md`).
+- Desktop app architecture, API and design notes: `docs/app.md`. Meeting folders that the app
+  writes into project folders (`<project>/Steno/`) are user data too: never commit them.

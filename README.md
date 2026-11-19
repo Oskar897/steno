@@ -3,8 +3,9 @@
 Local, private meeting transcription for Swedish and English, with speaker
 recognition, built to work alongside [Claude Code](https://claude.com/claude-code).
 
-> **Status:** early development (layer 1: capture → transcript file; layer 2:
-> speaker recognition, uncalibrated; layer 3: post-meeting finalize, summary and to-do).
+> **Status:** early development. Working: capture → live transcript, speaker recognition,
+> rolling refinement while recording, post-meeting finalize, clean-up / summary / to-do via
+> Claude, and a first version of the desktop app (`steno app`).
 
 ## Principles
 
@@ -36,7 +37,8 @@ A project is a folder you pick; every meeting gets its own readable folder in
 text never lands in a git repo by accident), an `index.md` and a `CLAUDE.md` telling Claude
 Code to read summaries before whole transcripts. Machine files (JSONL, revisions, voice
 windows), kept audio and voice profiles stay in the global data dir. On Windows 11 the window
-uses the system Acrylic backdrop. `steno ui` serves the same page in a browser.
+uses the system Acrylic backdrop. `steno ui` serves the same page in a browser. How the app
+is built (files, API, events, design): [docs/app.md](docs/app.md).
 
 `uv run steno install-shortcuts` adds Steno to the Start menu and the desktop (opens without
 a console; errors go to `%USERPROFILE%\.steno\logs\app.log`). Only one app runs at a time;
@@ -203,7 +205,7 @@ are never touched, and `summary` / `todo` use the clean text while it matches it
 `--dry-run` shows what would change. See `docs/formats.md` for the rules. In Claude Code the slash
 commands `/sammanfatta` and `/todo` run these and show the result.
 
-## Desktop-style UI (`steno ui`)
+## Browser UI (`steno ui`)
 
 ```powershell
 uv run steno ui                # starts a local server and opens your browser
@@ -216,8 +218,8 @@ Finalize / Clean up / Summary / To-do as background jobs, and manage enrolled pe
 it reads and writes the session folders in `%USERPROFILE%\.steno`.
 
 The UI is plain static HTML/CSS/JS in `src/steno/ui/static/` (no build step, no CDN, no web
-fonts) served by a stdlib HTTP server with Server-Sent Events, so it can later be wrapped in a
-desktop shell. It listens on 127.0.0.1 only; the address printed at start carries a random
+fonts) served by a stdlib HTTP server with Server-Sent Events; `steno app` shows the same page
+in a desktop window. It listens on 127.0.0.1 only; the address printed at start carries a random
 per-launch token that every API call must send, and requests with a foreign `Host`/`Origin`
 header are refused. Clean up, Summary and To-do show what is sent: transcript text only, never audio or
 voiceprints. Press Ctrl+C in the terminal to quit (a running recording is stopped and saved).

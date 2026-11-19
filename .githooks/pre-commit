@@ -20,7 +20,8 @@ BLOCKED_EXT = {
     ".onnx", ".bin", ".gguf", ".pt", ".ckpt", ".safetensors",
     ".key", ".pem",
 }
-BLOCKED_NAMES = {".env", "config.toml", "settings.local.json"}
+BLOCKED_NAMES = {".env", "config.toml", "settings.local.json",
+                 ".steno-meeting.json"}  # a Steno meeting folder (transcript, summary)
 BLOCKED_DIRS = ("data/", "recordings/", "sessions/", "transcripts/",
                 "profiles/", "voiceprints/", "models/", "context/",
                 "benchmarks/audio/", "benchmarks/results/")
@@ -58,6 +59,9 @@ def main() -> int:
             problems.append(f"{path}: local config/secret file")
         if any(low.startswith(d) or f"/{d}" in low for d in BLOCKED_DIRS):
             problems.append(f"{path}: inside a private data directory")
+        orig = path.replace("\\", "/")
+        if orig.startswith("Steno/") or "/Steno/" in orig:  # case-sensitive: not src/steno
+            problems.append(f"{path}: inside a Steno meetings folder")
         size = int(git("cat-file", "-s", f":{path}").strip() or 0)
         if size > MAX_BYTES:
             problems.append(f"{path}: {size} bytes > {MAX_BYTES}")

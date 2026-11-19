@@ -36,6 +36,28 @@ Voice profiles live next to the sessions, also encrypted:
 
 `<data_dir>` is `%USERPROFILE%\.steno` on Windows (override: `STENO_DATA_DIR`).
 
+A session recorded into a project (desktop app) also has `meeting.json` (`{"folder", "title"}`)
+pointing to its meeting folder; a session without one is in the Inbox.
+
+## Projects and meeting folders (desktop app)
+
+```
+<data_dir>/projects.json              # {"projects": [{"path": "..."}]}: registered project folders
+<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary
+<project folder>/Steno/
+  .gitignore                          # "*": meeting text is never committed by accident
+  CLAUDE.md                           # how Claude Code should read the meetings (summaries first)
+  index.md                            # one line per meeting, newest first; "recording" mark
+  <YYYY-MM-DD HH.MM title>/
+    .steno-meeting.json               # {"session": "<session_id>", "title": "..."}
+    transcript.md                     # best text (clean > final > refined live), rewritten while recording
+    summary.md, todo.md               # copies, when made
+```
+
+The meeting folder holds only readable text. The session directory above stays the source of
+truth (JSONL, revisions, embeddings, kept audio) and lives in the data dir. A `CLAUDE.md` in
+`Steno/` that does not start with Steno's marker comment is never overwritten.
+
 ## transcript.jsonl (v1)
 
 One JSON object per line, written only when a segment is final.
