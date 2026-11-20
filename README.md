@@ -33,7 +33,12 @@ uv run steno app
 
 A project is a folder you pick; every meeting gets its own readable folder in
 `<project>/Steno/` with `transcript.md` (kept current while recording), and `summary.md` /
-`todo.md` when you ask for them. `Steno/` gets a `.gitignore` (everything ignored, so meeting
+`todo.md` when you ask for them. Optionally a project has meeting types (project menu ⋯ →
+Meeting types), each with its own folder: a Board meeting is saved as
+`<project>/Meetings/Board/2026-11-20 Lobby days/`, and the sidebar groups meetings by type.
+While recording, a small strip with timer, Pause and Stop stays on top of other windows when
+Steno itself is not in front (drag it anywhere, x hides it until the next recording; hidden from
+screen sharing; Settings → Appearance turns it off). `Steno/` gets a `.gitignore` (everything ignored, so meeting
 text never lands in a git repo by accident), an `index.md` and a `CLAUDE.md` telling Claude
 Code to read summaries before whole transcripts. Machine files (JSONL, revisions, voice
 windows), kept audio and voice profiles stay in the global data dir. On Windows 11 the window

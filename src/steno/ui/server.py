@@ -40,7 +40,10 @@ MAX_BODY = 64 * 1024
 STATIC_TYPES = {
     "app.js": "text/javascript; charset=utf-8",
     "style.css": "text/css; charset=utf-8",
+    "mini.js": "text/javascript; charset=utf-8",
+    "mini.css": "text/css; charset=utf-8",
 }
+PAGES = {"/": "index.html", "/mini": "mini.html"}  # the mini strip of the desktop app
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
@@ -232,6 +235,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.record_resume()
             if segs == ["projects"]:
                 return app.project_add(body)
+            if n == 3 and segs[0] == "projects" and segs[2] == "types":
+                return app.project_types(segs[1], body)
             if segs == ["settings"]:
                 return app.settings_set(body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "rename":
@@ -258,12 +263,12 @@ class _Handler(BaseHTTPRequestHandler):
     # -- static -------------------------------------------------------------------
 
     def _serve_static(self, path: str, query: dict[str, list[str]]) -> None:
-        if path == "/":
+        if path in PAGES:
             if not self._token_ok((query.get("token") or [None])[0]):
                 self._send(403, b"Open the address printed by `steno ui` (it includes a "
                                 b"one-time access token).\n", "text/plain; charset=utf-8")
                 return
-            self._send(200, _static("index.html"), "text/html; charset=utf-8")
+            self._send(200, _static(PAGES[path]), "text/html; charset=utf-8")
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         elif path.startswith("/static/") and path[len("/static/"):] in STATIC_TYPES:
@@ -327,6 +332,10 @@ class UiServer:
     @property
     def url(self) -> str:
         return f"http://127.0.0.1:{self.port}/?token={self.token}"
+
+    @property
+    def mini_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mini?token={self.token}"
 
     def start(self) -> None:
         self._thread = threading.Thread(

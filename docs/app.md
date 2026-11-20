@@ -11,8 +11,9 @@ A map for working on the app (`steno app`). User-facing docs: [README](../README
 | API | `src/steno/ui/api.py` | `UiApp`: plain methods returning JSON dicts or raising `ApiError`. |
 | Recorder | `src/steno/ui/recorder.py` | Drives one `Engine` (same wiring as `steno record`, including refine models). Start into a project, pause/resume (samples replaced by silence, so the clock and kept audio stay aligned), mirrors `transcript.md` into the meeting folder every 2 s while recording. |
 | Jobs | `src/steno/ui/jobs.py` | One background job at a time (finalize, clean, summary, todo, and `auto`: the after-meeting chain from Settings). |
-| Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`) and meeting folders (`<project>/Steno/<YYYY-MM-DD HH.MM title>/`). |
-| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_clean`, `auto_summary`, `auto_todo` (all off by default), `glossary`, `theme`, `transparent`. |
+| Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`) and meeting folders (`<project>/Steno/<YYYY-MM-DD title>/`; with meeting types `<project>/<type folder>/<YYYY-MM-DD title>/`, e.g. `Meetings/Board/2026-11-20 Lobby days/`). See [formats](formats.md). |
+| Mini strip | `src/steno/ui/window.py` (`MiniBridge`, `watch_mini`, `prepare_mini`, `save/restore_mini_place`), `src/steno/ui/static/mini.*` | Second pywebview window (196x34, frameless, always on top, no focus steal) made hidden at start. `watch_mini` polls the recorder: shown while `starting`/`recording`, except when the main window is the foreground window, after x (`MiniBridge.dismiss`, until the recording ends) or with `settings.mini_strip` off; hidden from `stopping` on. Page `/mini?token=` (own SSE stream): grip, dot (opens Steno), timer, level bars, Pause/Resume, Stop (also brings the main window forward), x. Dragging anywhere but a button moves it through `MiniBridge.drag_start/drag_to/drag_end` (Win32 `SetWindowPos`; pywebview's own drag region calls `SetWindowPos` with `None` and fails); the place is kept in `<data dir>/mini-strip.json` and used again if still on a screen. Excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`), rounded corners. |
+| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_clean`, `auto_summary`, `auto_todo` (all off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
 | Shortcuts | `src/steno/shortcuts.py` | `steno install-shortcuts`: Start menu and desktop `.lnk` running `pythonw -m steno.cli app`. The icon (`steno.ico`, 16-256 px: dark rounded tile, orange four-bar wave) is drawn in code with numpy, bars snapped to whole pixels at small sizes. The app rewrites it on each start and sets it as window/taskbar icon with its own AppUserModelID (`Steno.Desktop`), so it does not show as Python. |
 | Page | `src/steno/ui/static/` | `index.html`, `style.css`, `app.js`. Plain JS, no build step, no CDN, no web fonts, no inline scripts or styles (CSP). Only these three files are served (`STATIC_TYPES`). |
 
@@ -23,12 +24,13 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | Method | Path | |
 |---|---|---|
 | GET | `/api/status` | recorder (`state`, `paused`, `project`, levels, elapsed, speaker, backlog), running job, config summary |
-| GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count) / add `{path, name?, create?}` / forget (files stay) |
+| GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count and `types`) / add `{path, name?, create?}` / forget (files stay) |
+| POST | `/api/projects/<id>/types` `{types: [{name, folder?}]}` | replace the meeting types (folder defaults to `Meetings/<name>`) |
 | GET | `/api/projects/<id>/meetings` | oldest first; id `inbox` = sessions without a meeting folder |
-| POST | `/api/record/start` `{project?, title?, mic, loopback, keep_audio}`, `/api/record/pause`, `/resume`, `/stop` | |
+| POST | `/api/record/start` `{project?, type?, title?, mic, loopback, keep_audio}`, `/api/record/pause`, `/resume`, `/stop` | |
 | GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
-| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project}` | renames/moves the meeting folder |
+| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type) |
 | POST | `/api/meetings/<id>/archive` `{archived}` | hide/show it in the app (`archived.json` in the session dir; files stay) |
 | DELETE | `/api/meetings/<id>` | deletes the session dir and its meeting folder for good (not while recording it or while a job runs on it) |
 | POST | `/api/sessions/<id>/jobs` `{kind}` | `finalize`, `clean`, `summary`, `todo` |
@@ -50,6 +52,12 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   top of `style.css`: four text levels (`--text`, `--body`, `--dim`, `--faint`, plus `--ghost` for
   times/counts), surfaces with a 1px top `--highlight`, radii 6/8/10/14, a 4px spacing grid.
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
+- Meeting types (project ⋯ → Meeting types...): a project with types shows one small group
+  per type in the sidebar (chevron, name, `+` for a new meeting of that type; folded state in
+  `steno-folded`), then "No type" when such meetings exist. The dock gets a type menu
+  (chosen with `+` or the menu, else the open meeting's type, else the last used,
+  `steno-type-<project>`); the header reads "Project › Type". Move... lists every project and
+  type. Without types everything looks as before.
 - Layout: sidebar tree: each project (and the Inbox) folds open to its meetings, newest
   first (6, then "Show all"); `+` on a project opens a "New meeting" screen in it. The main
   area shows one meeting at a time (header with the project name, running-job chip, ⋯ menu;
@@ -85,7 +93,6 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
 
 ## Not done yet (owner's list)
 
-- Compact mini strip that stays on top during a meeting (pause/stop).
 - Design pass from the owner's feedback.
 - Swedish UI language; Mac/Linux; installer and first-run setup; global hotkey.
 - Moving a meeting back to the Inbox; noticing a project folder moved outside the app.

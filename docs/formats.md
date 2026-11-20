@@ -44,17 +44,27 @@ it from lists and counts; nothing else changes.
 ## Projects and meeting folders (desktop app)
 
 ```
-<data_dir>/projects.json              # {"projects": [{"path": "..."}]}: registered project folders
-<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary, theme, transparent
+<data_dir>/projects.json              # {"projects": [{"path": "...", "types": [{"name", "folder"}]}]}
+<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
 <project folder>/Steno/
   .gitignore                          # "*": meeting text is never committed by accident
   CLAUDE.md                           # how Claude Code should read the meetings (summaries first)
-  index.md                            # one line per meeting, newest first; "recording" mark
-  <YYYY-MM-DD HH.MM title>/
+  index.md                            # one line per meeting, newest first, path from the project folder; "recording" mark
+  <YYYY-MM-DD title>/                 # a meeting without a type
+    .gitignore                        # "*" (every meeting folder has one)
     .steno-meeting.json               # {"session": "<session_id>", "title": "..."}
     transcript.md                     # best text (clean > final > refined live), rewritten while recording
     summary.md, todo.md               # copies, when made
+<project folder>/<type folder>/       # e.g. Meetings/Board: one folder per meeting type
+  <YYYY-MM-DD title>/                 # same files as above
 ```
+
+Meeting types are optional (`types` missing or empty: every meeting goes into `Steno/`). A
+type's `folder` is relative to the project, `/`-separated, at most 4 levels, never `..`, an
+absolute path or `Steno` itself. Which project and type a meeting belongs to follows from the
+folder it lies in. A type whose folder holds meetings cannot be removed or re-pointed (the
+app refuses); renaming it is fine. Folders made before types existed are named
+`YYYY-MM-DD HH.MM title` and keep that name until they are renamed or moved.
 
 The meeting folder holds only readable text. The session directory above stays the source of
 truth (JSONL, revisions, embeddings, kept audio) and lives in the data dir. A `CLAUDE.md` in

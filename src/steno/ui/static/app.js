@@ -39,6 +39,7 @@ const ICONS = {
   folderPlus: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 10v6M9 13h6",
   inbox: "M3 13h5l1.5 3h5l1.5-3h5M5.5 5h13L21 13v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5z",
   chevron: "M6 9l6 6 6-6",
+  tag: "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01",
   spark: "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z",
   todo: "M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17",
   wand: "M4 20L15 9M14 4v2M18 8h2M17.5 4.5l-1.4 1.4M13 9l2 2",
@@ -286,6 +287,9 @@ const SIDE_MEETINGS = 6;  // meetings listed under a project before "Show all"
 function loadExpanded() {
   try { return new Set(JSON.parse(remember("steno-expanded") || "[]")); } catch (e) { return new Set(); }
 }
+function loadFolded() {
+  try { return new Set(JSON.parse(remember("steno-folded") || "[]")); } catch (e) { return new Set(); }
+}
 const S = {
   token: null,
   status: { recorder: {}, job: null, jobs: [], config: {} },
@@ -297,6 +301,8 @@ const S = {
   meetings: [],           // list for the selected project, oldest first
   lists: new Map(),       // project id -> meetings (oldest first), for the sidebar
   expanded: loadExpanded(), showAll: new Set(), showArchived: new Set(),
+  folded: loadFolded(),   // "pid::type" groups closed in the sidebar
+  newType: new Map(),     // project id -> meeting type for the next recording ("" = none)
   feed: new Map(),        // session id -> {info, detail, docs, open, el, ...}
   loadingFeed: false, buffer: [], unknown: new Set(),
   stick: true, unseen: 0,
@@ -405,6 +411,25 @@ function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
 const curProject = () => S.projects.find((p) => p.id === S.sel) || null;
 const projectName = (id) => (id === "inbox" || !id ? "Inbox" : (S.projects.find((p) => p.id === id) || {}).name || "project");
 
+const projTypes = (pid) => ((S.projects.find((p) => p.id === pid) || {}).types || []);
+/* The meeting type the next recording in a project goes to: chosen (+ or the dock's menu),
+   else the open meeting's type, else the last one used, else none. */
+function recType(pid) {
+  const open = pid === S.sel && S.meeting && S.meeting !== "new" ? S.feed.get(S.meeting) : null;
+  const t = S.newType.has(pid) ? S.newType.get(pid)
+    : open ? open.info.type || "" : remember("steno-type-" + pid) || "";
+  return projTypes(pid).some((x) => x.name === t) ? t : "";
+}
+function setRecType(pid, type) {
+  S.newType.set(pid, type || "");
+  remember("steno-type-" + pid, type || null);
+}
+function curType() {  // the type shown in the header: of the open meeting, or of the next one
+  if (S.meeting === "new") return recType(S.sel);
+  const m = S.feed.get(S.meeting);
+  return (m && m.info.type) || "";
+}
+
 function recProjectId() {
   const r = S.status.recorder || {};
   if (!r.session || r.state === "idle" || r.state === "error") return null;
@@ -466,6 +491,7 @@ function ensureSelection() {  // returns true when the selected project had to c
 function selectProject(id, meeting) {
   const same = S.sel === id;
   S.view = "project"; S.sel = id; S.meeting = meeting || null; S.unseen = 0;
+  if (meeting && meeting !== "new") S.newType.delete(id);  // the dock follows the open meeting
   if (!same) { S.feed.clear(); S.meetings = S.lists.get(id) || []; S.unknown.clear(); }
   if (!S.expanded.has(id)) { S.expanded.add(id); saveExpanded(); }
   remember("steno-project", id);
@@ -476,7 +502,8 @@ function selectProject(id, meeting) {
 
 const selectMeeting = (pid, sid) => selectProject(pid, sid);
 
-function newMeeting(pid) {
+function newMeeting(pid, type) {
+  if (type !== undefined) setRecType(pid, type);
   selectProject(pid, "new");
   setTimeout(() => { if (!$("rec-title").disabled) $("rec-title").focus(); }, 60);
 }
@@ -541,6 +568,12 @@ async function loadSettings() {
       onclick: async () => { LOOK.theme = v; paintSeg(); applyLook(); await saveLook({ theme: v }); paintSeg(); } }));
   }
   paintSeg();
+  const strip = h("input", { type: "checkbox", class: "switch", id: "set-mini" });
+  strip.checked = s.mini_strip !== false;
+  strip.addEventListener("change", async () => {
+    const res = await guarded(() => api("POST", "/api/settings", { mini_strip: strip.checked }));
+    if (!res) strip.checked = !strip.checked;
+  });
   const glass = h("input", { type: "checkbox", class: "switch", id: "set-transparent" });
   glass.checked = LOOK.transparent;
   glass.addEventListener("change", async () => {
@@ -553,7 +586,9 @@ async function loadSettings() {
       h("div", { class: "set-row static" },
         h("div", { class: "pn" }, h("div", { text: "Theme" }), h("div", { class: "sub", text: "System follows Windows' light or dark app mode." })), seg),
       h("label", { class: "set-row", for: "set-transparent" },
-        h("div", { class: "pn" }, h("div", { text: "Transparent background" }), h("div", { class: "sub", text: "Your wallpaper shows softly through the window. Off: solid background." })), glass)));
+        h("div", { class: "pn" }, h("div", { text: "Transparent background" }), h("div", { class: "sub", text: "Your wallpaper shows softly through the window. Off: solid background." })), glass),
+      h("label", { class: "set-row", for: "set-mini" },
+        h("div", { class: "pn" }, h("div", { text: "Mini strip while recording" }), h("div", { class: "sub", text: "A small bar with timer, Pause and Stop stays on top of other windows while Steno is not in front. Drag it anywhere; x hides it until the next recording. Hidden from screen sharing." })), strip)));
   const group = h("div", { class: "group" });
   page.append(h("h2", { class: "set-h", text: "After a meeting" }),
     h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Each step uses Claude (Haiku) and takes about 10-30 s. Off: use the buttons on each meeting." }),
@@ -594,12 +629,8 @@ function sideMeetings(id) {
   const every = (S.lists.get(id) || []).slice().reverse();  // newest first
   const list = every.filter((i) => !i.archived);
   const archived = every.filter((i) => i.archived);
-  const all = S.showAll.has(id);
-  const shown = all ? list : list.slice(0, SIDE_MEETINGS);
-  const items = [];
-  if (here && S.meeting === "new") {
-    items.push(h("div", { class: "mitem active draft" }, h("span", { class: "mi-title", text: S.pendingRec ? "Starting..." : "New meeting" })));
-  }
+  const types = id === "inbox" ? [] : projTypes(id);
+  const draft = () => h("div", { class: "mitem active draft" }, h("span", { class: "mi-title", text: S.pendingRec ? "Starting..." : "New meeting" }));
   const row = (info) => {
     const live = info.recording || (r.session === info.session && r.state && r.state !== "idle" && r.state !== "error");
     const active = here && S.meeting === info.session;
@@ -612,12 +643,43 @@ function sideMeetings(id) {
       live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: niceDate(info.started_at).replace(" · ", " ") })),
       more);
   };
-  for (const info of shown) items.push(row(info));
-  if (list.length > SIDE_MEETINGS) {
-    items.push(h("button", { class: "mitem more", type: "button", text: all ? "Show fewer" : `Show all ${list.length}`,
-      onclick: () => { if (all) S.showAll.delete(id); else S.showAll.add(id); renderSide(); } }));
+  const rows = (key, part) => {  // newest first, "Show all" past SIDE_MEETINGS
+    const all = S.showAll.has(key);
+    const out = (all ? part : part.slice(0, SIDE_MEETINGS)).map(row);
+    if (part.length > SIDE_MEETINGS) {
+      out.push(h("button", { class: "mitem more", type: "button", text: all ? "Show fewer" : `Show all ${part.length}`,
+        onclick: () => { if (all) S.showAll.delete(key); else S.showAll.add(key); renderSide(); } }));
+    }
+    return out;
+  };
+  const items = [];
+  const drafting = here && S.meeting === "new";
+  if (!types.length) {
+    if (drafting) items.push(draft());
+    items.push(...rows(id, list));
+    if (!items.length && S.lists.has(id)) items.push(h("div", { class: "mitem none", text: "No meetings yet" }));
+  } else {
+    const chosen = drafting ? recType(id) : null;
+    const groups = types.map((t) => [t.name, t.name]);
+    const untyped = list.filter((i) => !i.type || !types.some((t) => t.name === i.type));
+    if (untyped.length || chosen === "") groups.push(["", "No type"]);
+    for (const [type, label] of groups) {
+      const part = type ? list.filter((i) => i.type === type) : untyped;
+      const key = `${id}::${type}`;
+      const open = !S.folded.has(key) || chosen === type;
+      const body = [];
+      if (chosen === type) body.push(draft());
+      body.push(...rows(key, part));
+      if (!body.length && S.lists.has(id)) body.push(h("div", { class: "mitem none", text: "No meetings yet" }));
+      items.push(h("div", { class: "tnode" + (open ? " open" : "") },
+        h("div", { class: "trow" },
+          h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: type ? `${label}: ${(types.find((t) => t.name === type) || {}).folder || ""}` : "Meetings without a type (in Steno/)",
+            onclick: () => { if (open) S.folded.add(key); else S.folded.delete(key); remember("steno-folded", JSON.stringify([...S.folded])); renderSide(); } },
+          icon("chevron"), h("span", { class: "tname", text: label }), open ? null : h("span", { class: "tcount", text: String(part.length) })),
+          h("button", { class: "padd", type: "button", title: `New ${type ? label + " " : ""}meeting`, "aria-label": `New ${label} meeting`, onclick: () => newMeeting(id, type) }, icon("plus"))),
+        open ? h("div", { class: "tlist" }, body) : null));
+    }
   }
-  if (!items.length && S.lists.has(id)) items.push(h("div", { class: "mitem none", text: "No meetings yet" }));
   if (archived.length) {
     const open = S.showArchived.has(id);
     items.push(h("button", { class: "mitem more arch-toggle", type: "button",
@@ -714,7 +776,9 @@ function renderTop() {
   const r = S.status.recorder || {}, st = r.state || "idle";
   const active = st === "starting" || st === "recording" || st === "stopping";
   const proj = curProject();
-  $("proj-name").textContent = S.sel === "inbox" ? "Inbox" : proj ? proj.name : "";
+  const ctype = proj ? curType() : "";
+  $("proj-name").textContent = S.sel === "inbox" ? "Inbox" : proj ? proj.name + (ctype ? "  ›  " + ctype : "") : "";
+  renderTypeSelect(proj, active);
   $("btn-projmenu").hidden = !proj;
   const noProject = !S.sel;
   const dock = $("dock");
@@ -744,6 +808,77 @@ function renderTop() {
   dock.hidden = !$("empty").hidden;
   renderStrip();
   updateButtons();
+}
+
+function renderTypeSelect(proj, active) {
+  const sel = $("rec-type");
+  const types = proj ? proj.types || [] : [];
+  sel.hidden = !types.length;
+  sel.disabled = active;
+  if (!types.length) return;
+  const key = proj.id + "|" + types.map((t) => t.name).join("|");
+  if (sel.dataset.key !== key) {
+    sel.dataset.key = key;
+    sel.replaceChildren(...types.map((t) => h("option", { value: t.name, text: t.name })), h("option", { value: "", text: "No type" }));
+  }
+  sel.value = recType(proj.id);
+}
+
+/* Edit a project's meeting types: name + folder (inside the project) per row. */
+function typesModal(p) {
+  return new Promise((resolve) => {
+    const dlg = $("modal");
+    const list = h("div", { class: "typerows" });
+    const addRow = (t) => {
+      const name = h("input", { class: "text tn", type: "text", value: t.name || "", placeholder: "e.g. Board", maxlength: "80", autocomplete: "off" });
+      const folder = h("input", { class: "text tf", type: "text", value: t.folder || "", placeholder: "Meetings/Board", autocomplete: "off" });
+      let auto = !t.folder;  // follow the name until the folder is edited by hand
+      name.addEventListener("input", () => { if (auto) folder.value = name.value.trim() ? "Meetings/" + name.value.trim() : ""; });
+      folder.addEventListener("input", () => { auto = false; });
+      const rm = h("button", { class: "icon-btn", type: "button", title: "Remove type (only when it has no meetings)", "aria-label": "Remove type" }, icon("x"));
+      const row = h("div", { class: "typerow" }, name, folder, rm);
+      rm.addEventListener("click", () => row.remove());
+      list.append(row);
+      return name;
+    };
+    for (const t of p.types || []) addRow(t);
+    const err = h("p", { class: "ferr", role: "alert", hidden: true });
+    const finish =(v) => { resolve(v); if (dlg.open) dlg.close(); };
+    const form = h("form", { class: "mform", onsubmit: async (ev) => {
+      ev.preventDefault();
+      const types = [...list.children].map((row) => {
+        const [n, f] = row.querySelectorAll("input");
+        return { name: n.value.trim(), folder: f.value.trim() };
+      }).filter((t) => t.name || t.folder);
+      err.hidden = true;
+      try {
+        const res = await api("POST", `/api/projects/${encodeURIComponent(p.id)}/types`, { types });
+        finish(res.types);
+      } catch (e) { err.textContent = e.message; err.hidden = false; }  // toasts sit behind the dialog
+    } },
+    h("h3", { text: `Meeting types in ${p.name}` }),
+    h("p", { text: "Each type saves its meetings in its own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Meetings without a type stay in Steno/. No types = one simple list." }),
+    h("div", { class: "typehead" }, h("span", { text: "Name" }), h("span", { text: "Folder in the project" })),
+    list,
+    h("button", { class: "btn", type: "button", onclick: () => addRow({}).focus() }, icon("plus"), h("span", { text: "Add type" })),
+    err,
+    h("div", { class: "btns" },
+      h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) }),
+      h("button", { class: "btn primary", type: "submit", text: "Save" })));
+    dlg.replaceChildren(form);
+    dlg.addEventListener("close", () => resolve(null), { once: true });
+    dlg.showModal();
+    if (!(p.types || []).length) addRow({}).focus();
+  });
+}
+
+async function editTypes() {
+  const p = curProject();
+  if (!p) return;
+  const types = await typesModal(p);
+  if (!types) return;
+  toast(types.length ? `Meeting types saved (${types.length})` : "Meeting types removed: one simple list");
+  await loadProjects();
 }
 
 function sourcesOn() {
@@ -806,7 +941,11 @@ function renderStrip() {
   if (rp && (S.view !== "project" || rp !== S.sel)) {
     out.push(h("span", { text: "·" }), h("button", { class: "link", type: "button", text: "in " + projectName(rp), onclick: () => selectProject(rp) }));
   }
-  $("live-status").replaceChildren(...out);
+  const statusKey = out.map((n) => n.className + ":" + n.textContent).join("|");
+  if ($("live-status").dataset.key !== statusKey) {  // rebuilt every tick, the spinner restarted and stuttered
+    $("live-status").dataset.key = statusKey;
+    $("live-status").replaceChildren(...out);
+  }
   $("live-status").title = word;
 }
 
@@ -826,6 +965,8 @@ async function startRecording() {
   if (!S.sel) return;
   remember("steno-opts", JSON.stringify(S.opts));
   const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep };
+  const type = S.sel !== "inbox" ? recType(S.sel) : "";
+  if (type) body.type = type;
   const title = $("rec-title").value.trim();
   if (title) body.title = title;
   S.stick = true;
@@ -929,7 +1070,8 @@ function renderFeed() {
 }
 
 function newCard() {
-  const where = projectName(S.sel);
+  const type = S.sel !== "inbox" ? recType(S.sel) : "";
+  const where = projectName(S.sel) + (type ? " · " + type : "");
   return h("div", { class: "newcard" },
     h("div", { class: "newicon" }, S.pendingRec ? h("span", { class: "spinner big" }) : icon("mic")),
     h("h2", { text: S.pendingRec ? "Starting the recording" : `New meeting in ${where}` }),
@@ -1020,7 +1162,7 @@ function meetingItems(info, pid, titleBtn) {
   items.push(
     { label: "Copy transcript", icon: "copy", onclick: () => guarded(async () => copyText(await meetingTranscript(info), "Transcript")) },
     { label: "Rename", icon: "pencil", onclick: () => (titleBtn && titleBtn.isConnected ? renameMeeting(S.feed.get(sid), titleBtn) : guarded(() => renameByDialog(info))) },
-    { label: "Move to project...", icon: "move", disabled: live || !S.projects.length, onclick: () => guarded(() => moveMeeting(info, pid)) },
+    { label: "Move...", sub: "Other project or meeting type", icon: "move", disabled: live || !S.projects.length, onclick: () => guarded(() => moveMeeting(info, pid)) },
     "-",
     info.archived
       ? { label: "Unarchive", sub: "Show it in the list again", icon: "unarchive", onclick: () => guarded(() => archiveMeeting(info, pid, false)) }
@@ -1278,11 +1420,21 @@ function renameMeeting(m, btn) {
 }
 
 async function moveMeeting(info, current) {
-  const options = S.projects.map((p) => ({ value: p.id, label: p.name }));
-  const v = await formModal({ title: "Move to project", text: "The meeting folder is moved to the project's Steno folder.", fields: [{ key: "project", label: "Project", options, value: current }], ok: "Move" });
-  if (!v || v.project === current) return;
-  await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: v.project });
-  toast(`Moved to ${projectName(v.project)}`);
+  const options = [];
+  for (const p of S.projects) {
+    const types = p.types || [];
+    options.push({ value: p.id, label: types.length ? `${p.name} (no type)` : p.name });
+    for (const t of types) options.push({ value: `${p.id}|${t.name}`, label: `${p.name} › ${t.name}` });
+  }
+  const here = current + (info.type ? "|" + info.type : "");
+  const v = await formModal({ title: "Move meeting", text: "The meeting folder is moved along: into the type's folder, or into Steno/ without a type.", fields: [{ key: "to", label: "Move to", options, value: here }], ok: "Move" });
+  if (!v || v.to === here) return;
+  const cut = v.to.indexOf("|");
+  const pid = cut < 0 ? v.to : v.to.slice(0, cut), type = cut < 0 ? null : v.to.slice(cut + 1);
+  v.project = pid;
+  await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: pid, type });
+  toast(`Moved to ${projectName(pid)}${type ? " › " + type : ""}`);
+  if (S.feed.has(info.session)) S.feed.get(info.session).info.type = type;
   const open = S.sel === current && S.meeting === info.session;
   if (!S.expanded.has(v.project)) { S.expanded.add(v.project); saveExpanded(); }
   await loadProjects();
@@ -1567,6 +1719,8 @@ function init() {
   $("empty-new").addEventListener("click", () => guarded(newProject));
   $("empty-add").addEventListener("click", () => guarded(addProject));
   $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => [
+    { label: "Meeting types...", sub: "Board, 1-1, ... each in its own folder", icon: "tag", onclick: () => guarded(editTypes) },
+    "-",
     { label: "Forget project", sub: "Files stay on disk", icon: "forget", danger: true, onclick: () => guarded(forgetProject) }]));
   $("nav-people").addEventListener("click", showPeople);
   $("nav-settings").addEventListener("click", showSettings);
@@ -1579,6 +1733,7 @@ function init() {
   $("btn-pause").addEventListener("click", () => recordCmd((S.status.recorder || {}).paused ? "resume" : "pause"));
   $("btn-stop").addEventListener("click", () => recordCmd("stop"));
   $("btn-src").addEventListener("click", () => showMenu($("btn-src"), sourceMenu));
+  $("rec-type").addEventListener("change", () => { if (S.sel && S.sel !== "inbox") { setRecType(S.sel, $("rec-type").value); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); } });
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });
   $("jump").addEventListener("click", () => { S.stick = true; scrollToEnd(); });

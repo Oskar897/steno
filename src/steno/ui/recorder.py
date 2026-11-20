@@ -134,6 +134,7 @@ class Recorder:
         self.segments = 0
         self.paused = False
         self.project: projects.Project | None = None
+        self.mtype: str | None = None  # meeting type within the project
         self._title: str | None = None
         self._mirror_dirty = False
         self._engine: Engine | None = None
@@ -167,6 +168,7 @@ class Recorder:
                 "state": self.state,
                 "paused": self.paused,
                 "project": self.project.id if self.project is not None else None,
+                "type": self.mtype,
                 "error": self.error,
                 "session": self.session_id,
                 "keep_audio": self.keep_audio,
@@ -183,7 +185,8 @@ class Recorder:
     # -- control ------------------------------------------------------------------
 
     def start(self, *, keep_audio: bool, mic: bool, loopback: bool,
-              project: projects.Project | None = None, title: str | None = None) -> None:
+              project: projects.Project | None = None, title: str | None = None,
+              mtype: str | None = None) -> None:
         if not (mic or loopback):
             raise RecorderError("nothing to record: enable the microphone or system audio")
         with self._lock:
@@ -197,6 +200,7 @@ class Recorder:
             self.segments = 0
             self.paused = False
             self.project = project
+            self.mtype = mtype
             self._title = title
             self.last_segment_at = None
             self._t0 = None
@@ -229,7 +233,7 @@ class Recorder:
             return
         if self.project is not None:
             try:
-                projects.create_meeting(self.project, session_dir, self._title)
+                projects.create_meeting(self.project, session_dir, self._title, self.mtype)
             except Exception:  # recording goes on; the session stays in the inbox
                 log.exception("Could not create the meeting folder")
         with self._lock:

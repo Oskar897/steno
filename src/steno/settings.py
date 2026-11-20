@@ -34,6 +34,8 @@ class AppSettings:
     theme: str = "system"
     # Desktop app: the desktop shows through the window (Mica); off = solid panels.
     transparent: bool = True
+    # Desktop app: a small always-on-top strip (timer, pause, stop) while recording.
+    mini_strip: bool = True
 
 
 def clean_terms(values: Any) -> list[str]:

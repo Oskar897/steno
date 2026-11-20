@@ -1,0 +1,41 @@
+/* Mini strip: the small always-on-top recording window (pause, stop, hide; drag to move). */
+:root {
+  --bg: #1f1f25; --fill: rgba(255, 255, 255, 0.07); --fill-hi: rgba(255, 255, 255, 0.14);
+  --text: #f2f2f5; --dim: #b4b4be; --faint: #6f6f7a; --accent: #ff5a1f;
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+html.light {
+  --bg: #f6f6f8; --fill: rgba(0, 0, 0, 0.05); --fill-hi: rgba(0, 0, 0, 0.1);
+  --text: #18181c; --dim: #4c4c56; --faint: #9a9aa4;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); user-select: none; }
+button { font: inherit; color: inherit; }
+.strip { display: flex; align-items: center; gap: 4px; height: 100%; padding: 0 4px 0 5px; cursor: grab; }
+.strip:active { cursor: grabbing; }
+.grip { display: grid; grid-template-columns: 2px 2px; gap: 2px; padding: 0 2px; flex: none; }
+.grip i { width: 2px; height: 2px; border-radius: 1px; background: var(--faint); }
+.open { display: grid; place-items: center; width: 20px; height: 22px; flex: none; padding: 0; border: 0; border-radius: 6px; background: none; cursor: pointer; }
+.open:hover { background: var(--fill-hi); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 2.5px rgba(255, 90, 31, 0.22); animation: pulse 1.6s ease-in-out infinite; }
+.strip[data-state="paused"] .dot { animation: none; background: var(--faint); box-shadow: none; }
+.time { min-width: 36px; font-variant-numeric: tabular-nums; font-size: 12.5px; font-weight: 600; letter-spacing: 0.01em; }
+.strip[data-state="paused"] .time { color: var(--dim); }
+.bars { display: inline-flex; align-items: center; gap: 2px; height: 12px; margin-right: 2px; flex: 1; }
+.bars i { display: block; width: 2.5px; height: 12px; border-radius: 2px; background: var(--dim); transform: scaleY(0.15); transition: transform 0.12s linear; }
+.strip[data-state="paused"] .bars i { transform: scaleY(0.15) !important; opacity: 0.5; }
+.b { display: grid; place-items: center; width: 24px; height: 24px; flex: none; padding: 0; border: 0; border-radius: 6px; background: var(--fill); cursor: pointer; transition: background 0.12s; }
+.b:hover { background: var(--fill-hi); }
+.b:disabled { opacity: 0.4; cursor: default; }
+.b svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.b.stop { background: var(--accent); color: #fff; }
+.b.stop:hover { background: #ff7a42; }
+.b.stop svg { fill: currentColor; width: 11px; height: 11px; }
+.b.hide { width: 18px; background: none; color: var(--faint); }
+.b.hide:hover { background: var(--fill); color: var(--text); }
+.b.hide svg { width: 11px; height: 11px; }
+.ic-play { display: none; }
+.strip[data-state="paused"] .ic-play { display: block; fill: currentColor; }
+.strip[data-state="paused"] .ic-pause { display: none; }
+@keyframes pulse { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .dot { animation: none; } .bars i { transition: none; } }

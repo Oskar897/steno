@@ -159,7 +159,12 @@ def test_page_needs_token_and_assets_are_self_contained(make_ui):
     assert "default-src 'none'" in csp and "script-src 'self'" in csp
     assert resp.getheader("Access-Control-Allow-Origin") is None
 
-    for name, ctype in (("app.js", "javascript"), ("style.css", "text/css")):
+    assert c.raw("GET", "/mini", token=None)[0] == 403
+    status, _, body = c.raw("GET", f"/mini?token={server.token}", token=None)
+    assert status == 200 and b"mini.js" in body
+
+    for name, ctype in (("app.js", "javascript"), ("style.css", "text/css"),
+                        ("mini.js", "javascript"), ("mini.css", "text/css")):
         status, resp, body = c.raw("GET", f"/static/{name}", token=None)
         assert status == 200 and ctype in resp.getheader("Content-Type") and body
     assert c.raw("GET", "/static/../server.py", token=None)[0] == 404
@@ -600,3 +605,59 @@ def test_clean_is_a_job_kind(make_ui):
     _, c = make_ui(runners={"clean": lambda d, p, progress: "done"})
     status, res = c.post(f"/api/sessions/{writer.session_id}/jobs", {"kind": "clean"})
     assert status == 200 and res["job"]["kind"] == "clean"
+
+
+def test_mini_strip_follows_the_recorder_focus_x_and_the_setting(monkeypatch):
+    import threading
+    import types
+
+    from steno import settings
+    from steno.ui import window
+
+    calls = []
+    mini = types.SimpleNamespace(show=lambda: calls.append("show"),
+                                 hide=lambda: calls.append("hide"))
+    rec = types.SimpleNamespace(state="idle", session_id=None)
+    bridge = window.MiniBridge()
+    bridge._main_hwnd = 111
+    bridge._mini = mini
+    front = {"hwnd": 222}  # some other app is in front
+    monkeypatch.setattr(window, "prepare_mini", lambda w=None: True)
+
+    def run():
+        stop = threading.Event()
+        t = threading.Thread(target=window.watch_mini, args=(mini, rec, stop, 0.01),
+                             kwargs={"bridge": bridge, "foreground": lambda: front["hwnd"]},
+                             daemon=True)
+        t.start()
+        return stop, t
+
+    stop, t = run()
+    try:
+        rec.state = "recording"
+        wait_for(lambda: calls == ["show"])
+        front["hwnd"] = 111  # Steno itself in front: no strip
+        wait_for(lambda: calls == ["show", "hide"])
+        front["hwnd"] = 222
+        wait_for(lambda: calls[-1] == "show")
+        bridge.dismiss()  # x: gone for this recording, even with another app in front
+        time.sleep(0.1)
+        assert calls[-1] == "hide"
+        rec.state = "stopping"
+        time.sleep(0.05)
+        rec.state = "recording"  # the next recording shows it again
+        wait_for(lambda: calls[-1] == "show")
+        rec.state = "stopping"  # Stop hides it at once
+        wait_for(lambda: calls[-1] == "hide")
+    finally:
+        stop.set()
+        t.join(timeout=2)
+
+    settings.update({"mini_strip": False})  # switched off in Settings: never shown
+    calls.clear()
+    rec.state = "recording"
+    stop, t = run()
+    time.sleep(0.15)
+    stop.set()
+    t.join(timeout=2)
+    assert calls == []

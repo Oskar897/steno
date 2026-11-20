@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from steno import projects
 from steno.audio import AudioChunk
@@ -42,7 +43,7 @@ def test_meeting_folder_lifecycle(tmp_path):
     b = projects.add_project(tmp_path, name="B", create=True)
     writer = make_session("2026-01-01T10:30:00", LINES)
     m = projects.create_meeting(a, writer.dir, "Kickoff?")
-    assert m.folder.name == "2026-01-01 10.30 Kickoff" and m.folder.parent == a.steno_dir
+    assert m.folder.name == "2026-01-01 Kickoff" and m.folder.parent == a.steno_dir
     text = (m.folder / "transcript.md").read_text(encoding="utf-8")
     assert text.startswith("# Kickoff") and "Hello there everyone" in text
     assert "**recording**" in (a.steno_dir / "index.md").read_text(encoding="utf-8")
@@ -54,7 +55,7 @@ def test_meeting_folder_lifecycle(tmp_path):
     assert (m.folder / "summary.md").is_file()
 
     r = projects.rename_meeting(writer.dir, "Planning")
-    assert r.folder.name == "2026-01-01 10.30 Planning" and not m.folder.exists()
+    assert r.folder.name == "2026-01-01 Planning" and not m.folder.exists()
     assert projects.meeting_title(writer.dir) == "Planning"
 
     mv = projects.move_meeting(writer.dir, b)
@@ -152,3 +153,73 @@ def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
 
     assert c.raw("DELETE", f"/api/projects/{pid}")[0] == 200
     assert c.get(f"/api/projects/{pid}/meetings")[0] == 404
+
+
+def test_meeting_types_put_meetings_in_their_own_folders(tmp_path):
+    p = projects.add_project(tmp_path, name="Club", create=True)
+    for bad in ("..", "../x", "C:/x", "/abs", "Steno", "a/b/c/d/e"):
+        with pytest.raises(projects.ProjectError):
+            projects.set_types(p.id, [{"name": "X", "folder": bad}])
+    with pytest.raises(projects.ProjectError):
+        projects.set_types(p.id, [{"name": "A", "folder": "x"}, {"name": "a", "folder": "y"}])
+    p = projects.set_types(p.id, [{"name": "Board", "folder": r"Meetings\Board"},
+                                  {"name": "1-1"}])
+    assert [(t.name, t.folder) for t in p.types] == [("Board", "Meetings/Board"),
+                                                    ("1-1", "Meetings/1-1")]
+
+    w1 = make_session("2026-11-20T10:00:00", LINES)
+    m1 = projects.create_meeting(p, w1.dir, "Lobby days", "board")
+    assert m1.folder == p.path / "Meetings" / "Board" / "2026-11-20 Lobby days"
+    assert (m1.folder / ".gitignore").is_file()
+    assert projects.type_of(w1.dir) == "Board" and projects.project_of(w1.dir).id == p.id
+    w2 = make_session("2026-11-21T10:00:00", LINES)
+    projects.create_meeting(p, w2.dir, "Plain")  # no type: Steno/ as before
+    assert projects.type_of(w2.dir) is None
+    assert [m.session for m in projects.list_meetings(p)] == [w1.dir.name, w2.dir.name]
+    index = (p.steno_dir / "index.md").read_text(encoding="utf-8")
+    assert "`Meetings/Board/2026-11-20 Lobby days/` (Board)" in index
+    with pytest.raises(projects.ProjectError):
+        projects.create_meeting(p, w2.dir, "x", "Nope")
+
+    # a type with meetings cannot be dropped or re-pointed; an empty one can
+    with pytest.raises(projects.ProjectError):
+        projects.set_types(p.id, [{"name": "1-1"}])
+    p = projects.set_types(p.id, [{"name": "Styrelse", "folder": "Meetings/Board"}])
+    assert projects.type_of(w1.dir) == "Styrelse"
+
+    mv = projects.move_meeting(w2.dir, p, "Styrelse")
+    assert mv.folder.parent == p.path / "Meetings" / "Board"
+    mv = projects.move_meeting(w1.dir, p)  # back to no type
+    assert mv.folder.parent == p.steno_dir and projects.type_of(w1.dir) is None
+    projects.delete_meeting(w2.dir)
+    assert not (p.path / "Meetings" / "Board" / "2026-11-21 Plain").exists()
+    assert (p.path / "Meetings" / "Board").is_dir()
+
+
+def test_meeting_types_api(make_ui, tmp_path):
+    _, c = make_ui(engine_factory=fake_engine_factory(burst_audio()))
+    pid = c.post("/api/projects", {"path": str(tmp_path), "name": "Club",
+                                   "create": True})[1]["project"]["id"]
+    assert c.post(f"/api/projects/{pid}/types", {"types": "Board"})[0] == 400
+    assert c.post(f"/api/projects/{pid}/types", {"types": [{"name": "B", "folder": ".."}]})[0] \
+        == 400
+    res = c.post(f"/api/projects/{pid}/types", {"types": [{"name": "Board"}]})[1]
+    assert res["types"] == [{"name": "Board", "folder": "Meetings/Board"}]
+    assert c.get("/api/projects")[1]["projects"][0]["types"] == res["types"]
+    assert c.post("/api/record/start", {"mic": True, "loopback": False, "project": pid,
+                                        "type": "Nope"})[0] == 400
+
+    c.post("/api/record/start", {"mic": True, "loopback": False, "project": pid,
+                                 "type": "Board", "title": "Lobby days"})
+    rec = wait_for(lambda: (r := c.get("/api/status")[1]["recorder"])["state"] == "recording"
+                   and r)
+    assert rec["type"] == "Board"
+    time.sleep(0.2)
+    c.post("/api/record/stop")
+    wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")
+    m = c.get(f"/api/projects/{pid}/meetings")[1]["meetings"][0]
+    assert m["type"] == "Board" and "Board" in m["folder"]
+    sid = m["session"]
+    assert c.get(f"/api/sessions/{sid}")[1]["type"] == "Board"
+    assert c.post(f"/api/meetings/{sid}/move", {"project": pid, "type": None})[1]["type"] is None
+    assert c.get(f"/api/projects/{pid}/meetings")[1]["meetings"][0]["type"] is None

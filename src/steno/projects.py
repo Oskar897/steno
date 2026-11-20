@@ -7,10 +7,16 @@ Layout::
         .gitignore            # "*": meeting text never ends up in a git repo by accident
         CLAUDE.md             # how Claude Code should read the meetings (cheap first)
         index.md              # one line per meeting, newest first
-        2026-11-19 10.30 Sprint planning/
+        2026-11-19 Sprint planning/
+          .gitignore          # "*", also in meeting folders outside Steno/
           .steno-meeting.json # {"session": "<id>", "title": "..."}
           transcript.md       # best text so far; rewritten while recording
           summary.md, todo.md # only after you asked for them
+      Meetings/Board/         # optional meeting types: each has its own folder
+        2026-11-20 Lobby days and build night/
+
+A project can have meeting types (``Board`` -> ``Meetings/Board``). Without types every
+meeting goes into ``Steno/``; meetings without a type stay there when types exist.
 
 The session itself (JSONL, revisions, voice windows, kept audio) stays in the global data
 dir (``steno.paths``); its ``meeting.json`` points to the meeting folder. Voice profiles
@@ -48,8 +54,18 @@ _BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _lock = threading.RLock()
 
 
+MAX_TYPES = 30
+MAX_TYPE_DEPTH = 4
+
+
 class ProjectError(ValueError):
     """A request about projects that cannot be honoured; the message is shown to the user."""
+
+
+@dataclass(frozen=True)
+class MeetingType:
+    name: str
+    folder: str  # relative to the project folder, "/"-separated
 
 
 @dataclass(frozen=True)
@@ -57,10 +73,22 @@ class Project:
     id: str
     name: str
     path: Path
+    types: tuple[MeetingType, ...] = ()
 
     @property
     def steno_dir(self) -> Path:
         return self.path / STENO_DIRNAME
+
+    def type_dir(self, mtype: MeetingType) -> Path:
+        return self.path.joinpath(*mtype.folder.split("/"))
+
+    def find_type(self, name: str | None) -> MeetingType | None:
+        if not name:
+            return None
+        for t in self.types:
+            if t.name.casefold() == name.casefold():
+                return t
+        raise ProjectError(f"no meeting type {name!r} in {self.name}")
 
 
 @dataclass(frozen=True)
@@ -82,27 +110,94 @@ def _registry() -> Path:
     return paths.data_dir() / REGISTRY_NAME
 
 
-def _load() -> list[str]:
+def _load_entries() -> list[dict]:
     try:
         data = json.loads(_registry().read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return []
-    return [p["path"] for p in data.get("projects", []) if isinstance(p, dict) and p.get("path")]
+    return [p for p in data.get("projects", []) if isinstance(p, dict) and p.get("path")]
 
 
-def _save(items: list[str]) -> None:
+def _save_entries(entries: list[dict]) -> None:
     atomic_write_text(_registry(), json.dumps(
-        {"projects": [{"path": p} for p in items]}, indent=2, ensure_ascii=False) + "\n")
+        {"projects": entries}, indent=2, ensure_ascii=False) + "\n")
+
+
+def _types_of(entry: dict) -> tuple[MeetingType, ...]:
+    out = []
+    for t in entry.get("types") or []:
+        if isinstance(t, dict) and t.get("name") and t.get("folder"):
+            try:
+                out.append(MeetingType(str(t["name"]), clean_type_folder(str(t["folder"]))))
+            except ProjectError:
+                log.warning("ignoring a meeting type with a bad folder: %r", t.get("folder"))
+    return tuple(out)
 
 
 def list_projects() -> list[Project]:
     """Registered projects whose folder still exists, in the order they were added."""
     out = []
-    for p in _load():
-        path = Path(p)
+    for entry in _load_entries():
+        path = Path(entry["path"])
         if path.is_dir():
-            out.append(Project(project_id(path), path.name, path))
+            out.append(Project(project_id(path), path.name, path, _types_of(entry)))
     return out
+
+
+def clean_type_folder(folder: str) -> str:
+    """A safe folder path inside the project: ``Meetings/Board``; no ``..``, not ``Steno``."""
+    raw = (folder or "").strip()
+    if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
+        raise ProjectError("give a folder inside the project, not a full path")
+    parts = [p for p in re.split(r"[\\/]+", raw) if p.strip()]
+    if not parts or len(parts) > MAX_TYPE_DEPTH:
+        raise ProjectError(f"give a folder inside the project, at most {MAX_TYPE_DEPTH} levels")
+    out = []
+    for part in parts:
+        if part.strip().strip(".") == "":
+            raise ProjectError("the folder must stay inside the project")
+        name = clean_title(part, "")
+        if not name:
+            raise ProjectError(f"not a valid folder name: {part!r}")
+        out.append(name)
+    if len(out) == 1 and out[0].casefold() == STENO_DIRNAME.casefold():
+        raise ProjectError("Steno/ holds the meetings without a type; pick another folder")
+    return "/".join(out)
+
+
+def set_types(pid: str, types: list[dict]) -> Project:
+    """Replace a project's meeting types. Folders of types that hold meetings cannot be
+    removed or moved (the meetings would fall out of the app)."""
+    project = get_project(pid)
+    if len(types) > MAX_TYPES:
+        raise ProjectError(f"at most {MAX_TYPES} meeting types")
+    new: list[MeetingType] = []
+    for t in types:
+        if not isinstance(t, dict):
+            raise ProjectError("a meeting type is {name, folder}")
+        name = clean_title(str(t.get("name") or ""), "")
+        if not name:
+            raise ProjectError("every meeting type needs a name")
+        folder = clean_type_folder(str(t.get("folder") or f"Meetings/{name}"))
+        if any(x.name.casefold() == name.casefold() for x in new):
+            raise ProjectError(f"two meeting types are called {name!r}")
+        if any(x.folder.casefold() == folder.casefold() for x in new):
+            raise ProjectError(f"two meeting types use the folder {folder!r}")
+        new.append(MeetingType(name, folder))
+    kept = {t.folder.casefold() for t in new}
+    for old in project.types:
+        if old.folder.casefold() not in kept and _meeting_dirs(project.type_dir(old)):
+            raise ProjectError(f"{old.name} has meetings: move or delete them before "
+                               "removing the type or changing its folder")
+    with _lock:
+        entries = _load_entries()
+        for entry in entries:
+            if project_id(Path(entry["path"])) == pid:
+                entry["types"] = [{"name": t.name, "folder": t.folder} for t in new]
+        _save_entries(entries)
+    project = get_project(pid)
+    write_index(project)
+    return project
 
 
 def get_project(pid: str) -> Project:
@@ -134,11 +229,11 @@ def add_project(path: str | Path, *, name: str | None = None, create: bool = Fal
         raise ProjectError(f"folder not found: {base}")
     base = base.resolve()
     with _lock:
-        items = _load()
-        if not any(project_id(Path(p)) == project_id(base) for p in items):
-            items.append(str(base))
-            _save(items)
-    project = Project(project_id(base), base.name, base)
+        entries = _load_entries()
+        if not any(project_id(Path(p["path"])) == project_id(base) for p in entries):
+            entries.append({"path": str(base)})
+            _save_entries(entries)
+    project = get_project(project_id(base))
     ensure_steno_dir(project)
     return project
 
@@ -146,8 +241,8 @@ def add_project(path: str | Path, *, name: str | None = None, create: bool = Fal
 def remove_project(pid: str) -> None:
     """Forget a project. Its files stay where they are."""
     with _lock:
-        items = [p for p in _load() if project_id(Path(p)) != pid]
-        _save(items)
+        entries = [p for p in _load_entries() if project_id(Path(p["path"])) != pid]
+        _save_entries(entries)
 
 
 def ensure_steno_dir(project: Project) -> Path:
@@ -166,8 +261,9 @@ def ensure_steno_dir(project: Project) -> Path:
 CLAUDE_MD = f"""{_CLAUDE_MARK}
 # Meetings (written by Steno)
 
-Each folder here is one meeting, named `YYYY-MM-DD HH.MM <title>`; the newest sorts last.
-`index.md` lists them all, newest first, with what each folder contains.
+Each meeting is one folder named `YYYY-MM-DD <title>`. Meetings without a type are
+here; meetings with a type (Board, 1-1, ...) are in that type's folder in the project.
+`index.md` lists them all, newest first, with their path from the project folder.
 
 How to read them (save tokens):
 1. Start with `index.md`.
@@ -210,21 +306,60 @@ def meeting_title(session_dir: Path) -> str:
     return str(_read_json(Path(session_dir) / LINK_NAME).get("title") or DEFAULT_TITLE)
 
 
-def project_of(session_dir: Path) -> Project | None:
-    folder = meeting_folder(session_dir)
-    if folder is None:
-        return None
-    root = folder.parent.parent
+def _key(path: Path) -> str:
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _place(folder: Path) -> tuple[Project, MeetingType | None] | None:
+    """Which project (and meeting type) a meeting folder belongs to, from where it lies."""
+    parent = _key(folder.parent)
     for p in list_projects():
-        if project_id(p.path) == project_id(root):
-            return p
+        if parent == _key(p.steno_dir):
+            return p, None
+        for t in p.types:
+            if parent == _key(p.type_dir(t)):
+                return p, t
     return None
 
 
+def project_of(session_dir: Path) -> Project | None:
+    folder = meeting_folder(session_dir)
+    place = _place(folder) if folder is not None else None
+    return place[0] if place else None
+
+
+def type_of(session_dir: Path) -> str | None:
+    """The meeting type's name, or None (no project, or no type)."""
+    folder = meeting_folder(session_dir)
+    place = _place(folder) if folder is not None else None
+    return place[1].name if place and place[1] else None
+
+
 def _prefix(session_id: str) -> str:
-    """``20261119-103005`` -> ``2026-11-19 10.30``."""
+    """``20261119-103005`` -> ``2026-11-19`` (folder names: date and title)."""
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})-.*", session_id)
+    return f"{m[1]}-{m[2]}-{m[3]}" if m else session_id
+
+
+def _when(session_id: str) -> str:
+    """``20261119-103005`` -> ``2026-11-19 10.30`` (shown inside transcripts)."""
     m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\d{2}.*", session_id)
     return f"{m[1]}-{m[2]}-{m[3]} {m[4]}.{m[5]}" if m else session_id
+
+
+def _parent_dir(project: Project, mtype: MeetingType | None) -> Path:
+    ensure_steno_dir(project)
+    if mtype is None:
+        return project.steno_dir
+    d = project.type_dir(mtype)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _meeting_dirs(parent: Path) -> list[Path]:
+    if not parent.is_dir():
+        return []
+    return [f for f in parent.iterdir() if f.is_dir() and (f / MEETING_FILE).is_file()]
 
 
 def _free_folder(parent: Path, name: str, keep: Path | None = None) -> Path:
@@ -235,16 +370,21 @@ def _free_folder(parent: Path, name: str, keep: Path | None = None) -> Path:
 
 
 def _link(session_dir: Path, folder: Path, title: str) -> None:
+    gi = folder / ".gitignore"
+    if not gi.exists():
+        gi.write_text("# Meeting text is private: keep it out of git.\n*\n", encoding="utf-8")
     atomic_write_text(folder / MEETING_FILE, json.dumps(
         {"session": session_dir.name, "title": title}, ensure_ascii=False) + "\n")
     atomic_write_text(session_dir / LINK_NAME, json.dumps(
         {"folder": str(folder), "title": title}, ensure_ascii=False) + "\n")
 
 
-def create_meeting(project: Project, session_dir: Path, title: str | None = None) -> Meeting:
+def create_meeting(project: Project, session_dir: Path, title: str | None = None,
+                   mtype: str | None = None) -> Meeting:
     title = clean_title(title)
+    kind = project.find_type(mtype)
     with _lock:
-        parent = ensure_steno_dir(project)
+        parent = _parent_dir(project, kind)
         folder = _free_folder(parent, f"{_prefix(session_dir.name)} {title}")
         folder.mkdir()
         _link(session_dir, folder, title)
@@ -254,14 +394,16 @@ def create_meeting(project: Project, session_dir: Path, title: str | None = None
 
 
 def list_meetings(project: Project) -> list[Meeting]:
-    """Meetings of a project, oldest first."""
-    d = project.steno_dir
+    """Meetings of a project (``Steno/`` and every type folder), oldest first."""
     out = []
-    if d.is_dir():
-        for f in d.iterdir():
-            meta = _read_json(f / MEETING_FILE) if f.is_dir() else {}
-            if meta.get("session"):
-                out.append(Meeting(str(meta["session"]), str(meta.get("title") or ""), f))
+    seen: set[str] = set()
+    for parent in [project.steno_dir, *(project.type_dir(t) for t in project.types)]:
+        for f in _meeting_dirs(parent):
+            meta = _read_json(f / MEETING_FILE)
+            sid = str(meta.get("session") or "")
+            if sid and sid not in seen:
+                seen.add(sid)
+                out.append(Meeting(sid, str(meta.get("title") or ""), f))
     return sorted(out, key=lambda m: m.session)
 
 
@@ -290,13 +432,16 @@ def rename_meeting(session_dir: Path, title: str) -> Meeting:
     return Meeting(Path(session_dir).name, title, target)
 
 
-def move_meeting(session_dir: Path, project: Project) -> Meeting:
+def move_meeting(session_dir: Path, project: Project, mtype: str | None = None) -> Meeting:
     session_dir = Path(session_dir)
     old_project = project_of(session_dir)
     folder = meeting_folder(session_dir)
     title = meeting_title(session_dir)
+    kind = project.find_type(mtype)
     with _lock:
-        parent = ensure_steno_dir(project)
+        parent = _parent_dir(project, kind)
+        if folder is not None and _key(folder.parent) == _key(parent):
+            return Meeting(session_dir.name, title, folder)  # already there
         target = _free_folder(parent, f"{_prefix(session_dir.name)} {title}")
         if folder is None:
             target.mkdir()
@@ -328,10 +473,11 @@ def delete_meeting(session_dir: Path) -> None:
     """Delete a meeting for good: its session dir (transcript, embeddings, audio) and its
     meeting folder in the project. Only a folder whose marker names this session is removed."""
     session_dir = Path(session_dir)
-    project = project_of(session_dir)
     folder = meeting_folder(session_dir)
+    place = _place(folder) if folder is not None else None
+    project = place[0] if place else None
     with _lock:
-        if folder is not None and folder.parent.name == STENO_DIRNAME:
+        if folder is not None and place is not None:  # only where Steno puts meetings
             shutil.rmtree(folder)
         shutil.rmtree(session_dir)
     if project is not None:
@@ -346,7 +492,7 @@ def render_transcript(session_dir: Path, title: str, *, recording: bool = False)
 
     segments, kind = llm.load_transcript(session_dir)
     state = "recording, lines may still improve" if recording else f"{kind} text"
-    head = f"# {title}\n\n_{_prefix(session_dir.name)} · {state}_\n\n"
+    head = f"# {title}\n\n_{_when(session_dir.name)} · {state}_\n\n"
     return head + transcript.render_markdown(segments) + "\n"
 
 
@@ -373,11 +519,18 @@ def sync(session_dir: Path, *, recording: bool = False, docs: bool = True) -> Pa
 def write_index(project: Project, recording: str | None = None) -> None:
     """``Steno/index.md``: newest first; ``recording`` is the session being recorded."""
     lines = [f"# Meetings in {project.name}", "",
-             "Newest first. Files: transcript.md always; summary.md / todo.md when made.", ""]
+             "Newest first; paths from the project folder. Files: transcript.md always; "
+             "summary.md / todo.md when made.", ""]
     for m in reversed(list_meetings(project)):
         files = ["transcript.md"] + [n for n in COPIED if (m.folder / n).is_file()]
         mark = " — **recording**" if m.session == recording else ""
-        lines.append(f"- `{m.folder.name}/`{mark}: {', '.join(files)}")
+        place = _place(m.folder)
+        kind = f" ({place[1].name})" if place and place[1] else ""
+        try:
+            rel = m.folder.relative_to(project.path).as_posix()
+        except ValueError:
+            rel = m.folder.name
+        lines.append(f"- `{rel}/`{kind}{mark}: {', '.join(files)}")
     try:
         atomic_write_text(ensure_steno_dir(project) / "index.md", "\n".join(lines) + "\n")
     except OSError:

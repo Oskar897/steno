@@ -8,10 +8,12 @@ through, blurred) and a dark title bar; elsewhere it is a plain dark window.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import sys
 import threading
+import time
 from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -32,6 +34,12 @@ _DWMWA_WINDOW_CORNER_PREFERENCE = 33
 _DWMWA_SYSTEMBACKDROP_TYPE = 38
 _DWMSBT_MAINWINDOW = 2  # Mica: the wallpaper, smoothly blurred (not the windows behind)
 _DWMWCP_ROUND = 2
+_WDA_EXCLUDEFROMCAPTURE = 0x11  # SetWindowDisplayAffinity: not in screen shares/recordings
+
+MINI_TITLE = "Steno recording"
+MINI_SIZE = (196, 34)
+MINI_PLACE_NAME = "mini-strip.json"  # in the data dir: where the strip was dragged to
+MINI_SHOW_STATES = ("starting", "recording")  # Stop hides it at once ("stopping")
 
 
 class _Margins(ctypes.Structure):
@@ -94,6 +102,183 @@ class Bridge:
             return False
         os.startfile(folder)  # noqa: S606 - a folder path we resolved ourselves
         return True
+
+
+class MiniBridge:
+    """Functions the mini strip may call. Also the strip's shared state for ``watch_mini``."""
+
+    def __init__(self) -> None:
+        self._main = None
+        self._mini = None
+        self._main_hwnd = 0  # set once the main window is shown
+        self._dismissed = False  # hidden with x for the running recording
+        self._drag: tuple | None = None  # (hwnd, x, y, scale) while dragging
+
+    def show_main(self) -> bool:
+        if self._main is None:
+            return False
+        try:
+            self._main.restore()
+            self._main.show()
+            if sys.platform == "win32" and self._main_hwnd:
+                ctypes.windll.user32.ShowWindow(self._main_hwnd, 9)  # SW_RESTORE
+                ctypes.windll.user32.SetForegroundWindow(self._main_hwnd)
+            return True
+        except Exception:
+            log.debug("could not bring the main window forward", exc_info=True)
+            return False
+
+    def _hide_now(self) -> None:
+        if self._mini is not None:
+            try:
+                self._mini.hide()
+            except Exception:
+                log.debug("could not hide the mini strip", exc_info=True)
+
+    def stopped(self) -> bool:
+        """Stop was pressed on the strip: hide it now and show the meeting."""
+        self._hide_now()
+        return self.show_main()
+
+    def drag_start(self) -> bool:
+        """The strip is being dragged (our own drag: pywebview's move() fails on Windows)."""
+        hwnd = _mini_hwnd()
+        r = wintypes.RECT()
+        if not hwnd or not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return False
+        scale = ctypes.windll.user32.GetDpiForWindow(hwnd) / 96 or 1.0
+        self._drag = (hwnd, r.left, r.top, scale)
+        return True
+
+    def drag_to(self, dx: float, dy: float) -> bool:
+        """Move by (dx, dy) CSS pixels from where the drag started."""
+        drag = getattr(self, "_drag", None)
+        if drag is None or not all(isinstance(v, int | float) for v in (dx, dy)):
+            return False
+        hwnd, x, y, scale = drag
+        user = ctypes.windll.user32
+        user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        return bool(user.SetWindowPos(hwnd, None, int(x + dx * scale), int(y + dy * scale), 0, 0,
+                                      0x0001 | 0x0004 | 0x0010))  # NOSIZE|NOZORDER|NOACTIVATE
+
+    def drag_end(self) -> bool:
+        self._drag = None
+        save_mini_place()
+        return True
+
+    def dismiss(self) -> bool:
+        """x on the strip: hidden for the rest of this recording (back with the next one)."""
+        self._dismissed = True
+        self._hide_now()
+        return True
+
+
+def _mini_hwnd() -> int:
+    if sys.platform != "win32":
+        return 0
+    return int(ctypes.windll.user32.FindWindowW(None, MINI_TITLE) or 0)
+
+
+def prepare_mini(window=None) -> bool:
+    """Rounded corners and no screen capture for the mini strip's window."""
+    hwnd = _mini_hwnd()
+    if not hwnd:
+        return False
+    try:
+        dwm = ctypes.windll.dwmapi
+        v = ctypes.c_int(_DWMWCP_ROUND)
+        dwm.DwmSetWindowAttribute(hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(v),
+                                  ctypes.sizeof(v))
+        user = ctypes.windll.user32
+        user.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+        return bool(user.SetWindowDisplayAffinity(hwnd, _WDA_EXCLUDEFROMCAPTURE))
+    except Exception:
+        log.debug("could not prepare the mini strip window", exc_info=True)
+        return False
+
+
+def _mini_place_file() -> Path:
+    from steno import paths
+
+    return paths.data_dir() / MINI_PLACE_NAME
+
+
+def save_mini_place() -> None:
+    """Remember where the strip was dragged to (physical pixels, top-left corner)."""
+    hwnd = _mini_hwnd()
+    if not hwnd:
+        return
+    r = wintypes.RECT()
+    if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        try:
+            _mini_place_file().write_text(json.dumps({"x": r.left, "y": r.top}),
+                                          encoding="utf-8")
+        except OSError:
+            log.debug("could not save the mini strip place", exc_info=True)
+
+
+def restore_mini_place() -> bool:
+    """Move the strip to its saved place, if that point is still on a screen."""
+    hwnd = _mini_hwnd()
+    try:
+        data = json.loads(_mini_place_file().read_text(encoding="utf-8"))
+        x, y = int(data["x"]), int(data["y"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not hwnd:
+        return False
+    user = ctypes.windll.user32
+    user.MonitorFromPoint.restype = ctypes.c_void_p
+    if not user.MonitorFromPoint(wintypes.POINT(x + 20, y + 10), 0):  # MONITOR_DEFAULTTONULL
+        return False
+    return bool(user.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010))
+    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+
+
+def _foreground() -> int:
+    return int(ctypes.windll.user32.GetForegroundWindow() or 0) if sys.platform == "win32" else 0
+
+
+def watch_mini(mini, recorder, stopping: threading.Event, every: float = 0.3, *,
+               bridge: MiniBridge | None = None, foreground=_foreground) -> None:
+    """Show the strip while a recording starts or runs, unless Steno itself is in front, the
+    strip was hidden with x for this recording, or Settings turned it off."""
+    from steno import settings
+
+    shown = placed = False
+    allowed, checked = True, 0.0
+    main_hwnd = 0
+    while not stopping.wait(every):
+        now = time.monotonic()
+        if now - checked > 2.0:  # the switch in Settings; re-read now and then
+            checked = now
+            try:
+                allowed = settings.load().mini_strip
+            except Exception:
+                allowed = True
+        if bridge is not None:
+            main_hwnd = bridge._main_hwnd
+        active = recorder.state in MINI_SHOW_STATES
+        if bridge is not None and not active:
+            bridge._dismissed = False  # x lasts until this recording ends
+        dismissed = bridge is not None and bridge._dismissed
+        app_in_front = bool(main_hwnd) and foreground() == main_hwnd
+        want = allowed and active and not dismissed and not app_in_front
+        if want == shown:
+            continue
+        try:
+            if want:
+                if not placed:
+                    placed = restore_mini_place() or True
+                mini.show()
+                prepare_mini(mini)  # each time: cheap, and capture exclusion must hold
+            else:
+                save_mini_place()
+                mini.hide()
+            shown = want
+        except Exception:
+            log.debug("mini strip show/hide failed", exc_info=True)
 
 
 def set_app_id() -> None:
@@ -348,6 +533,7 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
     bridge = Bridge()
     width, height = 1240, 820
     x = y = None  # centred, a little above the middle (the taskbar), not where Windows cascades
+    sw = 0  # screen width in logical pixels, when known
     try:  # fit on smaller or scaled screens (screens are physical pixels, the size is not)
         screen = webview.screens[0]
         scale = 1.0
@@ -373,7 +559,8 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
 
     def on_shown() -> None:
         try:
-            fit_on_screen(int(str(window.native.Handle)))
+            mini_bridge._main_hwnd = int(str(window.native.Handle))
+            fit_on_screen(mini_bridge._main_hwnd)
         except Exception:
             log.debug("could not fit the window on screen", exc_info=True)
         apply_icon(window, icon)
@@ -416,6 +603,28 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
     window.events.moved += on_moved
     window.events.loaded += on_loaded
     window.events.closing += on_closing
+
+    # The mini strip: hidden until a recording starts, top centre of the screen, always on top.
+    mini_bridge = MiniBridge()
+    mini_bridge._main = window
+    mw, mh = MINI_SIZE
+    mx, my = (max(0, (sw - mw) // 2), 8) if sw else (None, None)
+    mini = webview.create_window(
+        MINI_TITLE, url=server.mini_url, js_api=mini_bridge, width=mw, height=mh, x=mx, y=my,
+        resizable=False, frameless=True, easy_drag=False, on_top=True, hidden=True,
+        focus=False, background_color="#1f1f25", min_size=(mw, mh),
+    )
+    mini_bridge._mini = mini
+
+    def on_main_closed() -> None:
+        try:
+            mini.destroy()
+        except Exception:
+            pass
+
+    window.events.closed += on_main_closed
+    threading.Thread(target=watch_mini, args=(mini, app.recorder, server.stopping),
+                     kwargs={"bridge": mini_bridge}, name="mini-strip", daemon=True).start()
     try:
         webview.start(debug=debug, gui="edgechromium" if sys.platform == "win32" else None)
     except Exception:

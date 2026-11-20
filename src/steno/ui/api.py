@@ -141,6 +141,19 @@ class UiApp:
         except projects.ProjectError as exc:
             raise ApiError(404, str(exc)) from exc
 
+    @staticmethod
+    def _type(project: projects.Project | None, value: Any) -> str | None:
+        """A meeting type name of ``project`` (checked), or None for no type."""
+        if value in (None, ""):
+            return None
+        if project is None or not isinstance(value, str):
+            raise ApiError(400, "a meeting type needs a project")
+        try:
+            t = project.find_type(value)
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        return t.name if t else None
+
     def _session_dir(self, session_id: str) -> Path:
         if not _SESSION_ID_RE.match(session_id):
             raise ApiError(404, "no such session")
@@ -229,9 +242,10 @@ class UiApp:
         project = self._project(pid) if pid and pid != "inbox" else None
         title = body.get("title")
         title = clean_name(title, "title") if isinstance(title, str) and title.strip() else None
+        mtype = self._type(project, body.get("type"))
         try:
             self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback, project=project,
-                                title=title)
+                                title=title, mtype=mtype)
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
@@ -258,7 +272,7 @@ class UiApp:
     def settings_set(self, body: dict[str, Any]) -> dict[str, Any]:
         if "glossary" in body and not isinstance(body["glossary"], list | str):
             raise ApiError(400, "glossary must be a list of words")
-        for key in ("auto_clean", "auto_summary", "auto_todo", "transparent"):
+        for key in ("auto_clean", "auto_summary", "auto_todo", "transparent", "mini_strip"):
             if key in body and not isinstance(body[key], bool):
                 raise ApiError(400, f"{key} must be true or false")
         if "theme" in body and body["theme"] not in settings.THEMES:
@@ -274,7 +288,7 @@ class UiApp:
         for p in projects.list_projects():
             meetings = [m for m in projects.list_meetings(p) if not _archived(m.session)]
             out.append({"id": p.id, "name": p.name, "path": str(p.path),
-                        "meetings": len(meetings),
+                        "meetings": len(meetings), "types": _types(p),
                         "last_at": _started_at(meetings[-1].session) if meetings else None})
         inbox = [s for s in projects.inbox_sessions() if not projects.is_archived(s.dir)]
         return {"projects": out, "inbox": len(inbox)}
@@ -294,7 +308,22 @@ class UiApp:
             raise ApiError(400, f"cannot use that folder: {exc}") from exc
         self.bus.publish("projects", {})
         return {"project": {"id": p.id, "name": p.name, "path": str(p.path), "meetings": 0,
-                            "last_at": None}}
+                            "types": _types(p), "last_at": None}}
+
+    def project_types(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Replace the meeting types: ``{"types": [{"name", "folder"}]}``."""
+        self._project(pid)
+        types = body.get("types")
+        if not isinstance(types, list):
+            raise ApiError(400, "types must be a list of {name, folder}")
+        try:
+            p = projects.set_types(pid, types)
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(409, f"cannot write the project: {exc}") from exc
+        self.bus.publish("projects", {})
+        return {"types": _types(p)}
 
     def project_remove(self, pid: str) -> dict[str, Any]:
         self._project(pid)
@@ -305,18 +334,21 @@ class UiApp:
     def project_meetings(self, pid: str) -> dict[str, Any]:
         live = self.recorder.active_session()
         if pid == "inbox":
-            items = [(s.dir, projects.meeting_title(s.dir), "") for s in projects.inbox_sessions()]
+            items = [(s.dir, projects.meeting_title(s.dir), "", None)
+                     for s in projects.inbox_sessions()]
         else:
+            project = self._project(pid)
+            dirs = {project.type_dir(t): t.name for t in project.types}
             items = []
-            for m in projects.list_meetings(self._project(pid)):
+            for m in projects.list_meetings(project):
                 d = transcript.resolve_session(m.session)
                 if d is not None:
-                    items.append((d, m.title, str(m.folder)))
+                    items.append((d, m.title, str(m.folder), dirs.get(m.folder.parent)))
         out = []
-        for d, title, folder in items:
+        for d, title, folder, mtype in items:
             info = transcript.load_session_info(d)
             out.append({
-                "session": info.id, "title": title, "folder": folder,
+                "session": info.id, "title": title, "folder": folder, "type": mtype,
                 "started_at": info.started_at, "ended_at": info.ended_at,
                 "recording": info.id == live, "segments": info.segments,
                 "has_summary": (d / "summary.md").is_file(),
@@ -343,12 +375,14 @@ class UiApp:
         if body.get("project") == "inbox":
             raise ApiError(400, "meetings can be moved to a project, not back to the inbox")
         project = self._project(str(body.get("project") or ""))
+        mtype = self._type(project, body.get("type"))
         try:
-            m = projects.move_meeting(d, project)
+            m = projects.move_meeting(d, project, mtype)
         except OSError as exc:
             raise ApiError(409, f"cannot move the meeting folder: {exc}") from exc
         self.bus.publish("projects", {"session": session_id})
-        return {"title": m.title, "folder": str(m.folder), "project": project.id}
+        return {"title": m.title, "folder": str(m.folder), "project": project.id,
+                "type": mtype}
 
     def meeting_archive(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         d = self._session_dir(session_id)
@@ -441,6 +475,7 @@ class UiApp:
             "id": info.id,
             "title": projects.meeting_title(d),
             "project": project.id if project is not None else None,
+            "type": projects.type_of(d),
             "started_at": info.started_at,
             "ended_at": info.ended_at,
             "model": info.model,
@@ -593,6 +628,10 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
         return None
+
+
+def _types(p: projects.Project) -> list[dict[str, str]]:
+    return [{"name": t.name, "folder": t.folder} for t in p.types]
 
 
 def _archived(session_id: str) -> bool:
