@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -128,5 +129,26 @@ def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
     assert c.get(f"/api/projects/{pid}/meetings")[1]["meetings"] == []
     assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["title"] == "Weekly sync"
     assert c.get("/api/projects/inbox/meetings")[1]["meetings"] == []
+
+    # archive hides it from the counts but keeps everything; unarchive brings it back
+    assert c.post(f"/api/meetings/{sid}/archive", {"archived": True})[1]["archived"] is True
+    listed = c.get(f"/api/projects/{other}/meetings")[1]["meetings"]
+    assert listed[0]["archived"] is True
+    counts = {p["id"]: p["meetings"] for p in c.get("/api/projects")[1]["projects"]}
+    assert counts[other] == 0
+    assert c.post(f"/api/meetings/{sid}/archive", {"archived": "yes"})[0] == 400
+    assert c.post(f"/api/meetings/{sid}/archive", {"archived": False})[1]["archived"] is False
+    assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["archived"] is False
+
+    # delete removes the session and the meeting folder, nothing else
+    moved = Path(c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["folder"])
+    assert moved.is_dir()
+    assert c.raw("DELETE", f"/api/meetings/{sid}")[0] == 200
+    assert not moved.exists() and moved.parent.is_dir()
+    assert c.get(f"/api/sessions/{sid}")[0] == 404
+    assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"] == []
+    assert c.raw("DELETE", f"/api/meetings/{sid}")[0] == 404
+    assert c.raw("DELETE", "/api/meetings/..")[0] == 404
+
     assert c.raw("DELETE", f"/api/projects/{pid}")[0] == 200
     assert c.get(f"/api/projects/{pid}/meetings")[0] == 404

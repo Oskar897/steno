@@ -75,3 +75,16 @@ def test_settings_api_and_automatic_jobs_after_stop(make_ui):
                                  if j["kind"] == "auto" and j["state"] != "running"), None))
     assert ran == ["clean", "summary", "todo"]  # in order; a failing step does not stop the rest
     assert job["state"] == "done" and "failed: summary" in job["message"]
+
+
+def test_theme_and_transparency_settings(make_ui):
+    s = settings.load()
+    assert s.theme == "system" and s.transparent is True
+    s = settings.update({"theme": "neon", "transparent": "no"})
+    assert s.theme == "system" and s.transparent is True  # bad values ignored
+    assert settings.update({"theme": "light", "transparent": False}).theme == "light"
+    _, c = make_ui()
+    assert c.post("/api/settings", {"theme": "neon"})[0] == 400
+    assert c.post("/api/settings", {"transparent": 1})[0] == 400
+    res = c.post("/api/settings", {"theme": "dark", "transparent": True})[1]["settings"]
+    assert res["theme"] == "dark" and res["transparent"] is True

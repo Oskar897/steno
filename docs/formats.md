@@ -38,12 +38,14 @@ Voice profiles live next to the sessions, also encrypted:
 
 A session recorded into a project (desktop app) also has `meeting.json` (`{"folder", "title"}`)
 pointing to its meeting folder; a session without one is in the Inbox.
+An archived meeting has `archived.json` (`{"archived_at"}`) in its session dir: the app hides
+it from lists and counts; nothing else changes.
 
 ## Projects and meeting folders (desktop app)
 
 ```
 <data_dir>/projects.json              # {"projects": [{"path": "..."}]}: registered project folders
-<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary
+<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary, theme, transparent
 <project folder>/Steno/
   .gitignore                          # "*": meeting text is never committed by accident
   CLAUDE.md                           # how Claude Code should read the meetings (summaries first)

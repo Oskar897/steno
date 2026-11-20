@@ -17,6 +17,7 @@ from steno.transcript import atomic_write_text
 SETTINGS_NAME = "settings.json"
 MAX_TERMS = 200
 MAX_TERM_LEN = 60
+THEMES = ("system", "dark", "light")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -29,6 +30,10 @@ class AppSettings:
     # Words the meetings use (product names, course codes, people's names): the clean-up
     # gets them as the right spelling of what the speech recognition misheard.
     glossary: list[str] = field(default_factory=list)
+    # Look of the desktop app: "system" follows Windows' app mode, or "dark" / "light".
+    theme: str = "system"
+    # Desktop app: the desktop shows through the window (Mica); off = solid panels.
+    transparent: bool = True
 
 
 def clean_terms(values: Any) -> list[str]:
@@ -59,6 +64,9 @@ def from_dict(data: dict[str, Any], base: AppSettings | None = None) -> AppSetti
         value = data[f.name]
         if f.name == "glossary":
             updates[f.name] = clean_terms(value)
+        elif f.name == "theme":
+            if value in THEMES:
+                updates[f.name] = value
         elif isinstance(value, bool):
             updates[f.name] = value
     return replace(s, **updates)
@@ -66,7 +74,7 @@ def from_dict(data: dict[str, Any], base: AppSettings | None = None) -> AppSetti
 
 def load() -> AppSettings:
     try:
-        data = json.loads((paths.data_dir() / SETTINGS_NAME).read_text(encoding="utf-8"))
+        data = json.loads((paths.data_dir() / SETTINGS_NAME).read_text(encoding="utf-8-sig"))
     except (FileNotFoundError, ValueError):
         return AppSettings()
     return from_dict(data) if isinstance(data, dict) else AppSettings()

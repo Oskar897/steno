@@ -258,9 +258,11 @@ class UiApp:
     def settings_set(self, body: dict[str, Any]) -> dict[str, Any]:
         if "glossary" in body and not isinstance(body["glossary"], list | str):
             raise ApiError(400, "glossary must be a list of words")
-        for key in ("auto_clean", "auto_summary", "auto_todo"):
+        for key in ("auto_clean", "auto_summary", "auto_todo", "transparent"):
             if key in body and not isinstance(body[key], bool):
                 raise ApiError(400, f"{key} must be true or false")
+        if "theme" in body and body["theme"] not in settings.THEMES:
+            raise ApiError(400, "theme must be system, dark or light")
         s = settings.update(body)
         self.bus.publish("settings", asdict(s))
         return {"settings": asdict(s)}
@@ -270,11 +272,12 @@ class UiApp:
     def projects_list(self) -> dict[str, Any]:
         out = []
         for p in projects.list_projects():
-            meetings = projects.list_meetings(p)
+            meetings = [m for m in projects.list_meetings(p) if not _archived(m.session)]
             out.append({"id": p.id, "name": p.name, "path": str(p.path),
                         "meetings": len(meetings),
                         "last_at": _started_at(meetings[-1].session) if meetings else None})
-        return {"projects": out, "inbox": len(projects.inbox_sessions())}
+        inbox = [s for s in projects.inbox_sessions() if not projects.is_archived(s.dir)]
+        return {"projects": out, "inbox": len(inbox)}
 
     def project_add(self, body: dict[str, Any]) -> dict[str, Any]:
         path = body.get("path")
@@ -319,6 +322,7 @@ class UiApp:
                 "has_summary": (d / "summary.md").is_file(),
                 "has_todo": (d / "todo.md").is_file(),
                 "has_clean": (d / "clean.jsonl").is_file(),
+                "archived": projects.is_archived(d),
             })
         return {"meetings": out}
 
@@ -345,6 +349,32 @@ class UiApp:
             raise ApiError(409, f"cannot move the meeting folder: {exc}") from exc
         self.bus.publish("projects", {"session": session_id})
         return {"title": m.title, "folder": str(m.folder), "project": project.id}
+
+    def meeting_archive(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        archived = body.get("archived", True)
+        if not isinstance(archived, bool):
+            raise ApiError(400, "archived must be true or false")
+        if archived and session_id == self.recorder.active_session():
+            raise ApiError(409, "stop the recording before archiving it")
+        projects.set_archived(d, archived)
+        self.bus.publish("projects", {"session": session_id})
+        return {"archived": archived}
+
+    def meeting_delete(self, session_id: str) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        if session_id == self.recorder.active_session():
+            raise ApiError(409, "stop the recording before deleting it")
+        job = self.jobs.running()
+        if job is not None and job.session == session_id:
+            raise ApiError(409, "wait for the running job on this meeting to finish")
+        try:
+            projects.delete_meeting(d)
+        except OSError as exc:
+            raise ApiError(409, f"cannot delete the meeting: {exc}") from exc
+        self.bus.publish("projects", {"session": session_id})
+        self.bus.publish("sessions", {"session": session_id})
+        return {"ok": True}
 
     def session_doc(self, session_id: str, kind: str) -> dict[str, Any]:
         d = self._session_dir(session_id)
@@ -563,6 +593,11 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
         return None
+
+
+def _archived(session_id: str) -> bool:
+    d = transcript.resolve_session(session_id)
+    return d is not None and projects.is_archived(d)
 
 
 def _started_at(session_id: str) -> str | None:

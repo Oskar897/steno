@@ -17,28 +17,77 @@ APP_NAME = "Steno"
 ICON_NAME = "steno.ico"
 
 
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
+
+# The app's mark: four rounded bars of a sound wave (same as the logo in the page), in the
+# accent orange on a dark rounded tile. Unit coordinates, y down: (centre x, height).
+_BARS = ((0.335, 0.27), (0.445, 0.50), (0.555, 0.64), (0.665, 0.34))
+_BARS_SMALL = ((0.30, 0.34), (0.50, 0.62), (0.70, 0.42))  # 3 thicker bars stay crisp <= 24 px
+
+
+def _round_rect(x, y, x0, y0, x1, y1, r):
+    import numpy as np
+
+    dx = np.maximum(np.maximum(x0 + r - x, x - (x1 - r)), 0)
+    dy = np.maximum(np.maximum(y0 + r - y, y - (y1 - r)), 0)
+    return (dx * dx + dy * dy <= r * r) & (x >= x0) & (x <= x1) & (y >= y0) & (y <= y1)
+
+
+def _icon_rgba(size: int):
+    """float RGBA (size, size, 4), top row first, straight alpha; anti-aliased by supersampling."""
+    import numpy as np
+
+    ss = 8 if size <= 64 else 4
+    n = size * ss
+    t = (np.arange(n) + 0.5) / n
+    x, y = np.meshgrid(t, t)
+    small = size <= 24
+    pad = 0.04 if small else 0.06
+    tile = _round_rect(x, y, pad, pad, 1 - pad, 1 - pad, 0.24 if small else 0.225)
+    inner = pad + 0.012
+    rim = tile & ~_round_rect(x, y, inner, inner, 1 - inner, 1 - inner, 0.21)
+
+    top, bottom = np.array([0.205, 0.205, 0.235]), np.array([0.07, 0.07, 0.085])
+    k = ((y - pad) / (1 - 2 * pad)).clip(0, 1)[..., None]
+    rgb = top * (1 - k) + bottom * k
+    glow = np.exp(-(((x - 0.5) / 0.32) ** 2 + ((y - 0.62) / 0.26) ** 2))[..., None]
+    rgb = rgb + glow * np.array([0.10, 0.035, 0.0]) * 0.55  # faint warm light behind the bars
+    rgb = np.where(rim[..., None], rgb + (0.10 - 0.08 * k), rgb)  # hairline, lit from the top
+
+    bars = np.zeros_like(x, dtype=bool)
+    width = 0.13 if small else 0.074
+    snap = size <= 64  # small icons: bar edges on whole pixels, or they blur
+    for cx, height in _BARS_SMALL if small else _BARS:
+        x0, x1, y0 = cx - width / 2, cx + width / 2, 0.5 - height / 2
+        y1 = y0 + height
+        if snap:
+            wpx = max(2, round(width * size))
+            x0 = round(x0 * size) / size
+            x1 = x0 + wpx / size
+            y0, y1 = round(y0 * size) / size, round(y1 * size) / size
+        r = (x1 - x0) / 2 if size >= 32 else (x1 - x0) * 0.3
+        bars |= _round_rect(x, y, x0, y0, x1, y1, r)
+    hot, deep = np.array([1.0, 0.56, 0.32]), np.array([1.0, 0.29, 0.06])  # #ff8f52 -> #ff4a10
+    kb = ((y - 0.18) / 0.64).clip(0, 1)[..., None]
+    rgb = np.where(bars[..., None], hot * (1 - kb) + deep * kb, rgb)
+
+    alpha = tile.astype(float)
+    img = np.concatenate([rgb * alpha[..., None], alpha[..., None]], axis=-1)
+    img = img.reshape(size, ss, size, ss, 4).mean(axis=(1, 3))  # box filter
+    a = img[..., 3:4]
+    img[..., :3] = np.where(a > 0, img[..., :3] / np.maximum(a, 1e-6), 0)
+    return img.clip(0, 1)
+
+
 def _icon_pixels(size: int) -> bytes:
-    """BGRA rows, bottom-up: a dark round tile with a small orange dot (the accent)."""
-    rows = []
-    c = (size - 1) / 2
-    for y in range(size - 1, -1, -1):
-        row = bytearray()
-        for x in range(size):
-            d = ((x - c) ** 2 + (y - c) ** 2) ** 0.5
-            if d <= size * 0.16:
-                b, g, r, a = 0x1F, 0x5A, 0xFF, 255  # #ff5a1f
-            elif d <= size * 0.47:
-                b, g, r, a = 0x1C, 0x18, 0x16, 245
-            elif d <= size * 0.5:
-                b, g, r, a = 0x3A, 0x36, 0x34, 255  # thin light rim
-            else:
-                b, g, r, a = 0, 0, 0, 0
-            row += bytes((b, g, r, a))
-        rows.append(bytes(row))
-    return b"".join(rows)
+    """BGRA rows, bottom-up (the .ico layout)."""
+    import numpy as np
+
+    img = (_icon_rgba(size) * 255 + 0.5).astype(np.uint8)
+    return img[::-1][..., [2, 1, 0, 3]].tobytes()
 
 
-def make_icon(path: Path, sizes: tuple[int, ...] = (16, 32, 48, 256)) -> Path:
+def make_icon(path: Path, sizes: tuple[int, ...] = ICON_SIZES) -> Path:
     """Write a multi-size .ico (32-bit BMP images)."""
     images = []
     for s in sizes:

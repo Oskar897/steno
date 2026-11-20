@@ -1,7 +1,7 @@
 """Desktop window for the UI (``steno app``): the local UI server inside a native window.
 
 The page is the same as ``steno ui`` serves, shown by pywebview (WebView2 on Windows) instead
-of a browser. On Windows 11 the window gets the system Acrylic backdrop (the desktop shows
+of a browser. On Windows 11 the window gets the system Mica backdrop (the wallpaper shows
 through, blurred) and a dark title bar; elsewhere it is a plain dark window.
 """
 
@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import threading
+from ctypes import wintypes
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,13 +23,14 @@ log = logging.getLogger(__name__)
 TITLE = "Steno"
 _MUTEX_NAME = "Local\\steno-desktop-app"
 _ERROR_ALREADY_EXISTS = 183
+_APP_ID = "Steno.Desktop"  # taskbar identity (AppUserModelID)
 _mutex = None  # held for the life of the process
 
 # DwmSetWindowAttribute ids (Windows 11)
 _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 _DWMWA_WINDOW_CORNER_PREFERENCE = 33
 _DWMWA_SYSTEMBACKDROP_TYPE = 38
-_DWMSBT_TRANSIENTWINDOW = 3  # Acrylic
+_DWMSBT_MAINWINDOW = 2  # Mica: the wallpaper, smoothly blurred (not the windows behind)
 _DWMWCP_ROUND = 2
 
 
@@ -42,6 +44,28 @@ class Bridge:
 
     def __init__(self) -> None:
         self._window = None  # private: pywebview exposes public attributes to the page
+        self._hwnd = 0  # set once the custom frame is on
+        self._glass_hwnd = 0  # set once the backdrop is on
+
+    def set_look(self, dark: bool) -> bool:
+        """Light or dark window backdrop and frame, to match the page's theme."""
+        if not self._glass_hwnd or not isinstance(dark, bool):
+            return False
+        return _dwm_look(self._glass_hwnd, dark)
+
+    def window_control(self, action: str) -> bool:
+        """The page's own window buttons: minimize | maximize | close."""
+        from steno.ui import frame
+
+        if not self._hwnd or action not in ("minimize", "maximize", "close"):
+            return False
+        log.debug("window button: %s", action)
+        return frame.window_command(self._hwnd, action)
+
+    def window_maximized(self) -> bool:
+        from steno.ui import frame
+
+        return bool(self._hwnd) and frame.is_maximized(self._hwnd)
 
     def pick_folder(self) -> str | None:
         import webview
@@ -56,9 +80,169 @@ class Bridge:
             return None
         return str(result[0] if isinstance(result, list | tuple) else result)
 
+    def open_meeting_folder(self, session_id: str) -> bool:
+        """Show a meeting's folder in Explorer. Only meeting folders, found from the id."""
+        import re
 
-def apply_glass(window) -> bool:
-    """Windows 11 Acrylic backdrop behind a transparent page. False when not possible."""
+        from steno import projects, transcript
+
+        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            return False
+        d = transcript.resolve_session(session_id)
+        folder = projects.meeting_folder(d) if d is not None else None
+        if folder is None or sys.platform != "win32":
+            return False
+        os.startfile(folder)  # noqa: S606 - a folder path we resolved ourselves
+        return True
+
+
+def set_app_id() -> None:
+    """Own taskbar identity: without it Windows groups the window under python(w).exe and shows
+    Python's icon. Call before the window is created."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_APP_ID)
+    except Exception:
+        log.warning("Could not set the taskbar app id", exc_info=True)
+
+
+def app_icon() -> Path | None:
+    """The app icon (.ico, drawn in code) in the data dir, rewritten on each start."""
+    from steno import paths, shortcuts
+
+    try:
+        return shortcuts.make_icon(paths.data_dir() / shortcuts.ICON_NAME)
+    except Exception:
+        log.warning("Could not write the app icon", exc_info=True)
+        return None
+
+
+def apply_icon(window, icon: Path | None) -> bool:
+    """Window and taskbar icon (title bar, Alt+Tab, taskbar button)."""
+    if sys.platform != "win32" or icon is None:
+        return False
+    try:
+        import clr
+
+        clr.AddReference("System.Drawing")
+        import System
+        from System.Drawing import Icon
+
+        form = window.native
+        form.Invoke(System.Action(lambda: setattr(form, "Icon", Icon(str(icon)))))
+        return True
+    except Exception:
+        log.warning("Could not set the window icon", exc_info=True)
+        return False
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", ctypes.c_ulong)]
+
+
+def fit_on_screen(hwnd: int) -> bool:
+    """Move (and if needed shrink) the window so it lies inside its monitor's work area.
+
+    A window that starts partly below the screen or under the taskbar never paints that part,
+    and dragging it up then shows a white rectangle. True when it was moved.
+    """
+    if sys.platform != "win32":
+        return False
+    user = ctypes.windll.user32
+    user.MonitorFromWindow.restype = ctypes.c_void_p
+    user.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    user.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MonitorInfo)]
+    user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    info = _MonitorInfo()
+    info.cbSize = ctypes.sizeof(_MonitorInfo)
+    win = wintypes.RECT()
+    if not user.GetMonitorInfoW(user.MonitorFromWindow(hwnd, 2), ctypes.byref(info)):
+        return False
+    if not user.GetWindowRect(hwnd, ctypes.byref(win)):
+        return False
+    work = info.rcWork
+    w = min(win.right - win.left, work.right - work.left)
+    h = min(win.bottom - win.top, work.bottom - work.top)
+    inside = (win.left >= work.left and win.top >= work.top
+              and win.right <= work.right and win.bottom <= work.bottom)
+    if inside:
+        return False
+    x = work.left + (work.right - work.left - w) // 2
+    y = work.top + (work.bottom - work.top - h) // 2
+    user.SetWindowPos(hwnd, None, x, y, w, h, 0x0004 | 0x0010)  # NOZORDER | NOACTIVATE
+    return True
+
+
+_BLANK = ("<!doctype html><html><head><meta charset='utf-8'></head>"
+          "<body style='margin:0;background:transparent'></body></html>")
+
+
+def setup_frame(window, bridge: Bridge) -> bool:
+    """Page-drawn title bar: drag regions on, caption strip off. False = keep the native one."""
+    try:
+        import clr
+
+        clr.AddReference("System.Windows.Forms")
+        import System
+
+        from steno.ui import frame
+
+        form = window.native
+        result: list[bool] = []
+
+        def run() -> None:
+            ok = frame.enable_drag_regions(form) and frame.remove_caption(form)
+            result.append(ok)
+
+        form.Invoke(System.Action(run))
+        if result and result[0]:
+            bridge._hwnd = int(str(form.Handle))
+            return True
+    except Exception:
+        log.warning("Custom window frame not available; keeping the native title bar",
+                    exc_info=True)
+    return False
+
+
+def system_dark() -> bool:
+    """Windows' app mode (Settings > Personalization > Colors); dark when unknown."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except OSError:
+        return True
+
+
+def start_dark() -> bool:
+    """Dark or light at start, from the app settings (before the page can say)."""
+    from steno import settings
+
+    theme = settings.load().theme
+    return system_dark() if theme == "system" else theme == "dark"
+
+
+def _dwm_look(hwnd: int, dark: bool) -> bool:
+    dwm = ctypes.windll.dwmapi
+
+    def set_attr(attr: int, value: int) -> int:
+        v = ctypes.c_int(value)
+        return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+
+    set_attr(_DWMWA_USE_IMMERSIVE_DARK_MODE, 1 if dark else 0)
+    return set_attr(_DWMWA_SYSTEMBACKDROP_TYPE, _DWMSBT_MAINWINDOW) == 0
+
+
+def apply_glass(window, dark: bool = True) -> bool:
+    """Windows 11 Mica backdrop behind a transparent page. False when not possible."""
     if sys.platform != "win32":
         return False
     try:
@@ -83,9 +267,8 @@ def apply_glass(window) -> bool:
             v = ctypes.c_int(value)
             return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
 
-        set_attr(_DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
         set_attr(_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND)
-        ok = set_attr(_DWMWA_SYSTEMBACKDROP_TYPE, _DWMSBT_TRANSIENTWINDOW) == 0
+        ok = _dwm_look(hwnd, dark)
         dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(_Margins(-1, -1, -1, -1)))
         return ok
     except Exception:
@@ -160,26 +343,54 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
     app = UiApp(cfg)
     server = UiServer(app)
     server.start()
+    set_app_id()
+    icon = app_icon()
     bridge = Bridge()
     width, height = 1240, 820
+    x = y = None  # centred, a little above the middle (the taskbar), not where Windows cascades
     try:  # fit on smaller or scaled screens (screens are physical pixels, the size is not)
         screen = webview.screens[0]
         scale = 1.0
         if sys.platform == "win32":
             scale = max(1.0, ctypes.windll.user32.GetDpiForSystem() / 96)
-        width = min(width, int(screen.width / scale * 0.85))
-        height = min(height, int(screen.height / scale * 0.85))
+        sw, sh = int(screen.width / scale), int(screen.height / scale)
+        width = min(width, int(sw * 0.85))
+        height = min(height, int(sh * 0.85))
+        x, y = max(0, (sw - width) // 2), max(0, (sh - 48 - height) // 2)
     except Exception:
         pass
+    custom = sys.platform == "win32"
+    # A blank page first: the WebView2 setting for page-drawn title bars applies from the next
+    # navigation, so the real page is loaded once it is set (see on_loaded).
     window = webview.create_window(
-        TITLE, server.url, js_api=bridge, width=width, height=height, min_size=(760, 520),
-        transparent=sys.platform == "win32", background_color="#000000",
+        TITLE, html=_BLANK if custom else None, url=None if custom else server.url,
+        js_api=bridge, width=width, height=height, x=x, y=y, min_size=(340, 480),
+        transparent=custom, background_color="#000000",
     )
     bridge._window = window
+    looks: list[str] = []  # html classes for the page: "glass", "custom-frame"
+    started = threading.Event()
 
     def on_shown() -> None:
-        if apply_glass(window):
-            window.evaluate_js("document.documentElement.classList.add('glass')")
+        try:
+            fit_on_screen(int(str(window.native.Handle)))
+        except Exception:
+            log.debug("could not fit the window on screen", exc_info=True)
+        apply_icon(window, icon)
+        if apply_glass(window, start_dark()):
+            bridge._glass_hwnd = int(str(window.native.Handle))
+            looks.append("glass")
+
+    def on_loaded() -> None:
+        if custom and not started.is_set():
+            started.set()
+            if setup_frame(window, bridge):
+                looks.append("custom-frame")
+            window.load_url(server.url)
+            return
+        if looks:
+            names = ", ".join(repr(c) for c in looks)
+            window.evaluate_js(f"document.documentElement.classList.add({names})")
 
     def on_closing() -> bool:
         """Closing during a recording asks first; the recording is then stopped cleanly."""
@@ -189,7 +400,21 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
             TITLE, "A recording is running. Stop it and close Steno?\n\n"
                    "What was said so far is kept."))
 
+    moved = threading.Timer(0, lambda: None)
+
+    def on_moved(*_args) -> None:
+        """After a move, repaint the whole page once (parts that were off screen may not have
+        been painted yet)."""
+        nonlocal moved
+        moved.cancel()
+        moved = threading.Timer(0.25, lambda: window.evaluate_js(
+            "window.stenoRepaint && window.stenoRepaint()"))
+        moved.daemon = True
+        moved.start()
+
     window.events.shown += on_shown
+    window.events.moved += on_moved
+    window.events.loaded += on_loaded
     window.events.closing += on_closing
     try:
         webview.start(debug=debug, gui="edgechromium" if sys.platform == "win32" else None)

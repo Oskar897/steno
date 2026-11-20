@@ -238,6 +238,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.meeting_rename(segs[1], body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "move":
                 return app.meeting_move(segs[1], body)
+            if n == 3 and segs[0] == "meetings" and segs[2] == "archive":
+                return app.meeting_archive(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "name":
                 return app.name_speaker(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "jobs":
@@ -249,6 +251,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.person_delete(segs[1])
             if n == 2 and segs[0] == "projects":
                 return app.project_remove(segs[1])
+            if n == 2 and segs[0] == "meetings":
+                return app.meeting_delete(segs[1])
         raise ApiError(404, "no such endpoint")
 
     # -- static -------------------------------------------------------------------

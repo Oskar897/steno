@@ -27,6 +27,7 @@ import re
 import shutil
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from steno import paths, transcript
@@ -37,6 +38,7 @@ log = logging.getLogger(__name__)
 STENO_DIRNAME = "Steno"
 MEETING_FILE = ".steno-meeting.json"
 LINK_NAME = "meeting.json"  # in the session dir
+ARCHIVED_NAME = "archived.json"  # in the session dir: hidden in the app
 REGISTRY_NAME = "projects.json"
 DEFAULT_TITLE = "Meeting"
 MAX_TITLE = 80
@@ -306,6 +308,34 @@ def move_meeting(session_dir: Path, project: Project) -> Meeting:
     if old_project is not None and old_project.id != project.id:
         write_index(old_project)
     return Meeting(session_dir.name, title, target)
+
+
+def is_archived(session_dir: Path) -> bool:
+    return (Path(session_dir) / ARCHIVED_NAME).is_file()
+
+
+def set_archived(session_dir: Path, archived: bool) -> None:
+    """Archived meetings stay on disk and in the meeting folder; the app just hides them."""
+    marker = Path(session_dir) / ARCHIVED_NAME
+    if archived:
+        atomic_write_text(marker, json.dumps(
+            {"archived_at": datetime.now().isoformat(timespec="seconds")}) + "\n")
+    else:
+        marker.unlink(missing_ok=True)
+
+
+def delete_meeting(session_dir: Path) -> None:
+    """Delete a meeting for good: its session dir (transcript, embeddings, audio) and its
+    meeting folder in the project. Only a folder whose marker names this session is removed."""
+    session_dir = Path(session_dir)
+    project = project_of(session_dir)
+    folder = meeting_folder(session_dir)
+    with _lock:
+        if folder is not None and folder.parent.name == STENO_DIRNAME:
+            shutil.rmtree(folder)
+        shutil.rmtree(session_dir)
+    if project is not None:
+        write_index(project)
 
 
 # --------------------------------------------------------------------------- files

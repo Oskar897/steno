@@ -352,3 +352,16 @@ def test_llm_fix_batches_long_transcripts():
     rec = Recorder("[]")
     llm.llm_fix(segs, CFG, rec)
     assert len(rec.calls) >= 2  # split into several requests
+
+
+def test_claude_runs_without_a_console_window(monkeypatch):
+    seen = {}
+
+    def runner(cmd, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, stdout='{"result": "ok"}', stderr="")
+
+    assert llm.run_claude("sys", "text", LlmConfig(), runner=runner) == "ok"
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        assert seen["creationflags"] & subprocess.CREATE_NO_WINDOW
+        assert seen["startupinfo"].wShowWindow == 0

@@ -12,57 +12,73 @@
 <body>
 <div class="app">
 
-  <aside class="side" aria-label="Projects">
-    <div class="brand"><i class="dot"></i>STENO<span class="dim">LOCAL</span></div>
-
-    <div class="side-label">Projects</div>
-    <nav class="plist" id="plist"></nav>
-    <div class="side-actions">
-      <button class="btn ghost" id="btn-new" type="button">+ New project</button>
-      <button class="btn ghost" id="btn-add" type="button">Add existing folder</button>
+  <aside class="side" id="side" aria-label="Projects">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="7" width="2.4" height="6" rx="1.2"/><rect x="6.4" y="4" width="2.4" height="12" rx="1.2"/><rect x="10.8" y="2" width="2.4" height="16" rx="1.2"/><rect x="15.2" y="6" width="2.4" height="8" rx="1.2"/></svg>
+      <span>Steno</span>
+      <button class="icon-btn small side-hide" id="side-hide" type="button" aria-label="Hide sidebar" title="Hide sidebar (Ctrl+B)" data-icon="sidebar"></button>
+      <button class="icon-btn side-close" id="side-close" type="button" aria-label="Close menu" data-icon="x"></button>
     </div>
+
+    <div class="side-head">
+      <span class="side-label">Projects</span>
+      <button class="icon-btn small" id="btn-addmenu" type="button" aria-label="Add project" title="Add project" data-icon="plus"></button>
+    </div>
+    <nav class="plist" id="plist"></nav>
     <nav class="plist" id="inbox-slot"></nav>
 
     <div class="grow"></div>
-    <nav class="plist"><button class="pitem" id="nav-people" type="button"><span class="pname">People</span><span class="pcount" id="people-count"></span></button><button class="pitem" id="nav-settings" type="button"><span class="pname">Settings</span></button></nav>
+    <nav class="plist">
+      <button class="pitem" id="nav-people" type="button"><i class="picon" data-icon="people"></i><span class="pname">People</span><span class="pcount" id="people-count"></span></button>
+      <button class="pitem" id="nav-settings" type="button"><i class="picon" data-icon="settings"></i><span class="pname">Settings</span></button>
+    </nav>
     <div class="side-foot" id="side-foot"></div>
   </aside>
+  <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the sidebar (drag all the way left to hide it)" tabindex="0" title="Drag to resize · drag left to hide · double-click to hide/show (Ctrl+B)"></div>
+  <div class="scrim" id="scrim" hidden></div>
 
   <main class="main">
     <!-- project view -->
     <section class="view" id="view-project" aria-label="Meetings">
       <header class="top">
-        <div class="top-row">
-          <h1 id="proj-name"></h1>
-          <button class="btn ghost small" id="btn-forget" type="button" title="Forget this project (files stay on disk)">Forget</button>
-        </div>
-        <div class="rec-row">
-          <input class="text" id="rec-title" type="text" placeholder="Meeting" maxlength="80" aria-label="Meeting title" autocomplete="off">
-          <button class="btn rec" id="btn-rec" type="button"><i class="dot"></i><span id="btn-rec-label">Record</span></button>
-          <button class="btn" id="btn-pause" type="button" hidden>Pause</button>
-          <button class="btn solid" id="btn-stop" type="button" hidden>Stop</button>
-          <span class="toggles" id="toggles">
-            <button class="tgl" id="tgl-mic" type="button" aria-pressed="true">Mic</button>
-            <button class="tgl" id="tgl-loop" type="button" aria-pressed="true">System audio</button>
-            <button class="tgl" id="tgl-keep" type="button" aria-pressed="false" title="Keep the raw audio in the meeting folder (needed for a final transcript)">Keep audio</button>
-          </span>
-        </div>
-        <div class="strip" id="strip" aria-live="polite"></div>
+        <button class="icon-btn menu-btn" type="button" aria-label="Projects" data-icon="menu"></button>
+        <h1 id="proj-name"></h1>
+        <span class="jobchip" id="jobchip" hidden></span>
+        <button class="icon-btn" id="btn-projmenu" type="button" aria-label="Project options" title="Project options" data-icon="more"></button>
       </header>
 
       <div class="feed-wrap">
         <div class="feed" id="feed"></div>
-        <button class="pill" id="jump" type="button" hidden>Jump to live</button>
+        <button class="pill" id="jump" type="button" hidden></button>
       </div>
 
       <div class="empty" id="empty" hidden>
         <div class="card">
+          <svg class="logo big" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="7" width="2.4" height="6" rx="1.2"/><rect x="6.4" y="4" width="2.4" height="12" rx="1.2"/><rect x="10.8" y="2" width="2.4" height="16" rx="1.2"/><rect x="15.2" y="6" width="2.4" height="8" rx="1.2"/></svg>
           <h2>Create a project</h2>
-          <p>A project is a folder on disk. Meetings are saved in <code>&lt;folder&gt;/Steno/</code>, so they stay with the rest of your work.</p>
+          <p>A project is a folder on disk. Meetings are saved in <code>&lt;folder&gt;/Steno/</code>, next to the rest of your work.</p>
           <div class="card-actions">
-            <button class="btn rec" id="empty-new" type="button">+ New project</button>
+            <button class="btn primary" id="empty-new" type="button">New project</button>
             <button class="btn" id="empty-add" type="button">Add existing folder</button>
           </div>
+        </div>
+      </div>
+
+      <!-- recording dock -->
+      <div class="dock" id="dock" data-state="idle">
+        <div class="dock-idle">
+          <input class="text dock-title" id="rec-title" type="text" placeholder="Meeting title (optional)" maxlength="80" aria-label="Meeting title" autocomplete="off">
+          <button class="icon-btn src-btn" id="btn-src" type="button" aria-label="Audio sources" title="Audio sources"></button>
+          <button class="btn rec" id="btn-rec" type="button"><span class="rec-ico"></span><span id="btn-rec-label">Record</span></button>
+        </div>
+        <div class="dock-live">
+          <span class="live-dot"></span>
+          <span class="timer" id="timer">00:00</span>
+          <span class="meters" id="meters"></span>
+          <span class="live-status" id="live-status"></span>
+          <span class="grow"></span>
+          <button class="btn" id="btn-pause" type="button"><i data-icon="pause"></i><span class="lbl">Pause</span></button>
+          <button class="btn stop" id="btn-stop" type="button"><i data-icon="stop"></i><span class="lbl">Stop</span></button>
         </div>
       </div>
     </section>
@@ -70,8 +86,8 @@
     <!-- people view -->
     <section class="view" id="view-people" aria-label="People" hidden>
       <header class="top">
-        <div class="top-row"><h1>People</h1></div>
-        <div class="strip"><span class="lab">VOICE PROFILES · STORED ON THIS COMPUTER</span></div>
+        <button class="icon-btn menu-btn" type="button" aria-label="Projects" data-icon="menu"></button>
+        <h1>People</h1>
       </header>
       <div class="feed-wrap"><div class="feed" id="people"></div></div>
     </section>
@@ -79,14 +95,21 @@
     <!-- settings view -->
     <section class="view" id="view-settings" aria-label="Settings" hidden>
       <header class="top">
-        <div class="top-row"><h1>Settings</h1></div>
-        <div class="strip"><span class="lab">SAVED ON THIS COMPUTER</span></div>
+        <button class="icon-btn menu-btn" type="button" aria-label="Projects" data-icon="menu"></button>
+        <h1>Settings</h1>
       </header>
       <div class="feed-wrap"><div class="feed" id="settings"></div></div>
     </section>
   </main>
 </div>
 
+<!-- window buttons and the top drag strip: only with the desktop app's own frame (html.custom-frame) -->
+<div class="dragstrip" aria-hidden="true"></div>
+<div class="winctl" id="winctl" role="group" aria-label="Window">
+  <button class="wbtn" type="button" data-win="minimize" aria-label="Minimize" title="Minimize" data-icon="winMin"></button>
+  <button class="wbtn" type="button" data-win="maximize" aria-label="Maximize" title="Maximize" id="win-max" data-icon="winMax"></button>
+  <button class="wbtn close" type="button" data-win="close" aria-label="Close" title="Close" data-icon="winClose"></button>
+</div>
 <div class="toasts" id="toasts" role="status"></div>
 <dialog id="modal"></dialog>
 <datalist id="people-names"></datalist>

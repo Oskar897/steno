@@ -86,6 +86,22 @@ def build_command(cfg: LlmConfig, prompt_file: Path) -> list[str]:
     return cmd
 
 
+def no_window() -> dict[str, Any]:
+    """subprocess options that keep a console window from flashing up on Windows.
+
+    The desktop app runs under ``pythonw`` (no console), so each child would otherwise get a
+    new console window of its own (``claude.cmd`` goes through ``cmd.exe``).
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 0  # SW_HIDE
+    return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": info}
+
+
 def run_claude(
     system_prompt: str, user_text: str, cfg: LlmConfig, runner: Runner | None = None
 ) -> str:
@@ -98,7 +114,7 @@ def run_claude(
             cmd = build_command(cfg, prompt_file)
             proc = runner(
                 cmd, input=user_text, capture_output=True, text=True, encoding="utf-8",
-                timeout=cfg.timeout_s, cwd=empty, check=False,
+                timeout=cfg.timeout_s, cwd=empty, check=False, **no_window(),
             )
     except FileNotFoundError as exc:
         raise LlmError(
