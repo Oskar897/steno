@@ -73,7 +73,9 @@ def test_settings_api_and_automatic_jobs_after_stop(make_ui):
     c.post("/api/record/stop")
     job = wait_for(lambda: next((j for j in c.get("/api/jobs")[1]["jobs"]
                                  if j["kind"] == "auto" and j["state"] != "running"), None))
-    assert ran == ["clean", "summary", "todo"]  # in order; a failing step does not stop the rest
+    # finalize first (on by default, no kept audio needed), then the switches, in order; a failing
+    # step does not stop the rest
+    assert ran == ["finalize", "clean", "summary", "todo"]
     assert job["state"] == "done" and "failed: summary" in job["message"]
 
 

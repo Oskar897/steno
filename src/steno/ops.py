@@ -183,6 +183,93 @@ def name_cluster(
     )
 
 
+@dataclass(frozen=True)
+class FinalNameResult:
+    final_id: str
+    live_cluster: str | None  # the live cluster the name was attached to (carried by finalize)
+    profile: Profile | None  # set when the voice was learned
+    created: bool
+    windows: int  # voice windows learned from
+
+
+FINAL_NAME_MIN_WINDOWS = 3  # fewer windows than this: too little voice to learn a profile from
+
+
+def name_final_speaker(
+    session_dir: Path,
+    final_id: str,
+    name: str,
+    store: ProfileStore | None = None,
+    *,
+    save_profile: bool = False,
+) -> FinalNameResult:
+    """Name a speaker of the *final* transcript (``steno finalize``).
+
+    Final labels are rebuilt by every finalize run, so the name is attached to the live cluster
+    whose lines overlap this final speaker's turns the most (finalize carries names of live
+    clusters over). With ``save_profile`` the voice is learned from the live window embeddings
+    inside the final speaker's turns, not from the live cluster: live clusters can mix voices,
+    which is what finalize corrects.
+    """
+    from steno import finalize as fz
+
+    session_dir = Path(session_dir)
+    name = name.strip()
+    if not name:
+        raise OpsError("name must not be empty")
+    turns = [s for s in fz.read_final(session_dir) if s.speaker_id == final_id]
+    if not turns:
+        raise OpsError(f"the final transcript has no speaker {final_id}")
+    live = transcript.read_segments(session_dir)
+    ids = lab.effective_speaker_ids(session_dir, live)
+    overlap: dict[str, float] = {}
+    for seg in live:
+        sid = ids.get(seg.seq)
+        if sid is None or lab.cluster_number(sid) is None:
+            continue
+        for t in turns:
+            if t.source == seg.source:
+                ov = min(t.t_end, seg.t_end) - max(t.t_start, seg.t_start)
+                if ov > 0:
+                    overlap[sid] = overlap.get(sid, 0.0) + ov
+    cluster = max(overlap, key=overlap.get) if overlap else None
+
+    profile, created, used = None, False, 0
+    if save_profile:
+        if store is None:
+            raise OpsError("no profile store")
+        win = SessionWindows.load(session_dir)
+        vectors = []
+        if win is not None:
+            for i in range(len(win)):
+                for t in turns:
+                    if (win.stream[i] == t.source and win.t0[i] >= t.t_start - 0.1
+                            and win.t1[i] <= t.t_end + 0.1):
+                        vectors.append(win.emb[i])
+                        break
+        if len(vectors) < FINAL_NAME_MIN_WINDOWS:
+            raise OpsError(
+                f"too little clear speech from {final_id} to learn the voice "
+                f"({len(vectors)} window(s)); name it without remembering the voice, or add "
+                "the person with a voice sample in People")
+        emb = np.vstack(vectors)
+        emb = emb[drop_outliers(emb)]
+        existing = store.find_by_name(name)
+        if existing is None:
+            profile, created = store.create(name, emb, session_dir.name), True
+        else:
+            profile = store.add_embeddings(existing.id, emb, session_dir.name)
+        used = len(emb)
+    if cluster is not None:
+        session_labels = lab.SessionLabels(session_dir)
+        session_labels.set_cluster_name(session_labels.resolve_root(cluster), name,
+                                        profile.id if profile is not None else None)
+        lab.regenerate_markdown(session_dir)
+    elif profile is None:
+        raise OpsError(f"no live lines overlap {final_id}; nothing to attach the name to")
+    return FinalNameResult(final_id, cluster, profile, created, used)
+
+
 # --------------------------------------------------------------------------- refine
 
 

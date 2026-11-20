@@ -193,6 +193,9 @@ class Recorder:
             if self.active:
                 raise RecorderError("already recording")
             self.state = "starting"
+            # The previous session id must not linger: the page opens "the session being
+            # recorded" as soon as it shows up, and would open the old meeting instead.
+            self.session_id = None
             self.error = ""
             self.keep_audio = keep_audio
             self.sources = [n for n, on in (("mic", mic), ("loopback", loopback)) if on]

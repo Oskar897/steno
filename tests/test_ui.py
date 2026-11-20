@@ -6,6 +6,7 @@ fake ASR) and fake job runners. No audio devices, no real Claude CLI.
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import re
@@ -251,7 +252,7 @@ def test_sessions_list_and_detail(make_ui):
     assert c.get("/api/sessions/20260101-100000?view=final")[0] == 404
 
 
-def test_final_transcript_is_preferred_and_cannot_be_named(make_ui):
+def test_final_transcript_is_preferred_and_unnamed_final_speakers_can_be_named(make_ui):
     writer = make_session("2026-01-01T10:00:00", LINES)
     final = [
         {"v": 1, "seq": 1, "t_start": 0.0, "t_end": 4.0, "wall": "x", "source": "mic",
@@ -269,7 +270,9 @@ def test_final_transcript_is_preferred_and_cannot_be_named(make_ui):
     assert d["view"] == "final" and d["has_final"] and d["llm_source"] == "final"
     assert [s["text"] for s in d["segments"]] == ["Hello there everyone", "Final text"]
     assert d["summary"].startswith("# Summary")
-    assert not any(s["can_name"] for s in d["speakers"])
+    assert d["speaker_space"] == "final"
+    can = {s["id"]: s["can_name"] for s in d["speakers"]}
+    assert can == {"S1": True, "P:1a2b3c4d": False}  # an enrolled person needs no name
     assert c.get("/api/sessions/20260101-100000?view=live")[1]["view"] == "live"
     listed = c.get("/api/sessions")[1]["sessions"][0]
     assert listed["has_final"] and listed["has_summary"]
@@ -348,8 +351,10 @@ def test_finalize_job_lifecycle_progress_and_busy(make_ui):
     _, c = make_ui(runners={"finalize": gate, "summary": GatedRunner(), "todo": GatedRunner()})
     sid = writer.dir.name
 
-    assert c.post(f"/api/sessions/{sid}/jobs", {"kind": "finalize"})[0] == 400  # no audio kept
-    (writer.dir / "audio-mic.flac").write_bytes(b"")  # presence is enough for the pre-check
+    # the default finalize needs no kept audio; the thorough one does
+    _, thorough = make_ui(cfg=dataclasses.replace(
+        Config(), post=dataclasses.replace(Config().post, diarization="thorough")))
+    assert thorough.post(f"/api/sessions/{sid}/jobs", {"kind": "finalize"})[0] == 400
     assert c.post(f"/api/sessions/{sid}/jobs", {"kind": "bogus"})[0] == 400
     assert c.post(f"/api/sessions/{sid}/jobs", {"kind": "finalize", "speakers": 0})[0] == 400
     assert c.post(f"/api/sessions/{sid}/jobs", {"kind": "finalize", "speakers": "3"})[0] == 400
@@ -661,3 +666,21 @@ def test_mini_strip_follows_the_recorder_focus_x_and_the_setting(monkeypatch):
     stop.set()
     t.join(timeout=2)
     assert calls == []
+
+
+def test_a_new_recording_never_reports_the_previous_session(make_ui):
+    """Pressing Record must not make the page open the last meeting while models load."""
+    _, c = make_ui(engine_factory=fake_engine_factory(burst_audio()))
+    c.post("/api/record/start", {"mic": True, "loopback": False})
+    old = wait_for(lambda: (r := c.get("/api/status")[1]["recorder"])["state"] == "recording"
+                   and r["session"])
+    c.post("/api/record/stop")
+    wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")
+    time.sleep(1.1)  # session ids have one-second resolution
+    started = c.post("/api/record/start", {"mic": True, "loopback": False})[1]["recorder"]
+    assert started["session"] != old
+    new = wait_for(lambda: (r := c.get("/api/status")[1]["recorder"])["state"] == "recording"
+                   and r["session"])
+    assert new != old
+    c.post("/api/record/stop")
+    wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")

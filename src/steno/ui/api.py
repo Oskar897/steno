@@ -17,6 +17,7 @@ from steno import __version__, labels, projects, settings, transcript
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
+from steno.ui.enroll import DEFAULT_SECONDS, Enroller, EnrollError
 from steno.ui.events import EventBus
 from steno.ui.jobs import JobBusy, JobManager, Progress, Runner
 from steno.ui.recorder import EngineFactory, Recorder, RecorderError, segment_dict
@@ -101,6 +102,7 @@ class UiApp:
         engine_factory: EngineFactory | None = None,
         runners: dict[str, Runner] | None = None,
         store_factory: Callable[[], ProfileStore] = ProfileStore,
+        enroller_deps: dict[str, Any] | None = None,
     ):
         self.cfg = cfg
         self.bus = EventBus()
@@ -110,6 +112,8 @@ class UiApp:
         base[AUTO_JOB] = self._auto_runner(base)
         self.jobs = JobManager(self.bus, self._with_sync(base))
         self.recorder.on_stopped = self._after_recording
+        self.enroller = Enroller(cfg, self.bus, store_factory=store_factory,
+                                 is_recording=lambda: self.recorder.active, **(enroller_deps or {}))
 
     # -- helpers ------------------------------------------------------------------
 
@@ -162,9 +166,16 @@ class UiApp:
             raise ApiError(404, "no such session")
         return d
 
+    def _finalize_needs_audio(self) -> bool:
+        """The default finalize ([post] diarization "fast", asr_mode "refined") works from what
+        the live run stored; only the thorough / re-transcribing modes read kept audio."""
+        post = self.cfg.post
+        return post.diarization == "thorough" or post.asr_mode in ("longform", "selective")
+
     def _after_recording(self, session_id: str, keep_audio: bool) -> None:
         s = settings.load()
-        steps = ["finalize"] if self.cfg.post.auto and keep_audio else []
+        can_finalize = keep_audio or not self._finalize_needs_audio()
+        steps = ["finalize"] if (s.auto_finalize or self.cfg.post.auto) and can_finalize else []
         steps += [kind for kind, on in (("clean", s.auto_clean), ("summary", s.auto_summary),
                                         ("todo", s.auto_todo)) if on]
         steps = [k for k in steps if k in self.jobs.kinds]
@@ -232,6 +243,8 @@ class UiApp:
     # -- recording ----------------------------------------------------------------
 
     def record_start(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.enroller.active:
+            raise ApiError(409, "a voice recording for a person is running; wait for it to finish")
         cfg = self.cfg.audio
         mic = body.get("mic", cfg.capture_mic)
         loopback = body.get("loopback", cfg.capture_loopback)
@@ -272,7 +285,8 @@ class UiApp:
     def settings_set(self, body: dict[str, Any]) -> dict[str, Any]:
         if "glossary" in body and not isinstance(body["glossary"], list | str):
             raise ApiError(400, "glossary must be a list of words")
-        for key in ("auto_clean", "auto_summary", "auto_todo", "transparent", "mini_strip"):
+        for key in ("auto_finalize", "auto_clean", "auto_summary", "auto_todo", "transparent",
+                    "mini_strip"):
             if key in body and not isinstance(body[key], bool):
                 raise ApiError(400, f"{key} must be true or false")
         if "theme" in body and body["theme"] not in settings.THEMES:
@@ -485,7 +499,10 @@ class UiApp:
             "has_audio": any(d.glob("audio-*.flac")),
             "view": kind,
             "segments": [segment_dict(s) for s in segments],
-            "speakers": self._speakers(d, segments, kind),
+            # which labels the lines carry: "final" (finalize) or "live"; clean text keeps
+            # the labels of the text it was made from
+            "speaker_space": "final" if use_final else "live",
+            "speakers": self._speakers(d, segments, "final" if use_final else "live"),
             "summary": _read_text(d / llm.SUMMARY_NAME),
             "todo": _read_text(d / llm.TODO_MD_NAME),
             # which text the clean-up sends, and which one summary / to-do would send (text only)
@@ -517,7 +534,9 @@ class UiApp:
             named = bool(data["clusters"].get(sid, {}).get("name")) if is_cluster else True
             if kind == "final":  # final labels are a new namespace: naming happens on live lines
                 named = not (is_cluster and e["name"] == f"Speaker {labels.cluster_number(sid)}")
-            e["can_name"] = kind == "live" and is_cluster
+            # final speakers can be named too (the name goes to the overlapping live cluster
+            # and finalize runs again, see ops.name_final_speaker)
+            e["can_name"] = is_cluster and (kind == "live" or not named)
             e["named"] = named
             out.append(e)
         out.sort(key=lambda e: -e["seconds"])
@@ -532,6 +551,8 @@ class UiApp:
         save = body.get("save_profile", False)
         if not isinstance(spec, str) or not isinstance(save, bool):
             raise ApiError(400, "speaker must be text and save_profile true or false")
+        if body.get("view") == "final":
+            return self._name_final(session_id, d, spec, name, save)
         cluster = labels.parse_cluster_spec(spec)
         if cluster is None:
             raise ApiError(400, f"not a speaker cluster: {spec!r}")
@@ -555,6 +576,29 @@ class UiApp:
         self.bus.publish("names", {"session": session_id})
         return {"ok": True, "message": note}
 
+    def _name_final(self, session_id: str, d: Path, spec: str, name: str,
+                    save: bool) -> dict[str, Any]:
+        from steno import ops
+
+        final_id = labels.parse_cluster_spec(spec)
+        if final_id is None:
+            raise ApiError(400, f"not a speaker cluster: {spec!r}")
+        try:
+            res = self._store_call(lambda: ops.name_final_speaker(
+                d, final_id, name, self._store_factory() if save else None, save_profile=save))
+        except ops.OpsError as exc:
+            raise ApiError(400, str(exc)) from exc
+        note = f"{name}: " + (
+            f"voice profile {'created' if res.created else 'extended'} ({res.windows} windows)"
+            if res.profile is not None else "named in this meeting")
+        try:  # finalize again so the final labels carry the name (seconds)
+            self.jobs.submit("finalize", d.name, d, {})
+            note += "; updating the transcript"
+        except (JobBusy, KeyError):
+            note += "; run Finalize to update the transcript"
+        self.bus.publish("names", {"session": session_id})
+        return {"ok": True, "message": note}
+
     # -- jobs ---------------------------------------------------------------------
 
     def start_job(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -572,7 +616,7 @@ class UiApp:
                 params["speakers"] = speakers
             if session_id == self.recorder.active_session():
                 raise ApiError(409, "stop the recording before finalizing it")
-            if not any(d.glob("audio-*.flac")):
+            if self._finalize_needs_audio() and not any(d.glob("audio-*.flac")):
                 raise ApiError(400, "no kept audio in this session; record with Keep audio")
         elif kind == "todo" and body.get("person") not in (None, ""):
             params["person"] = clean_name(body.get("person"), "person")
@@ -621,6 +665,34 @@ class UiApp:
         profile = self._profile(store, profile_id)
         self._store_call(lambda: store.delete(profile.name))
         return {"ok": True, "message": f"deleted {profile.name} and their voice data"}
+
+    def enroll_start(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Record the microphone for a new person, or to add voice to an existing one."""
+        name = clean_name(body.get("name"))
+        seconds = body.get("seconds", DEFAULT_SECONDS)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise ApiError(400, "seconds must be a number")
+        found = self._store_call(lambda: self._store_factory().find_by_name(name))
+        existing = body.get("existing", found is not None)
+        if not isinstance(existing, bool):
+            raise ApiError(400, "existing must be true or false")
+        if existing and found is None:
+            raise ApiError(404, "no such person")
+        if not existing and found is not None:
+            raise ApiError(409, f"{found.name} already has a voice profile; use Add voice on them")
+        if found is not None:
+            name = found.name  # keep the stored spelling
+        try:
+            self.enroller.start(name, float(seconds), existing)
+        except EnrollError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return {"enroll": self.enroller.snapshot()}
+
+    def enroll_status(self) -> dict[str, Any]:
+        return {"enroll": self.enroller.snapshot()}
+
+    def enroll_cancel(self) -> dict[str, Any]:
+        return {"enroll": self.enroller.cancel()}
 
 
 def _read_text(path: Path) -> str | None:

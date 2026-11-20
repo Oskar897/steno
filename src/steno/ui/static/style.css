@@ -180,6 +180,11 @@ html.glass *, html.glass *::before, html.glass *::after { -webkit-backdrop-filte
 .trow .padd { width: 22px; height: 22px; }
 .trow:hover .padd, .pnode.here .trow .padd { opacity: 1; }
 .tlist { display: flex; flex-direction: column; gap: 1px; }
+.trow .tmore { opacity: 0; }
+.trow:hover .tmore, .tmore:focus-visible, .tmore[aria-expanded="true"] { opacity: 1; }
+.add-sub { gap: 6px; margin-top: 4px; }
+.add-sub .ic { width: 13px; height: 13px; }
+.prow .padd + .padd { margin-left: -4px; }
 .dock-type { flex: 0 1 auto; max-width: 34%; min-width: 0; height: 34px; background: transparent; border-color: transparent; box-shadow: none; color: var(--dim); font-size: 13px; }
 .dock-type:hover { border-color: var(--line); color: var(--text); }
 .typerows { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 8px; }
@@ -359,7 +364,8 @@ h1 { margin: 0; font-family: var(--display); font-size: 15px; font-weight: 600; 
 .who .q { margin-left: 4px; padding: 0 5px; border-radius: 4px; background: var(--fill-hi); color: var(--dim); font-size: 11px; font-weight: 600; }
 .time { color: var(--ghost); font-size: 11.5px; }
 .seg p { margin: 0; font-size: 14.5px; line-height: 1.65; color: var(--body); overflow-wrap: anywhere; border-radius: 4px; transition: color 0.4s; }
-.seg.prov p { color: var(--faint); }
+/* uncertain live speaker: a small "?" by the name; the words keep the normal colour */
+.who .unsure { margin-left: 3px; color: var(--faint); font-weight: 500; }
 .seg.enter { animation: seg-in 0.4s var(--ease); }
 .seg p.revised { animation: revised 1.4s ease-out; }
 .namer {
@@ -389,6 +395,11 @@ h1 { margin: 0; font-family: var(--display); font-size: 15px; font-weight: 600; 
 .src-btn { width: auto; padding: 0 8px; gap: 2px; display: inline-flex; align-items: center; }
 .src-btn { color: var(--dim); }
 .src-btn .ic.off { opacity: 0.28; }
+.keep-btn { height: 34px; padding: 0 10px; gap: 6px; color: var(--dim); background: transparent; border-color: transparent; box-shadow: none; font-size: 12.5px; flex: none; }
+.keep-btn .ic { width: 15px; height: 15px; }
+.keep-btn:hover:not(:disabled) { color: var(--text); border-color: var(--line); }
+.keep-btn.on { color: var(--text); background: var(--fill-hi); border-color: var(--line-hi); }
+.keep-btn.on .ic { color: var(--accent); }
 .btn.rec {
   height: 34px; padding: 0 16px 0 13px; background: var(--accent-fill); border-color: rgba(0, 0, 0, 0.15); color: #fff; font-weight: 650;
   text-shadow: 0 1px 0 rgba(120, 30, 0, 0.35); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px rgba(255, 90, 31, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.28);
@@ -685,3 +696,31 @@ html.light.solid body, html.light.solid body.browser { background: #e3e4e9; }
 }
 .seg-ctl button:hover { color: var(--text); }
 .seg-ctl button.on { background: var(--pop); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), var(--highlight); }
+
+/* ---------------------------------------------------------------- voice sample dialog (People) */
+.people-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.people-head .set-hint { flex: 1 1 220px; margin: 0 0 0 2px; }
+.people-head .btn { flex: none; }
+.mform .en-field { display: flex; flex-direction: column; gap: 6px; }
+.mform .en-label { font-size: 12px; font-weight: 550; color: var(--dim); }
+.mform .en-sub { font-size: 12px; color: var(--faint); }
+.mform .en-read { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--fill); color: var(--body); font-size: 14px; line-height: 1.65; }
+.mform .en-lens { display: flex; gap: 6px; }
+.mform .en-len.on { background: var(--fill-hi); border-color: var(--line-hi); color: var(--text); }
+.mform .en-consent { margin: 0; font-size: 12px; color: var(--faint); }
+.mform .en-err, .mform .en-ok { display: flex; align-items: flex-start; gap: 8px; margin: 0; font-size: 13px; line-height: 1.5; }
+.mform .en-err { color: var(--danger); }
+.mform .en-err .ic { margin-top: 2px; }
+.mform .en-ok { color: var(--text); }
+.mform .en-ok .ic { margin-top: 2px; color: var(--ok); }
+.mform .en-count { font-family: var(--display); font-size: 44px; font-weight: 600; line-height: 1.1; letter-spacing: -0.02em; text-align: center; font-variant-numeric: tabular-nums; }
+.mform .en-bar, .mform .en-meter { position: relative; overflow: hidden; border-radius: 999px; background: var(--fill-hi); }
+.mform .en-bar { height: 6px; margin-top: -4px; }
+.mform .en-bar i { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: inherit; background: var(--text); opacity: 0.8; transition: width 0.3s linear; }
+.mform .en-meter { height: 10px; }
+.mform .en-meter i { position: absolute; inset: 0; border-radius: inherit; background: var(--ok); transform: scaleX(0.02); transform-origin: left; transition: transform 0.12s ease-out; }
+.mform .en-status { margin: 0; text-align: center; color: var(--dim); font-size: 13px; }
+@media (max-width: 420px) {
+  .mform .en-count { font-size: 38px; }
+  .mform .en-read { font-size: 13.5px; padding: 10px 12px; }
+}

@@ -13,7 +13,7 @@ A map for working on the app (`steno app`). User-facing docs: [README](../README
 | Jobs | `src/steno/ui/jobs.py` | One background job at a time (finalize, clean, summary, todo, and `auto`: the after-meeting chain from Settings). |
 | Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`) and meeting folders (`<project>/Steno/<YYYY-MM-DD title>/`; with meeting types `<project>/<type folder>/<YYYY-MM-DD title>/`, e.g. `Meetings/Board/2026-11-20 Lobby days/`). See [formats](formats.md). |
 | Mini strip | `src/steno/ui/window.py` (`MiniBridge`, `watch_mini`, `prepare_mini`, `save/restore_mini_place`), `src/steno/ui/static/mini.*` | Second pywebview window (196x34, frameless, always on top, no focus steal) made hidden at start. `watch_mini` polls the recorder: shown while `starting`/`recording`, except when the main window is the foreground window, after x (`MiniBridge.dismiss`, until the recording ends) or with `settings.mini_strip` off; hidden from `stopping` on. Page `/mini?token=` (own SSE stream): grip, dot (opens Steno), timer, level bars, Pause/Resume, Stop (also brings the main window forward), x. Dragging anywhere but a button moves it through `MiniBridge.drag_start/drag_to/drag_end` (Win32 `SetWindowPos`; pywebview's own drag region calls `SetWindowPos` with `None` and fails); the place is kept in `<data dir>/mini-strip.json` and used again if still on a screen. Excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`), rounded corners. |
-| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_clean`, `auto_summary`, `auto_todo` (all off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
+| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_finalize` (on: finalize after every recording; the default `[post]` modes need no kept audio), `auto_clean`, `auto_summary`, `auto_todo` (off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
 | Shortcuts | `src/steno/shortcuts.py` | `steno install-shortcuts`: Start menu and desktop `.lnk` running `pythonw -m steno.cli app`. The icon (`steno.ico`, 16-256 px: dark rounded tile, orange four-bar wave) is drawn in code with numpy, bars snapped to whole pixels at small sizes. The app rewrites it on each start and sets it as window/taskbar icon with its own AppUserModelID (`Steno.Desktop`), so it does not show as Python. |
 | Page | `src/steno/ui/static/` | `index.html`, `style.css`, `app.js`. Plain JS, no build step, no CDN, no web fonts, no inline scripts or styles (CSP). Only these three files are served (`STATIC_TYPES`). |
 
@@ -34,12 +34,27 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/meetings/<id>/archive` `{archived}` | hide/show it in the app (`archived.json` in the session dir; files stay) |
 | DELETE | `/api/meetings/<id>` | deletes the session dir and its meeting folder for good (not while recording it or while a job runs on it) |
 | POST | `/api/sessions/<id>/jobs` `{kind}` | `finalize`, `clean`, `summary`, `todo` |
-| POST | `/api/sessions/<id>/name` `{speaker, name, save_profile?}` | name a speaker (optionally into a voice profile) |
+| POST | `/api/sessions/<id>/name` `{speaker, name, save_profile?, view?}` | name a speaker (optionally into a voice profile); `view: "final"` names a final speaker (`ops.name_final_speaker`: the name goes to the live cluster overlapping its turns, the voice is learned from the window embeddings inside its turns) and queues finalize again. `GET /api/sessions/<id>` says which labels the lines carry in `speaker_space` (`final` / `live`) |
 | GET/POST | `/api/settings` | read / update (partial) |
 | GET/POST/DELETE | `/api/people`, `/api/people/<id>/rename`, `/api/people/<id>` | voice profiles |
+| POST | `/api/people/enroll` `{name, seconds?, existing?}` | record the microphone (10-120 s, default 30) into a new person or add voice to an existing one; 409 while a meeting is recorded or another enrolment runs |
+| GET | `/api/people/enroll` | state of the enrolment: `{enroll: {state, name, elapsed_s, seconds, level, message, created, speech_s}}`, state `idle`, `preparing`, `recording`, `processing`, `done` or `error` |
+| POST | `/api/people/enroll/cancel` | finish early: processes what was recorded if >= 10 s, else cancels |
 
 SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{session, seq, text}`
-(refined text of a line: swap in place), `job`, `names`, `sessions`, `projects`, `settings`.
+(refined text of a line: swap in place), `job`, `names`, `sessions`, `projects`, `settings`, `enroll` (the enrolment state above, about 4 times a second while recording).
+
+## Speakers and kept audio
+
+- Lines keep one text colour. A live speaker guess that may still change (`provisional`) gets a
+  small "?" after the name; "Speaker N" is an unnamed one.
+- Finalize runs after every recording by default (`auto_finalize`) and needs no kept audio
+  (`diar.bin` / `windows.bin` from the live run); only `[post] diarization = "thorough"` or
+  `asr_mode` longform/selective need it, and the API only asks for audio then.
+- The dock has a visible Keep audio toggle (on until Steno closes, never remembered): the raw
+  recording stays in the session dir in the data dir, e.g. to compare speech models later.
+- Pressing Record clears the recorder's session id until the new one exists, and the page only
+  opens a session that is recording and differs from the previous one.
 
 ## Design (second pass)
 
@@ -52,7 +67,10 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   top of `style.css`: four text levels (`--text`, `--body`, `--dim`, `--faint`, plus `--ghost` for
   times/counts), surfaces with a 1px top `--highlight`, radii 6/8/10/14, a 4px spacing grid.
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
-- Meeting types (project ⋯ → Meeting types...): a project with types shows one small group
+- Subfolders = meeting types. Created from the sidebar: hover a project for the folder-plus button
+  (next to `+`), or "New subfolder" under a project that has some; each subfolder row has `+` and
+  a hover ⋯ (Rename, Remove when empty). Project ⋯ → Subfolders... edits them all at once.
+- Meeting types: a project with types shows one small group
   per type in the sidebar (chevron, name, `+` for a new meeting of that type; folded state in
   `steno-folded`), then "No type" when such meetings exist. The dock gets a type menu
   (chosen with `+` or the menu, else the open meeting's type, else the last used,

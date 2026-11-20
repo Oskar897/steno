@@ -216,6 +216,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.job_list()
             if segs == ["people"]:
                 return app.people()
+            if segs == ["people", "enroll"]:
+                return app.enroll_status()
             if segs == ["projects"]:
                 return app.projects_list()
             if segs == ["settings"]:
@@ -249,6 +251,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.name_speaker(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "jobs":
                 return app.start_job(segs[1], body)
+            if segs == ["people", "enroll"]:
+                return app.enroll_start(body)
+            if segs == ["people", "enroll", "cancel"]:
+                return app.enroll_cancel()
             if n == 3 and segs[0] == "people" and segs[2] == "rename":
                 return app.person_rename(segs[1], body)
         elif method == "DELETE":

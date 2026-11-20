@@ -511,7 +511,7 @@ function newMeeting(pid, type) {
 /* Which meeting to open: the one asked for, else the live one, else the latest, else "new". */
 function pickMeeting() {
   const list = S.meetings, r = S.status.recorder || {};
-  if (S.pendingRec && r.session && list.some((i) => i.session === r.session)) {
+  if (S.pendingRec && r.state === "recording" && r.session && r.session !== S.pendingFrom && list.some((i) => i.session === r.session)) {
     S.meeting = r.session; S.pendingRec = false;
   }
   if (S.meeting === "new") return;
@@ -543,6 +543,7 @@ function showSettings() {
 // ---------------------------------------------------------------- settings
 
 const AUTO = [
+  ["auto_finalize", "Sort out speakers automatically", "A few seconds after Stop, on this computer: who said what is worked out again from the whole meeting, more accurately than live. No kept audio needed."],
   ["auto_clean", "Clean up automatically", "After a recording stops, Claude fixes misheard words and punctuation."],
   ["auto_summary", "Summary automatically", "Then writes summary.md in the meeting folder."],
   ["auto_todo", "To-do automatically", "Then writes todo.md with explicit commitments."],
@@ -591,7 +592,7 @@ async function loadSettings() {
         h("div", { class: "pn" }, h("div", { text: "Mini strip while recording" }), h("div", { class: "sub", text: "A small bar with timer, Pause and Stop stays on top of other windows while Steno is not in front. Drag it anywhere; x hides it until the next recording. Hidden from screen sharing." })), strip)));
   const group = h("div", { class: "group" });
   page.append(h("h2", { class: "set-h", text: "After a meeting" }),
-    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Each step uses Claude (Haiku) and takes about 10-30 s. Off: use the buttons on each meeting." }),
+    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Clean up, Summary and To-do use Claude (Haiku), about 10-30 s each. Off: use the buttons on each meeting." }),
     group);
   for (const [key, label, sub] of AUTO) {
     const box2 = h("input", { type: "checkbox", class: "switch", id: `set-${key}` });
@@ -676,9 +677,12 @@ function sideMeetings(id) {
           h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: type ? `${label}: ${(types.find((t) => t.name === type) || {}).folder || ""}` : "Meetings without a type (in Steno/)",
             onclick: () => { if (open) S.folded.add(key); else S.folded.delete(key); remember("steno-folded", JSON.stringify([...S.folded])); renderSide(); } },
           icon("chevron"), h("span", { class: "tname", text: label }), open ? null : h("span", { class: "tcount", text: String(part.length) })),
+          type ? subfolderMore(id, type, part.length) : null,
           h("button", { class: "padd", type: "button", title: `New ${type ? label + " " : ""}meeting`, "aria-label": `New ${label} meeting`, onclick: () => newMeeting(id, type) }, icon("plus"))),
         open ? h("div", { class: "tlist" }, body) : null));
     }
+    items.push(h("button", { class: "mitem more add-sub", type: "button", onclick: () => guarded(() => newSubfolder(id)) },
+      icon("folderPlus"), h("span", { text: "New subfolder" })));
   }
   if (archived.length) {
     const open = S.showArchived.has(id);
@@ -699,8 +703,9 @@ function projectNode(id, name, count, canRecord, live) {
     h("span", { class: "pname", text: name }),
     live ? h("i", { class: "live-dot", title: "Recording" }) : open ? null : h("span", { class: "pcount", text: String(count) }));
   const add = canRecord ? h("button", { class: "padd", type: "button", title: `New meeting in ${name}`, "aria-label": `New meeting in ${name}`, onclick: () => newMeeting(id) }, icon("plus")) : null;
+  const sub = canRecord ? h("button", { class: "padd", type: "button", title: `New subfolder in ${name} (e.g. Board, 1-1)`, "aria-label": `New subfolder in ${name}`, onclick: () => guarded(() => newSubfolder(id)) }, icon("folderPlus")) : null;
   return h("div", { class: "pnode" + (open ? " open" : "") + (here ? " here" : "") },
-    h("div", { class: "pitem prow" + (here && !open ? " active" : "") }, chev, main, add),
+    h("div", { class: "pitem prow" + (here && !open ? " active" : "") }, chev, main, sub, add),
     open ? sideMeetings(id) : null);
 }
 
@@ -798,6 +803,13 @@ function renderTop() {
   const on = sourcesOn();
   const srcKey = `${on.mic}${on.loop}`;
   $("btn-src").disabled = active;
+  const keepBtn = $("btn-keep");
+  keepBtn.disabled = active;
+  keepBtn.setAttribute("aria-pressed", String(!!S.opts.keep));
+  keepBtn.classList.toggle("on", !!S.opts.keep);
+  keepBtn.title = S.opts.keep
+    ? "Keep audio: ON. The raw recording is saved on this computer (not in the project folder). Click to turn off."
+    : "Keep audio: off. Turn on to save the raw recording on this computer, e.g. to compare speech models. Not needed for speakers.";
   if ($("btn-src").dataset.key !== srcKey) {
     $("btn-src").dataset.key = srcKey;
     $("btn-src").replaceChildren(icon("mic", on.mic ? "" : "off"), icon("system", on.loop ? "" : "off"));
@@ -856,7 +868,7 @@ function typesModal(p) {
         finish(res.types);
       } catch (e) { err.textContent = e.message; err.hidden = false; }  // toasts sit behind the dialog
     } },
-    h("h3", { text: `Meeting types in ${p.name}` }),
+    h("h3", { text: `Subfolders in ${p.name}` }),
     h("p", { text: "Each type saves its meetings in its own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Meetings without a type stay in Steno/. No types = one simple list." }),
     h("div", { class: "typehead" }, h("span", { text: "Name" }), h("span", { text: "Folder in the project" })),
     list,
@@ -872,12 +884,53 @@ function typesModal(p) {
   });
 }
 
+/* Subfolders (meeting types) straight from the sidebar: create, rename, remove. */
+const typeList = (pid) => projTypes(pid).map((t) => ({ name: t.name, folder: t.folder }));
+async function saveTypes(pid, types) {
+  await api("POST", `/api/projects/${encodeURIComponent(pid)}/types`, { types });
+  if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
+  await loadProjects();
+}
+async function newSubfolder(pid) {
+  const p = S.projects.find((x) => x.id === pid);
+  if (!p) return;
+  const v = await formModal({
+    title: `New subfolder in ${p.name}`,
+    text: "Meetings of one kind get their own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Press + next to it to record one.",
+    fields: [
+      { key: "name", label: "Name", placeholder: "e.g. Board, Dev team, 1-1, External" },
+      { key: "folder", label: "Folder in the project (optional)", placeholder: "Meetings/<name>" }],
+    ok: "Create" });
+  if (!v || !v.name) return;
+  await saveTypes(pid, [...typeList(pid), { name: v.name, folder: v.folder }]);
+  toast(`Subfolder ${v.name} created`);
+}
+async function renameSubfolder(pid, name) {
+  const v = await formModal({ title: "Rename subfolder", text: "Only the name in Steno changes; the folder on disk stays.",
+    fields: [{ key: "name", label: "Name", value: name }], ok: "Rename" });
+  if (!v || !v.name || v.name === name) return;
+  await saveTypes(pid, typeList(pid).map((t) => (t.name === name ? { ...t, name: v.name } : t)));
+}
+async function removeSubfolder(pid, name, count) {
+  if (count) { toast(`${name} has meetings: move or delete them first.`, "error"); return; }
+  const ok = await formModal({ title: "Remove subfolder", text: `Remove ${name} from Steno? Nothing on disk is deleted.`, ok: "Remove", danger: true });
+  if (!ok) return;
+  await saveTypes(pid, typeList(pid).filter((t) => t.name !== name));
+}
+function subfolderMore(pid, name, count) {
+  const more = h("button", { class: "padd tmore", type: "button", title: `${name}: rename or remove`, "aria-label": `${name} actions`, "aria-haspopup": "menu" }, icon("more"));
+  more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => [
+    { label: "Rename...", icon: "pencil", onclick: () => guarded(() => renameSubfolder(pid, name)) },
+    { label: "Remove", sub: count ? "Move its meetings out first" : "Files on disk stay", icon: "trash", danger: true, disabled: !!count, onclick: () => guarded(() => removeSubfolder(pid, name, count)) }]); });
+  return more;
+}
+
 async function editTypes() {
   const p = curProject();
   if (!p) return;
   const types = await typesModal(p);
   if (!types) return;
-  toast(types.length ? `Meeting types saved (${types.length})` : "Meeting types removed: one simple list");
+  toast(types.length ? `Subfolders saved (${types.length})` : "Subfolders removed: one simple list");
   await loadProjects();
 }
 
@@ -897,7 +950,7 @@ function sourceMenu() {
     { label: "Microphone", icon: "mic", checked: S.opts.mic, keep: true, onclick: t("mic") },
     { label: "System audio", sub: "What the computer plays (calls, video)", icon: "system", checked: S.opts.loop, keep: true, onclick: t("loop") },
     "-",
-    { label: "Keep audio", sub: "Raw audio in the meeting folder, needed for a final transcript", icon: "keep", checked: S.opts.keep, keep: true, onclick: t("keep") },
+    { label: "Keep audio", sub: "Saves the recording on this computer (data folder), e.g. to compare speech models later", icon: "keep", checked: S.opts.keep, keep: true, onclick: t("keep") },
   ];
 }
 
@@ -971,6 +1024,7 @@ async function startRecording() {
   if (title) body.title = title;
   S.stick = true;
   S.meeting = "new"; S.pendingRec = true;
+  S.pendingFrom = (S.status.recorder || {}).session || null;  // never "find" the previous recording
   renderSide(); renderFeed();
   const res = await guarded(() => api("POST", "/api/record/start", body));
   if (res) {
@@ -1269,7 +1323,7 @@ function canName(m, seg) {
   const n = clusterNo(seg.speaker_id);
   if (n === null) return false;
   const sp = m.detail.speakers.find((x) => x.id === seg.speaker_id && x.name === seg.speaker);
-  return sp ? !!sp.can_name : m.detail.view !== "final";
+  return sp ? !!sp.can_name : true;
 }
 
 function segRow(m, seg, prev) {
@@ -1279,7 +1333,10 @@ function segRow(m, seg, prev) {
   const nameable = first && canName(m, seg);
   const who = first && seg.speaker ? h("button", {
     class: "who" + (unknown ? " unknown" : "") + (nameable ? " nameable" : ""), type: "button",
-    title: nameable ? "Name this speaker" : null }, seg.speaker, unknown && nameable ? h("span", { class: "q", text: "Name?" }) : null) : null;
+    title: nameable ? "Name this speaker" : null }, seg.speaker,
+    // a live guess that may still change (text stays the same colour: the words are not in doubt)
+    seg.provisional && !unknown ? h("span", { class: "unsure", title: "Speaker not certain yet: it can change after the meeting", text: "?" }) : null,
+    unknown && nameable ? h("span", { class: "q", text: "Name?" }) : null) : null;
   const p = h("p", { text: seg.text, title: first ? null : clock(seg.t_start) });
   const row = h("div", { class: "seg" + (seg.provisional ? " prov" : "") + (first ? " first" : ""), "data-seq": seg.seq });
   if (first) {
@@ -1452,7 +1509,9 @@ async function openNamer(m, row, seg) {
     ev.preventDefault();
     const name = input.value.trim();
     if (!name) return;
-    const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/name`, { speaker: seg.speaker_id, name, save_profile: save.checked }));
+    const body = { speaker: seg.speaker_id, name, save_profile: save.checked };
+    if (m.detail.speaker_space === "final") body.view = "final";  // finalize runs again afterwards
+    const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/name`, body));
     if (res) { toast(res.message || "Speaker named"); await guarded(() => refreshMeeting(m.info.session)); }
   } }, input,
   h("label", { title: "Store a voice profile on this computer so future meetings recognise this person" }, save, "Remember voice"),
@@ -1536,9 +1595,11 @@ async function loadPeople() {
   S.people = data.people;
   const box = $("people");
   const page = h("div", { class: "page" },
-    h("p", { class: "set-hint", text: "Voice profiles are stored encrypted on this computer. Steno uses them to recognise people in new meetings." }));
+    h("div", { class: "people-head" },
+      h("p", { class: "set-hint", text: "Voice profiles are stored encrypted on this computer. Steno uses them to recognise people in new meetings." }),
+      h("button", { class: "btn primary", type: "button", onclick: () => openEnroll(null) }, icon("plus"), "Add person")));
   box.replaceChildren(page);
-  if (!S.people.length) page.append(h("p", { class: "hint", text: "No voice profiles yet. Name a speaker in a meeting and choose \"Remember voice\"." }));
+  if (!S.people.length) page.append(h("p", { class: "hint", text: "No voice profiles yet. Choose \"Add person\" to record a voice sample, or name a speaker in a meeting and choose \"Remember voice\"." }));
   else page.append(h("div", { class: "group" }, S.people.map(personRow)));
   renderSide();
 }
@@ -1549,6 +1610,7 @@ function personRow(p) {
   const show = () => row.replaceChildren(
     h("span", { class: "avatar", "aria-hidden": "true", text: initials(p.name) }),
     h("div", { class: "pn" }, h("div", { text: p.name }), h("div", { class: "sub", text: `${p.embeddings} voice sample${p.embeddings === 1 ? "" : "s"} · updated ${niceDate(p.updated)}` })),
+    h("button", { class: "btn small", type: "button", title: "Record more of this person's voice", onclick: () => openEnroll(p) }, icon("mic"), "Add voice"),
     h("button", { class: "icon-btn", type: "button", title: "Rename", "aria-label": "Rename", onclick: edit }, icon("pencil")),
     h("button", { class: "icon-btn", type: "button", title: "Delete", "aria-label": "Delete", onclick: () => removePerson(p) }, icon("trash")));
   const edit = () => {
@@ -1570,6 +1632,129 @@ async function removePerson(p) {
   if (!ok) return;
   const res = await guarded(() => api("DELETE", `/api/people/${p.id}`));
   if (res) { toast(res.message); await guarded(loadPeople); }
+}
+
+// ---- voice sample from the microphone: new person or more voice for an existing one
+
+const ENROLL_TEXT = "Jag brukar börja dagen med en kopp kaffe och en promenad längs vattnet. " +
+  "På vårens första varma dag sitter många ute och läser en bok i solen. " +
+  "Bussen till centrum går varje kvart, men ibland är det snabbare att cykla. " +
+  "I köket luktar det nybakat bröd, och någon har dukat fram ost och sylt. " +
+  "Efter middagen brukar vi sitta en stund och prata om vad som hände under dagen.";
+const ENROLL_MIN_S = 10;      // shorter recordings are dropped when finished early
+const ENROLL_GOOD_S = 30;
+let enrollUi = null;          // the open dialog: { dlg, name, existing, seconds, live, phase, el }
+
+function openEnroll(person) {
+  const dlg = $("modal");
+  const ui = { dlg, name: person ? person.name : "", existing: !!person, seconds: ENROLL_GOOD_S, live: false, phase: "", el: null };
+  const noEscape = (ev) => { if (ui.live) ev.preventDefault(); };  // Escape must not drop a running recording
+  dlg.addEventListener("cancel", noEscape);
+  dlg.addEventListener("close", () => { dlg.removeEventListener("cancel", noEscape); if (enrollUi === ui) enrollUi = null; }, { once: true });
+  enrollUi = ui;
+  enrollForm(ui);
+  dlg.showModal();
+}
+
+function enrollForm(ui, error) {
+  ui.live = false; ui.phase = "form"; ui.el = null;
+  const name = h("input", { class: "text", type: "text", value: ui.name, maxlength: "80", autocomplete: "off", placeholder: "Name", "aria-label": "Name", readonly: ui.existing });
+  const err = h("p", { class: "en-err", role: "alert", text: error || "", hidden: !error });
+  const showErr = (msg) => { err.textContent = msg; err.hidden = false; };
+  const lens = [ENROLL_GOOD_S, 60].map((s) => h("button", { type: "button", class: "btn small en-len", text: `${s} s`, onclick: () => pick(s) }));
+  const pick = (s) => {
+    ui.seconds = s;
+    lens.forEach((b, i) => { const on = [ENROLL_GOOD_S, 60][i] === s; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
+  };
+  pick(ui.seconds);
+  const start = h("button", { class: "btn primary", type: "submit" }, icon("mic"), "Start recording");
+  const form = h("form", { class: "mform", onsubmit: async (ev) => {
+    ev.preventDefault();
+    const nm = name.value.trim();
+    if (!nm) { showErr("Enter a name first."); name.focus(); return; }
+    ui.name = nm; start.disabled = true; err.hidden = true;
+    ui.live = true;  // events can arrive before the reply
+    try {
+      const res = await api("POST", "/api/people/enroll", { name: nm, seconds: ui.seconds, existing: ui.existing });
+      if (ui.phase === "form") onEnroll(res.enroll);  // else events already moved the dialog on
+    } catch (e) {
+      enrollForm(ui, e instanceof Error ? e.message : String(e));
+    }
+  } },
+  h("h3", { text: ui.existing ? `Add voice to ${ui.name}` : "Add person" }),
+  h("p", { text: "Record a short voice sample so Steno recognises this person in later meetings. Use the microphone you use in meetings and a quiet room." }),
+  h("label", null, "Name", name),
+  h("div", { class: "en-field" }, h("span", { class: "en-label", text: "Read this aloud, at a normal pace" }), h("p", { class: "en-read", lang: "sv", text: ENROLL_TEXT })),
+  h("div", { class: "en-field" }, h("span", { class: "en-label", text: "Length" }), h("div", { class: "en-lens", role: "group", "aria-label": "Length" }, lens),
+    h("span", { class: "en-sub", text: "30 s is enough; 60 s is more reliable." })),
+  h("p", { class: "en-consent", text: "Voiceprints are biometric data; only add people who agreed." }),
+  err,
+  h("div", { class: "btns" }, h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => ui.dlg.close() }), start));
+  ui.dlg.replaceChildren(form);
+  (ui.existing ? start : name).focus();
+}
+
+const enrollClock = (secs) => { const s = Math.max(0, Math.ceil(secs)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+
+function enrollActive(ui) {  // the recording view: built once, then only updated
+  ui.phase = "active";
+  const el = ui.el = {
+    count: h("div", { class: "en-count" }),
+    fill: h("i"), level: h("i"),
+    status: h("p", { class: "en-status", "aria-live": "polite" }),
+    btn: h("button", { class: "btn", type: "button" }),
+  };
+  el.btn.addEventListener("click", async () => {
+    el.btn.disabled = true;
+    try { await api("POST", "/api/people/enroll/cancel", {}); } catch (e) { el.btn.disabled = false; }
+  });
+  ui.dlg.replaceChildren(h("div", { class: "mform" },
+    h("h3", { text: ui.existing ? `Adding voice to ${ui.name}` : `Recording ${ui.name}` }),
+    el.count,
+    h("div", { class: "en-bar", role: "progressbar", "aria-label": "Recording progress" }, el.fill),
+    h("div", { class: "en-meter", "aria-hidden": "true" }, el.level),
+    el.status,
+    h("p", { class: "en-read", lang: "sv", text: ENROLL_TEXT }),
+    h("div", { class: "btns" }, el.btn)));
+}
+
+function enrollResult(ui, d) {
+  ui.live = false; ui.phase = d.state; ui.el = null;
+  const failed = d.state === "error";
+  const again = () => { ui.existing = true; ui.name = d.name || ui.name; enrollForm(ui); };
+  const retry = () => enrollForm(ui);
+  ui.dlg.replaceChildren(h("div", { class: "mform" },
+    h("h3", { text: failed ? "Could not record the voice" : "Voice added" }),
+    h("p", { class: failed ? "en-err" : "en-ok", role: failed ? "alert" : "status" }, icon(failed ? "alert" : "check"), h("span", { text: d.message })),
+    h("div", { class: "btns" },
+      failed ? h("button", { class: "btn", type: "button", text: "Try again", onclick: retry }) : null,
+      !failed && d.speech_s < ENROLL_GOOD_S ? h("button", { class: "btn", type: "button", text: "Add more voice", onclick: again }) : null,
+      h("button", { class: "btn primary", type: "button", text: failed ? "Close" : "Done", onclick: () => ui.dlg.close() }))));
+  ui.dlg.querySelector(".btn.primary").focus();
+}
+
+function onEnroll(d) {  // SSE "enroll" and the start reply: {state, name, elapsed_s, seconds, level, message, created, speech_s}
+  if (d.state === "done" && S.view === "people") guarded(loadPeople);
+  const ui = enrollUi;
+  if (!ui || !ui.live) return;
+  if (d.state === "idle") {  // cancelled before enough was recorded
+    ui.live = false;
+    if (ui.dlg.open) ui.dlg.close();
+    if (d.message) toast(d.message);
+    return;
+  }
+  if (d.state === "done" || d.state === "error") { enrollResult(ui, d); return; }
+  if (ui.phase !== "active") enrollActive(ui);
+  const el = ui.el, recording = d.state === "recording";
+  const shown = d.state === "processing" ? 0 : d.seconds - d.elapsed_s;
+  el.count.textContent = enrollClock(shown);
+  el.fill.style.width = `${Math.min(100, d.state === "processing" ? 100 : (d.elapsed_s / d.seconds) * 100)}%`;
+  el.level.style.transform = `scaleX(${Math.max(0.02, Math.min(1, d.level || 0))})`;
+  el.status.textContent = d.state === "preparing" ? "Loading the speaker model ..."
+    : recording ? (d.elapsed_s < ENROLL_MIN_S ? "Recording. Read the text aloud." : "Recording. You can finish early now.")
+    : "Learning the voice ...";
+  el.btn.hidden = d.state === "processing";
+  el.btn.textContent = recording && d.elapsed_s >= ENROLL_MIN_S ? "Finish early" : "Cancel";
 }
 
 // ---------------------------------------------------------------- live events (SSE over fetch)
@@ -1594,6 +1779,8 @@ function handleEvent(name, data) {
     if (S.view === "people") guarded(loadPeople);
     if (data.session) guarded(() => refreshMeeting(data.session));
     else for (const id of S.feed.keys()) guarded(() => refreshMeeting(id));
+  } else if (name === "enroll") {
+    onEnroll(data);
   } else if (name === "settings") {
     applyLook(data);
   } else if (name === "sessions" || name === "projects") {
@@ -1719,7 +1906,7 @@ function init() {
   $("empty-new").addEventListener("click", () => guarded(newProject));
   $("empty-add").addEventListener("click", () => guarded(addProject));
   $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => [
-    { label: "Meeting types...", sub: "Board, 1-1, ... each in its own folder", icon: "tag", onclick: () => guarded(editTypes) },
+    { label: "Subfolders...", sub: "Board, 1-1, ... each in its own folder", icon: "folderPlus", onclick: () => guarded(editTypes) },
     "-",
     { label: "Forget project", sub: "Files stay on disk", icon: "forget", danger: true, onclick: () => guarded(forgetProject) }]));
   $("nav-people").addEventListener("click", showPeople);
@@ -1733,6 +1920,7 @@ function init() {
   $("btn-pause").addEventListener("click", () => recordCmd((S.status.recorder || {}).paused ? "resume" : "pause"));
   $("btn-stop").addEventListener("click", () => recordCmd("stop"));
   $("btn-src").addEventListener("click", () => showMenu($("btn-src"), sourceMenu));
+  $("btn-keep").addEventListener("click", () => { S.opts.keep = !S.opts.keep; renderTop(); });  // until Steno closes
   $("rec-type").addEventListener("change", () => { if (S.sel && S.sel !== "inbox") { setRecType(S.sel, $("rec-type").value); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); } });
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });

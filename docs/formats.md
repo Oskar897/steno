@@ -45,7 +45,7 @@ it from lists and counts; nothing else changes.
 
 ```
 <data_dir>/projects.json              # {"projects": [{"path": "...", "types": [{"name", "folder"}]}]}
-<data_dir>/settings.json              # app settings: auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
+<data_dir>/settings.json              # app settings: auto_finalize, auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
 <project folder>/Steno/
   .gitignore                          # "*": meeting text is never committed by accident
   CLAUDE.md                           # how Claude Code should read the meetings (summaries first)

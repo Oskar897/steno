@@ -219,7 +219,7 @@ uv run steno ui --no-browser   # only print the address (add --port N to fix the
 
 Record (same sources and config as `steno record`, optional *Keep audio*), watch the live
 transcript, name speakers (optionally saving the voice to a profile), open past sessions, run
-Finalize / Clean up / Summary / To-do as background jobs, and manage enrolled people. Same data as the CLI:
+Finalize / Clean up / Summary / To-do as background jobs, and manage enrolled people (People > *Add person* / *Add voice* records a short voice sample from the microphone). Same data as the CLI:
 it reads and writes the session folders in `%USERPROFILE%\.steno`.
 
 The UI is plain static HTML/CSS/JS in `src/steno/ui/static/` (no build step, no CDN, no web
