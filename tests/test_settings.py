@@ -90,6 +90,9 @@ def test_theme_and_transparency_settings(make_ui):
     assert settings.update({"palette": "wine"}).palette == "wine"
     assert settings.update({"palette": "neon"}).palette == "wine"  # bad value ignored
     assert c.post("/api/settings", {"palette": "neon"})[0] == 400
+    assert settings.update({"intensity": "strong"}).intensity == "strong"
+    assert settings.update({"intensity": "loud"}).intensity == "strong"  # bad value ignored
+    assert c.post("/api/settings", {"intensity": "loud"})[0] == 400
     assert c.post("/api/settings", {"transparent": 1})[0] == 400
     res = c.post("/api/settings", {"theme": "dark", "transparent": True})[1]["settings"]
     assert res["theme"] == "dark" and res["transparent"] is True

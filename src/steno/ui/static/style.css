@@ -6,8 +6,14 @@
      the "colour palettes" block at the end of this file (html[data-palette]). The only colour
      outside both is --rec, a small red for "recording now" (the live dot), because that signal
      has to be read at a glance. */
-  --ink: #101010;
-  --prussian: #1c1c1c;
+  /* palette tone + strength: how far the surfaces lean toward the palette colour (Settings > Colours) */
+  --tone-d: #1c1c1c;
+  --tone-l: #f0f0f0;
+  --mix: 0%;
+  --a-main: 72%;                   /* opacity of the main / sidebar fill when the background is transparent */
+  --a-side: 62%;
+  --ink: color-mix(in srgb, #101010, color-mix(in srgb, var(--tone-d) 70%, #000) var(--mix));
+  --prussian: color-mix(in srgb, #1c1c1c, var(--tone-d) var(--mix));
   --dusk: #3d3d3d;
   --lavender: #8c8c8c;
   --alabaster: #e6e6e6;
@@ -15,7 +21,7 @@
   --ala-rgb: 230, 230, 230;
   --tint: 140, 140, 140;           /* hairlines and fills on dark */
   --tint-d: 80, 80, 80;            /* hairlines and fills on light */
-  --light-solid: #f0f0f0;
+  --light-solid: color-mix(in srgb, #f0f0f0, var(--tone-l) var(--mix));
   --rec: #ef5b5b;
   /* accent: selected-row marker, focus ring, toggles that are on (default palette: Mono) */
   --accent: #bdbdbd;
@@ -40,9 +46,9 @@
   --raised: rgba(var(--tint), 0.06);
   --field: rgba(var(--ink-rgb), 0.45);            /* input background */
   --highlight: 0 0 0 0 transparent;           /* no top-edge light any more; token kept for old rules */
-  --main: rgba(28, 28, 28, 0.96);
-  --side: rgba(var(--ink-rgb), 0.94);
-  --pop: #282828;                             /* menus, dialogs */
+  --main: color-mix(in srgb, var(--prussian) var(--a-main), transparent);
+  --side: color-mix(in srgb, var(--ink) var(--a-side), transparent);
+  --pop: color-mix(in srgb, var(--prussian), #fff 8%);                            /* menus, dialogs */
   --main-solid: var(--ink);                   /* text colour on light (Stop, Record) buttons */
   --shadow-pop: 0 10px 28px rgba(0, 0, 0, 0.45);
   --ok: var(--accent-text);
@@ -701,9 +707,10 @@ html.light {
   --fill-hi: rgba(var(--tint-d), 0.15);
   --raised: rgba(var(--tint-d), 0.04);
   --field: rgba(255, 255, 255, 0.6);
-  --main: rgba(240, 240, 240, 0.97);
-  --side: rgba(var(--ala-rgb), 0.96);
-  --pop: #f7f7f7;
+  --alabaster: color-mix(in srgb, #e6e6e6, var(--tone-l) var(--mix));
+  --main: color-mix(in srgb, var(--light-solid) var(--a-main), transparent);
+  --side: color-mix(in srgb, color-mix(in srgb, var(--light-solid), #000 5%) var(--a-side), transparent);
+  --pop: color-mix(in srgb, var(--light-solid), #fff 65%);
   --shadow-pop: 0 10px 28px rgba(var(--ink-rgb), 0.16);
   --ok: var(--accent-text);
   --danger: #a33a3a;
@@ -906,3 +913,13 @@ html.light[data-palette="deepsea"] {
 .pal-dots { display: inline-flex; }
 .pal-dots i { width: 12px; height: 12px; border-radius: 50%; margin-left: -3px; border: 1px solid var(--line-hi); }
 .pal-dots i:first-child { margin-left: 0; }
+
+/* colour strength: Subtle = accent on controls only. Medium = selected and pressed states also take the
+   accent (hairlines stay neutral grey). Strong = the surfaces lean toward the palette too, with muted
+   (low-saturation) tones so the accent never gets more saturated, only the grey changes character. */
+html[data-palette="teal"] { --tone-d: #26363c; --tone-l: #eceee6; }
+html[data-palette="wine"] { --tone-d: #3a2427; --tone-l: #f0e9e9; }
+html[data-palette="vintage"] { --tone-d: #353031; --tone-l: #eeeaeb; }
+html[data-palette="deepsea"] { --tone-d: #232d38; --tone-l: #e6ecee; }
+html[data-intensity="medium"] { --fill-hi: rgba(var(--accent-rgb), 0.16); }
+html[data-intensity="strong"] { --mix: 100%; --fill-hi: rgba(var(--accent-rgb), 0.16); }

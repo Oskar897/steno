@@ -656,6 +656,18 @@ async function loadSettings() {
       h("span", { class: "pal-dots" }, h("i"), h("i")), label));
   }
   paintPal();
+  const str = h("div", { class: "seg-ctl", role: "radiogroup", "aria-label": "Colour strength" });
+  const paintStr = () => {
+    for (const b of str.children) {
+      const on = b.dataset.v === LOOK.intensity;
+      b.classList.toggle("on", on); b.setAttribute("aria-checked", String(on));
+    }
+  };
+  for (const [v, label] of [["subtle", "Subtle"], ["medium", "Medium"], ["strong", "Strong"]]) {
+    str.append(h("button", { type: "button", role: "radio", "data-v": v, text: label,
+      onclick: async () => { LOOK.intensity = v; paintStr(); applyLook(); await saveLook({ intensity: v }); paintStr(); } }));
+  }
+  paintStr();
   seg.addEventListener("click", () => setTimeout(paintPal, 0));
   const strip = h("input", { type: "checkbox", class: "switch", id: "set-mini" });
   strip.checked = s.mini_strip !== false;
@@ -676,6 +688,8 @@ async function loadSettings() {
         h("div", { class: "pn" }, h("div", { text: "Theme" }), h("div", { class: "sub", text: "System follows Windows' light or dark app mode." })), seg),
       h("div", { class: "set-row static" },
         h("div", { class: "pn" }, h("div", { text: "Colours" }), h("div", { class: "sub", text: "Accent colour on grey surfaces. Every palette has a dark and a light version." })), pal),
+      h("div", { class: "set-row static" },
+        h("div", { class: "pn" }, h("div", { text: "Colour strength" }), h("div", { class: "sub", text: "Subtle: colour on buttons and focus only. Medium: selected items take the colour too. Strong: the background also leans toward it, muted." })), str),
       h("label", { class: "set-row", for: "set-transparent" },
         h("div", { class: "pn" }, h("div", { text: "Transparent background" }), h("div", { class: "sub", text: "Your wallpaper shows softly through the window. Off: solid background." })), glass),
       h("label", { class: "set-row", for: "set-mini" },
@@ -2433,12 +2447,13 @@ const PALETTES = [
   ["vintage", "Vintage", ["#bcabae", "#716969"], ["#716969", "#2d2e2e"]],
   ["deepsea", "Deep sea", ["#1b98e0", "#006494"], ["#006494", "#247ba0"]],
 ];
-const LOOK = { theme: "system", palette: "mono", transparent: true };
+const LOOK = { theme: "system", palette: "mono", intensity: "subtle", transparent: true };
 const systemLight = window.matchMedia("(prefers-color-scheme: light)");
 function applyLook(s) {
   if (s && typeof s === "object") {
     if (["system", "dark", "light"].includes(s.theme)) LOOK.theme = s.theme;
     if (PALETTES.some((p) => p[0] === s.palette)) LOOK.palette = s.palette;
+    if (["subtle", "medium", "strong"].includes(s.intensity)) LOOK.intensity = s.intensity;
     if (typeof s.transparent === "boolean") LOOK.transparent = s.transparent;
   }
   const light = LOOK.theme === "light" || (LOOK.theme === "system" && systemLight.matches);
@@ -2446,6 +2461,7 @@ function applyLook(s) {
   root.classList.toggle("light", light);
   root.classList.toggle("solid", !LOOK.transparent);
   root.dataset.palette = LOOK.palette;
+  root.dataset.intensity = LOOK.intensity;
   root.style.colorScheme = light ? "light" : "dark";
   remember("steno-look", JSON.stringify(LOOK));  // no flash of the wrong theme on the next start
   const api = window.pywebview && window.pywebview.api;
