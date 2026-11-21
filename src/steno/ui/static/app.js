@@ -474,6 +474,9 @@ function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
 
 const curProject = () => S.projects.find((p) => p.id === S.sel) || null;
 const INBOX_NAME = "Inbox / TBD";
+// The server calls an unnamed meeting "Meeting" (projects.DEFAULT_TITLE); the app shows it as untitled.
+const DEFAULT_TITLE = "Meeting";
+const titleOf = (info) => (info && info.title && info.title !== DEFAULT_TITLE ? info.title : "");
 const projectName = (id) => (id === "inbox" || !id ? INBOX_NAME : (S.projects.find((p) => p.id === id) || {}).name || "project");
 
 const projTypes = (pid) => ((S.projects.find((p) => p.id === pid) || {}).types || []);
@@ -663,7 +666,7 @@ async function loadSettings() {
     h("div", { class: "group" }, h("div", { class: "set-row static", id: "set-llm" })));
   renderSettingsLlm();
   page.append(h("h2", { class: "set-h", text: "After a meeting" }),
-    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Title, Clean up, Summary and To-do use Claude (Haiku), about 10-30 s each. Off: use the buttons on each meeting." }),
+    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Title, Clean up, Summary and To-do use Claude, about 10-30 s each. Off: use the buttons on each meeting." }),
     group);
   for (const [key, label, sub] of AUTO) {
     const box2 = h("input", { type: "checkbox", class: "switch", id: `set-${key}` });
@@ -693,7 +696,7 @@ async function loadSettings() {
     h("div", { class: "group" },
       kv("Speech recognition", cfg.asr_model), kv("Language model", cfg.llm_model),
       kv("Version", S.status.version ? "v" + S.status.version : ""),
-      kv("Data", "Stays on this computer")));
+      kv("Data", "Audio stays on this computer. Only transcript text goes to Claude, for Title, Clean up, Summary and To-do.")));
 }
 
 function sideMeetings(id) {
@@ -711,8 +714,8 @@ function sideMeetings(id) {
     more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => meetingItems(info, id, null)); });
     const full = niceDate(info.started_at);  // the row shows a relative label; the tooltip the exact time
     const main = h("button", { class: "mitem" + (active ? " active" : ""), type: "button",
-      title: (info.title || "Untitled meeting") + (full ? "\n" + full : ""), onclick: () => selectMeeting(id, info.session) },
-    h("span", { class: "mi-title" + (info.title ? "" : " untitled"), text: info.title || "Untitled meeting" }),
+      title: (titleOf(info) || "Untitled meeting") + (full ? "\n" + full : ""), onclick: () => selectMeeting(id, info.session) },
+    h("span", { class: "mi-title" + (titleOf(info) ? "" : " untitled"), text: titleOf(info) || "Untitled meeting" }),
     live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: relDate(info.started_at) }));
     armDrag(main, info, id);
     const dragged = DRAG.active && DRAG.active.info.session === info.session;
@@ -815,12 +818,10 @@ function renderSide() {
   renderSideFoot();
 }
 
-function renderSideFoot() {
+function renderSideFoot() {  // only shown while the connection to the local server is lost
   const foot = $("side-foot");
-  foot.classList.toggle("off", !S.connected);
-  foot.replaceChildren(h("i", { class: "state" }),
-    h("span", { text: S.connected ? "On this computer" : "Reconnecting..." }));
-  foot.title = S.connected ? "Everything runs locally. Only Clean up, Summary, To-do and automatic titles send transcript text to Claude." : "";
+  foot.hidden = !!S.connected;
+  if (!S.connected && !foot.firstChild) foot.replaceChildren(h("i", { class: "state" }), h("span", { text: "Reconnecting..." }));
 }
 
 // ---------------------------------------------------------------- Claude Code status (AI features)
@@ -889,7 +890,7 @@ function renderSideLlm() {
   if (waiting) { label = "Waiting for sign-in..."; cls = "wait"; tip = "Finish signing in to Claude in the browser window that opened."; }
   else if (st === "ok") {
     label = "Claude"; cls = "ok";
-    tip = `Claude is signed in${llmDetail() ? " (" + llmDetail() + ")" : ""}. Summary, To-do, Clean up and automatic titles use it. Click to check again.`;
+    tip = `Claude is signed in${llmDetail() ? " (" + llmDetail() + ")" : ""}. Summary, To-do, Clean up and automatic titles use it. Click for options.`;
   } else if (aiOff()) {
     label = AI_OFF_TEXT[st]; cls = "warn";
     tip = st === "missing" ? "Install Claude Code to use Summary, To-do, Clean up and automatic titles." : "Log in to Claude to use Summary, To-do, Clean up and automatic titles.";
@@ -950,14 +951,15 @@ function renderAutoTitle() {
   const typed = !active && !!input.value.trim();
   const off = aiOff();
   const on = (active ? !!r.auto_title : S.autoTitle) && !off && !typed;
-  input.placeholder = on && aiOk() ? "Title is written after the meeting" : "Untitled meeting";
+  input.placeholder = on && aiOk() ? "Title, or let Claude name it" : "Meeting title (optional)";
   let tip;
-  if (off) tip = AI_OFF_TEXT[S.llm.state];
-  else if (typed) tip = "Auto title is not used: you typed a title.";
-  else if (on) tip = "Auto title: ON. Claude names the meeting after it ends, if you do not. Click to turn off for this meeting.";
-  else tip = "Auto title: off. Click to let Claude name this meeting after it ends.";
+  if (off) tip = `${AI_OFF_TEXT[S.llm.state]}. Log in under Settings to use Auto title.`;
+  else if (typed) tip = "Auto title is not needed: you typed a title. Clear the field to use it.";
+  else if (st === "stopping") tip = "The meeting is being saved.";
+  else if (on) tip = "Auto title is ON: Claude names the meeting when it ends. Click to turn it off for this meeting.";
+  else tip = "Auto title is off. Click to let Claude name this meeting when it ends. You can also press Auto title on the meeting afterwards.";
   for (const b of [$("btn-autotitle"), $("btn-autotitle-live")]) {
-    b.disabled = off || st === "stopping";
+    b.disabled = off || typed || st === "stopping";
     b.setAttribute("aria-pressed", String(on));
     b.classList.toggle("on", on);
     b.title = tip;
@@ -1026,7 +1028,7 @@ function renderTop() {
   $("rec-title").disabled = noProject || active;
   const rec = $("btn-rec");
   rec.disabled = noProject || st === "starting" || st === "stopping";
-  $("btn-rec-label").textContent = st === "starting" ? "Loading models" : "Record";
+  $("btn-rec-label").textContent = st === "starting" ? "Starting..." : "Record";
   const pause = $("btn-pause");
   if (pause.dataset.paused !== String(!!r.paused)) {
     pause.dataset.paused = String(!!r.paused);
@@ -1058,18 +1060,31 @@ function renderTop() {
   updateButtons();
 }
 
+// Subfolder of the next meeting: a button in the dock that opens a menu (a native <select> drops a
+// white list on Windows that ignores the theme).
 function renderTypeSelect(proj, active) {
-  const sel = $("rec-type");
+  const btn = $("rec-type");
   const types = proj ? proj.types || [] : [];
-  sel.hidden = !types.length;
-  sel.disabled = active;
+  btn.hidden = !types.length;
+  btn.disabled = active;
   if (!types.length) return;
-  const key = proj.id + "|" + types.map((t) => t.name).join("|");
-  if (sel.dataset.key !== key) {
-    sel.dataset.key = key;
-    sel.replaceChildren(...types.map((t) => h("option", { value: t.name, text: t.name })), h("option", { value: "", text: "Project root" }));
-  }
-  sel.value = recType(proj.id);
+  const cur = recType(proj.id);
+  const key = [proj.id, proj.name, cur, ...types.map((t) => t.name)].join("|");
+  if (btn.dataset.key === key) return;
+  btn.dataset.key = key;
+  btn.replaceChildren(icon("folder"), h("span", { class: "dt-name", text: cur || "Project root" }), icon("chevron"));
+  btn.title = `Saved in: ${proj.name} › ${cur || "project root"}. Click to change.`;
+}
+
+function typeMenuItems() {
+  const proj = curProject();
+  if (!proj) return [];
+  const cur = recType(proj.id);
+  const pick = (name) => () => { setRecType(proj.id, name); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); };
+  return [{ header: "Save the next meeting in" },
+    ...(proj.types || []).map((t) => ({ label: t.name, sub: t.folder || null, icon: t.name === cur ? "check" : "folder", onclick: pick(t.name) })),
+    "-",
+    { label: "Project root", sub: "Steno/", icon: cur ? "folder" : "check", onclick: pick("") }];
 }
 
 /* Edit a project's meeting types: name + folder (inside the project) per row. */
@@ -1083,7 +1098,7 @@ function typesModal(p) {
       let auto = !t.folder;  // follow the name until the folder is edited by hand
       name.addEventListener("input", () => { if (auto) folder.value = name.value.trim() ? "Meetings/" + name.value.trim() : ""; });
       folder.addEventListener("input", () => { auto = false; });
-      const rm = h("button", { class: "icon-btn", type: "button", title: "Remove type (only when it has no meetings)", "aria-label": "Remove type" }, icon("x"));
+      const rm = h("button", { class: "icon-btn", type: "button", title: "Remove subfolder (only when it has no meetings)", "aria-label": "Remove subfolder" }, icon("x"));
       const row = h("div", { class: "typerow" }, name, folder, rm);
       rm.addEventListener("click", () => row.remove());
       list.append(row);
@@ -1108,7 +1123,7 @@ function typesModal(p) {
     h("p", { text: "Each type saves its meetings in its own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Meetings without a type stay in Steno/. No types = one simple list." }),
     h("div", { class: "typehead" }, h("span", { text: "Name" }), h("span", { text: "Folder in the project" })),
     list,
-    h("button", { class: "btn", type: "button", onclick: () => addRow({}).focus() }, icon("plus"), h("span", { text: "Add type" })),
+    h("button", { class: "btn", type: "button", onclick: () => addRow({}).focus() }, icon("plus"), h("span", { text: "Add subfolder" })),
     err,
     h("div", { class: "btns" },
       h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) }),
@@ -1169,7 +1184,7 @@ async function editTypes() {
   if (!p) return;
   const types = await typesModal(p);
   if (!types) return;
-  toast(types.length ? `Subfolders saved (${types.length})` : "Subfolders removed: one simple list");
+  toast(types.length ? `Subfolders saved (${types.length})` : "All subfolders removed");
   await loadProjects();
 }
 
@@ -1305,6 +1320,7 @@ async function loadFeed() {
   for (const ev of S.buffer) { const m = S.feed.get(ev.session); if (m && m.detail) appendSegment(m, ev.segment, true); }
   S.buffer = [];
   renderSide();
+  renderTop();  // the header and the dock's subfolder follow the meeting that just loaded
   renderFeed();
 }
 
@@ -1343,7 +1359,7 @@ function renderFeed() {
   const changed = feed.dataset.meeting !== String(S.meeting);
   feed.dataset.meeting = String(S.meeting);
   feed.replaceChildren();
-  if (!S.sel) { feed.append(h("p", { class: "hint", text: "No project selected." })); return; }
+  if (!S.sel) { feed.append(h("p", { class: "hint", text: "Select or create a project in the sidebar." })); return; }
   if (S.meeting === "new") {
     feed.append(newCard());
     renderJump();
@@ -1374,12 +1390,15 @@ function newCard() {
 }
 
 function jobLabel(job) {
-  return { summary: "Summarizing", todo: "Extracting to-dos", clean: "Cleaning up", finalize: "Finalizing", auto: "After meeting" }[job.kind] || String(job.kind);
+  return { summary: "Summarizing", todo: "Extracting to-dos", clean: "Cleaning up", finalize: "Finalizing", auto: "After meeting", title: "Writing a title" }[job.kind] || String(job.kind);
 }
 function jobText(job) {
   const stage = job.stage && job.stage !== "waiting for Claude" ? " · " + job.stage : "";
   return jobLabel(job) + stage + (job.total ? ` ${job.done}/${job.total}` : "");
 }
+
+// what a job is called in toasts (job.kind is the server's internal name)
+const JOB_NAMES = { summary: "Summary", todo: "To-do", clean: "Clean up", finalize: "Speakers", auto: "After-meeting steps", title: "Title" };
 
 const busyJob = () => !!(S.status.job && S.status.job.state === "running");
 
@@ -1431,7 +1450,7 @@ async function meetingTranscript(info) {
   const detail = m && m.detail ? m.detail : await api("GET", `/api/sessions/${encodeURIComponent(info.session)}`);
   const segs = detail.segments || [];
   if (!segs.length) throw new Error("This meeting has no transcript lines yet.");
-  return transcriptText(info.title, info.started_at, segs);
+  return transcriptText(titleOf(info), info.started_at, segs);
 }
 
 // ---------------------------------------------------------------- meeting actions (⋯ in the sidebar and on the meeting)
@@ -1453,11 +1472,11 @@ function meetingItems(info, pid, titleBtn) {
   items.push(
     { label: "Copy transcript", icon: "copy", onclick: () => guarded(async () => copyText(await meetingTranscript(info), "Transcript")) },
     { label: "Rename", icon: "pencil", onclick: () => (titleBtn && titleBtn.isConnected ? renameMeeting(S.feed.get(sid), titleBtn) : guarded(() => renameByDialog(info))) },
-    { label: "Move...", sub: "Other project or meeting type", icon: "move", disabled: live || !S.projects.length, onclick: () => guarded(() => moveMeeting(info, pid)) },
+    { label: "Move...", sub: "Other project or subfolder", icon: "move", disabled: live || !S.projects.length, title: live ? "Stop the recording first" : null, onclick: () => guarded(() => moveMeeting(info, pid)) },
     "-",
     info.archived
       ? { label: "Unarchive", sub: "Show it in the list again", icon: "unarchive", onclick: () => guarded(() => archiveMeeting(info, pid, false)) }
-      : { label: "Archive", sub: "Hide it in the app; files stay", icon: "archive", disabled: live, onclick: () => guarded(() => archiveMeeting(info, pid, true)) },
+      : { label: "Archive", sub: "Hide it in the app; files stay", icon: "archive", disabled: live, title: live ? "Stop the recording first" : null, onclick: () => guarded(() => archiveMeeting(info, pid, true)) },
     { label: "Delete...", icon: "trash", danger: true, disabled: live || job, title: live ? "Stop the recording first" : job ? "A job is running on it" : null,
       onclick: () => guarded(() => deleteMeeting(info, pid)) });
   return items;
@@ -1466,7 +1485,7 @@ function meetingItems(info, pid, titleBtn) {
 function meetingMenu(m, titleBtn) { return meetingItems(m.info, S.sel, titleBtn); }
 
 async function renameByDialog(info) {
-  const v = await formModal({ title: "Rename meeting", fields: [{ key: "title", label: "Title", value: info.title || "", placeholder: "Meeting title" }], ok: "Rename" });
+  const v = await formModal({ title: "Rename meeting", fields: [{ key: "title", label: "Title", value: titleOf(info), placeholder: "Meeting title" }], ok: "Rename" });
   if (!v || !v.title || v.title === info.title) return;
   await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/rename`, { title: v.title });
   for (const list of S.lists.values()) for (const i of list) if (i.session === info.session) i.title = v.title;
@@ -1486,7 +1505,7 @@ async function archiveMeeting(info, pid, archived) {
 }
 
 async function deleteMeeting(info, pid) {
-  const name = info.title || "Untitled meeting";
+  const name = titleOf(info) || "Untitled meeting";
   const ok = await formModal({ title: "Delete meeting",
     text: `Delete "${name}" (${niceDate(info.started_at)})? Its transcript, summary, to-do, voice data and any kept audio are removed from this computer and from the project folder. This cannot be undone.`,
     ok: "Delete", danger: true });
@@ -1503,7 +1522,7 @@ async function deleteMeeting(info, pid) {
 function buildMeeting(m) {
   const info = m.info, sid = info.session;
   m.rows = new Map();
-  const titleBtn = h("button", { class: "mtitle" + (info.title ? "" : " untitled"), type: "button", title: "Click to rename", text: info.title || "Untitled meeting", onclick: () => renameMeeting(m, titleBtn) });
+  const titleBtn = h("button", { class: "mtitle" + (titleOf(info) ? "" : " untitled"), type: "button", title: "Click to rename", text: titleOf(info) || "Untitled meeting", onclick: () => renameMeeting(m, titleBtn) });
   m.durEl = h("span", { class: "mdur" });
   const more = h("button", { class: "icon-btn", type: "button", "aria-label": "Meeting actions", title: "Meeting actions", "aria-haspopup": "menu" }, icon("more"));
   more.addEventListener("click", () => showMenu(more, () => meetingMenu(m, titleBtn)));
@@ -1516,7 +1535,9 @@ function buildMeeting(m) {
   const bar = h("div", { class: "mbar" },
     act("summary", m.docs.summary ? "Redo summary" : "Summary", "spark", m.docs.summary ? "Summarize again with Claude (sends transcript text only)" : "Summarize with Claude (sends transcript text only)"),
     act("todo", m.docs.todo ? "Redo to-do" : "To-do", "todo", m.docs.todo ? "Extract to-dos again with Claude" : "Extract explicit commitments with Claude"),
-    act("clean", "Clean up", "wand", "Fix misheard words and punctuation with Claude"));
+    act("clean", "Clean up", "wand", "Fix misheard words and punctuation with Claude"),
+    // only for an untitled meeting: Claude names it from what was said (same as the automatic title)
+    titleOf(info) ? null : act("title", "Auto title", "heading", "Let Claude name this meeting from what was said (sends transcript text only)"));
   m.jobEl = h("div", { class: "mjob", hidden: true });
   m.docsEl = h("div", { class: "docs" });
   m.linesEl = h("div", { class: "lines" });
@@ -1552,7 +1573,7 @@ function syncEmptyNote(m) {
   if (!note) {
     m.linesEl.append(m.info.recording
       ? h("div", { class: "empty-meeting" }, h("span", { class: "spinner" }), "Listening. Lines appear a few seconds after someone speaks.")
-      : h("div", { class: "empty-meeting", text: "No transcript lines." }));
+      : h("div", { class: "empty-meeting", text: "Nothing was transcribed. Check the audio sources (the microphone icon next to Record) and try again." }));
   }
 }
 
@@ -1618,6 +1639,7 @@ async function refreshMeeting(session, openKind) {
   const m = S.feed.get(session);
   if (!m || !m.el) return;
   await fetchDetail(m);
+  if (m.detail.title) m.info.title = m.detail.title;  // e.g. a title Claude just wrote
   if (openKind && m.docs[openKind]) m.open[openKind] = true;
   m.el.replaceWith(buildMeeting(m));
   if (S.stick) scrollToEnd();
@@ -1663,12 +1685,18 @@ function updateJobLines() {
 }
 
 function updateButtons() {
-  const busy = busyJob(), off = aiOff();
+  const busy = busyJob(), off = aiOff(), r = S.status.recorder || {};
   for (const m of S.feed.values()) {
-    for (const b of Object.values(m.btns || {})) {
-      b.disabled = busy;
+    const live = m.info.recording || (r.session === m.info.session && r.state && r.state !== "idle");
+    const empty = !(m.detail && m.detail.segments && m.detail.segments.length);
+    for (const [kind, b] of Object.entries(m.btns || {})) {
+      // why the button cannot be pressed right now, if it cannot (shown as its tooltip)
+      const why = busy ? "Wait: another job is running"
+        : live && kind !== "summary" && kind !== "todo" ? "Available when the meeting has ended"
+        : empty ? "Available once the meeting has transcript lines" : "";
+      b.disabled = !!why;
       b.classList.toggle("ai-off", off);  // stays visible; a click explains and offers the login
-      b.title = busy ? "Another job is running" : off ? `${AI_OFF_TEXT[S.llm.state]}. Click for options.` : b.dataset.tip;
+      b.title = why || (off ? `${AI_OFF_TEXT[S.llm.state]}. Click for options.` : b.dataset.tip);
     }
   }
 }
@@ -1697,7 +1725,7 @@ function renderDocs(m) {
 
 function renameMeeting(m, btn) {
   if (!btn.isConnected) return;
-  const input = h("input", { class: "text mtitle-in", type: "text", value: m.info.title || "", placeholder: "Meeting title", maxlength: "80", "aria-label": "Meeting title" });
+  const input = h("input", { class: "text mtitle-in", type: "text", value: titleOf(m.info), placeholder: "Meeting title", maxlength: "80", "aria-label": "Meeting title" });
   let done = false;
   const finish = async (save) => {
     if (done) return; done = true;
@@ -1706,6 +1734,7 @@ function renameMeeting(m, btn) {
       const res = await guarded(() => api("POST", `/api/meetings/${encodeURIComponent(m.info.session)}/rename`, { title }));
       if (res) {
         m.info.title = title; btn.textContent = title; btn.classList.remove("untitled");
+        if (m.btns.title) { m.btns.title.remove(); delete m.btns.title; }  // named: no Auto title any more
         for (const list of S.lists.values()) for (const i of list) if (i.session === m.info.session) i.title = title;
         renderSide();
       }
@@ -1722,7 +1751,7 @@ async function moveMeeting(info, current) {
   const options = [];
   for (const p of S.projects) {
     const types = p.types || [];
-    options.push({ value: p.id, label: types.length ? `${p.name} (project root)` : p.name });
+    options.push({ value: p.id, label: types.length ? `${p.name} (no subfolder)` : p.name });
     for (const t of types) options.push({ value: `${p.id}|${t.name}`, label: `${p.name} › ${t.name}` });
   }
   options.push({ value: "inbox", label: INBOX_NAME });
@@ -2123,8 +2152,8 @@ function personRow(p, i) {
     h("span", { class: "avatar", "aria-hidden": "true", text: initials(p.name) }),
     h("div", { class: "pn" }, h("div", { text: p.name }), h("div", { class: "sub", text: `${p.embeddings} voice sample${p.embeddings === 1 ? "" : "s"} · updated ${niceDate(p.updated)}` })),
     h("button", { class: "btn small", type: "button", title: "Record more of this person's voice", onclick: () => openEnroll(p) }, icon("mic"), "Add voice"),
-    h("button", { class: "icon-btn", type: "button", title: "Rename", "aria-label": "Rename", onclick: edit }, icon("pencil")),
-    h("button", { class: "icon-btn", type: "button", title: "Delete", "aria-label": "Delete", onclick: () => removePerson(p) }, icon("trash")));
+    h("button", { class: "icon-btn", type: "button", title: "Rename person", "aria-label": "Rename person", onclick: edit }, icon("pencil")),
+    h("button", { class: "icon-btn", type: "button", title: "Delete person", "aria-label": "Delete person", onclick: () => removePerson(p) }, icon("trash")));
   const edit = () => {
     const input = h("input", { class: "text", type: "text", value: p.name, maxlength: "80", "aria-label": "New name" });
     row.replaceChildren(h("form", { onsubmit: async (ev) => {
@@ -2329,10 +2358,13 @@ function onJob(job) {
   else if (S.status.job && S.status.job.id === job.id) S.status.job = null;
   updateJobLines(); updateButtons(); renderStrip();
   if (job.state !== "running" && prev !== job.state) {
-    if (job.state === "error") toast(/^Not logged in to Claude/.test(job.error) ? job.error : `${job.kind} failed: ${job.error}`, "error");
+    const name = JOB_NAMES[job.kind] || String(job.kind);
+    if (job.state === "error") toast(/^Not logged in to Claude/.test(job.error) ? job.error : `${name} failed: ${job.error}`, "error");
     else {
-      toast(`${job.kind} done${job.message ? ": " + job.message : ""}`);
+      const msg = job.message || "";
+      toast(job.kind === "title" && msg.startsWith("titled: ") ? `Named "${msg.slice(8)}"` : `${name} done${msg ? ": " + msg : ""}`);
       guarded(() => refreshMeeting(job.session, job.kind === "summary" || job.kind === "todo" ? job.kind : null));
+      if (job.kind === "title" || job.kind === "auto") scheduleProjects();  // the new title in the sidebar
     }
   }
 }
@@ -2447,7 +2479,7 @@ function init() {
   });
   $("rec-title").addEventListener("input", renderAutoTitle);
   window.addEventListener("focus", () => fetchLlm(false));  // cheap: the server keeps the answer for a minute
-  $("rec-type").addEventListener("change", () => { if (S.sel && S.sel !== "inbox") { setRecType(S.sel, $("rec-type").value); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); } });
+  $("rec-type").addEventListener("click", () => { if (S.sel && S.sel !== "inbox") showMenu($("rec-type"), typeMenuItems); });
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });
   $("jump").addEventListener("click", () => { S.stick = true; scrollToEnd(); });

@@ -1,12 +1,13 @@
 /* Mini strip: the small always-on-top recording window (pause, stop, hide; drag to move). */
 :root {
-  --bg: #212120; --fill: rgba(255, 255, 255, 0.06); --fill-hi: rgba(255, 255, 255, 0.12); --line: rgba(255, 255, 255, 0.14);
-  --text: #ececeb; --dim: #b8b8b4; --faint: #8e8e8a; --accent: #ff5a1f; --accent-btn: #c8470f;
+  /* palette: Ink Black, Prussian Blue, Dusk Blue, Lavender Grey, Alabaster Grey (+ the recording red) */
+  --bg: #1b263b; --fill: rgba(119, 141, 169, 0.12); --fill-hi: rgba(119, 141, 169, 0.24); --line: rgba(119, 141, 169, 0.3);
+  --text: #e0e1dd; --dim: #b4c3d6; --faint: #8fa2bb; --accent: #ef5b5b; --accent-btn: #e0e1dd; --accent-btn-text: #0d1b2a; --accent-btn-hi: #f1f2ee;
   font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 html.light {
-  --bg: #fcfcfb; --fill: rgba(0, 0, 0, 0.045); --fill-hi: rgba(0, 0, 0, 0.09); --line: rgba(0, 0, 0, 0.16);
-  --text: #1c1c1b; --dim: #4a4a48; --faint: #6c6c68;
+  --bg: #ecede9; --fill: rgba(65, 90, 119, 0.08); --fill-hi: rgba(65, 90, 119, 0.16); --line: rgba(65, 90, 119, 0.3);
+  --text: #0d1b2a; --dim: #1b263b; --faint: #4a6280; --accent-btn: #1b263b; --accent-btn-text: #e0e1dd; --accent-btn-hi: #0d1b2a;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); user-select: none; }
@@ -29,8 +30,8 @@ button { font: inherit; color: inherit; }
 .b:hover { background: var(--fill-hi); }
 .b:disabled { opacity: 0.4; cursor: default; }
 .b svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
-.b.stop { background: var(--accent-btn); color: #fff; }
-.b.stop:hover { background: #b83f0a; }
+.b.stop { background: var(--accent-btn); color: var(--accent-btn-text); }
+.b.stop:hover { background: var(--accent-btn-hi); }
 .b.stop svg { fill: currentColor; width: 11px; height: 11px; }
 .b.hide { width: 18px; background: none; color: var(--faint); }
 .b.hide:hover { background: var(--fill); color: var(--text); }

@@ -624,7 +624,7 @@ def run_app(cfg: Config, *, debug: bool = False) -> int:
     mini = webview.create_window(
         MINI_TITLE, url=server.mini_url, js_api=mini_bridge, width=mw, height=mh, x=mx, y=my,
         resizable=False, frameless=True, easy_drag=False, on_top=True, hidden=True,
-        focus=False, background_color="#1f1f25", min_size=(mw, mh),
+        focus=False, background_color="#1b263b", min_size=(mw, mh),
     )
     mini_bridge._mini = mini
 
