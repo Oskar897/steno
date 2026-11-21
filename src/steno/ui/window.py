@@ -31,6 +31,8 @@ _mutex = None  # held for the life of the process
 # DwmSetWindowAttribute ids (Windows 11)
 _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 _DWMWA_WINDOW_CORNER_PREFERENCE = 33
+_DWMWA_BORDER_COLOR = 34
+_DWMWA_COLOR_NONE = -2  # 0xFFFFFFFE as a signed int: DWM draws no border line around the window
 _DWMWA_SYSTEMBACKDROP_TYPE = 38
 _DWMSBT_MAINWINDOW = 2  # Mica: the wallpaper, smoothly blurred (not the windows behind)
 _DWMWCP_ROUND = 2
@@ -88,20 +90,29 @@ class Bridge:
             return None
         return str(result[0] if isinstance(result, list | tuple) else result)
 
-    def open_meeting_folder(self, session_id: str) -> bool:
-        """Show a meeting's folder in Explorer. Only meeting folders, found from the id."""
-        import re
+    def open_folder(self, kind: str, ref: str | None = None, mtype: str | None = None) -> bool:
+        """Show a folder in Explorer: ``meeting`` (ref = session id), ``project`` (ref = project
+        id), ``type`` (ref = project id, mtype = subfolder name) or ``inbox``. The path is
+        resolved here from ids and names (``projects.folder_to_open``), never from the page."""
+        from steno import projects
 
-        from steno import projects, transcript
-
-        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+        if sys.platform != "win32" or not isinstance(kind, str):
             return False
-        d = transcript.resolve_session(session_id)
-        folder = projects.meeting_folder(d) if d is not None else None
-        if folder is None or sys.platform != "win32":
+        if not all(v is None or isinstance(v, str) for v in (ref, mtype)):
+            return False
+        try:
+            folder = projects.folder_to_open(kind, ref, mtype)
+        except Exception:
+            log.debug("could not resolve the folder to open", exc_info=True)
+            return False
+        if folder is None or not folder.is_dir():
             return False
         os.startfile(folder)  # noqa: S606 - a folder path we resolved ourselves
         return True
+
+    def open_meeting_folder(self, session_id: str) -> bool:
+        """Show a meeting's folder in Explorer (an inbox session: its session folder)."""
+        return self.open_folder("meeting", session_id)
 
 
 class MiniBridge:
@@ -453,6 +464,7 @@ def apply_glass(window, dark: bool = True) -> bool:
             return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
 
         set_attr(_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND)
+        set_attr(_DWMWA_BORDER_COLOR, _DWMWA_COLOR_NONE)  # no 1px frame line around the whole app
         ok = _dwm_look(hwnd, dark)
         dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(_Margins(-1, -1, -1, -1)))
         return ok

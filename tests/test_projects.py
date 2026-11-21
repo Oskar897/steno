@@ -223,3 +223,139 @@ def test_meeting_types_api(make_ui, tmp_path):
     assert c.get(f"/api/sessions/{sid}")[1]["type"] == "Board"
     assert c.post(f"/api/meetings/{sid}/move", {"project": pid, "type": None})[1]["type"] is None
     assert c.get(f"/api/projects/{pid}/meetings")[1]["meetings"][0]["type"] is None
+
+
+# --------------------------------------------------------------------------- moving around
+
+
+def _club(tmp_path):
+    p = projects.add_project(tmp_path, name="Club", create=True)
+    return projects.set_types(p.id, [{"name": "Board"}, {"name": "Dev team"}])
+
+
+def test_move_to_the_inbox_and_back(tmp_path):
+    p = _club(tmp_path)
+    w = make_session("2026-11-20T10:00:00", LINES)
+    m = projects.create_meeting(p, w.dir, "Lobby days", "Board")
+    (w.dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
+    projects.sync(w.dir)
+    assert (m.folder / "summary.md").is_file() and projects.inbox_sessions() == []
+
+    out = projects.move_to_inbox(w.dir)
+    assert not m.folder.exists() and out.title == "Lobby days"
+    assert (p.path / "Meetings" / "Board").is_dir()  # the subfolder itself stays
+    assert projects.meeting_folder(w.dir) is None and projects.project_of(w.dir) is None
+    assert projects.meeting_title(w.dir) == "Lobby days"
+    assert [s.id for s in projects.inbox_sessions()] == [w.dir.name]
+    assert (w.dir / "summary.md").read_text(encoding="utf-8") == "# Summary\n"  # nothing lost
+    assert projects.list_meetings(p) == []
+    assert "Lobby days" not in (p.steno_dir / "index.md").read_text(encoding="utf-8")
+    assert projects.move_to_inbox(w.dir).folder == w.dir  # already there: nothing happens
+
+    back = projects.move_meeting(w.dir, p, "Dev team")
+    assert back.folder == p.path / "Meetings" / "Dev team" / "2026-11-20 Lobby days"
+    assert (back.folder / "summary.md").is_file() and "Hello there" in (
+        back.folder / "transcript.md").read_text(encoding="utf-8")
+    assert projects.inbox_sessions() == [] and projects.type_of(w.dir) == "Dev team"
+
+
+def test_move_to_the_inbox_keeps_a_folder_with_other_files(tmp_path):
+    p = _club(tmp_path)
+    w = make_session("2026-11-20T10:00:00", LINES)
+    m = projects.create_meeting(p, w.dir, "Notes")
+    (w.dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
+    projects.sync(w.dir)
+    (m.folder / "mine.txt").write_text("my own notes", encoding="utf-8")
+    (m.folder / "summary.md").write_text("# Summary, edited by hand\n", encoding="utf-8")
+
+    projects.move_to_inbox(w.dir)
+    assert (m.folder / "mine.txt").read_text(encoding="utf-8") == "my own notes"
+    assert "edited by hand" in (m.folder / "summary.md").read_text(encoding="utf-8")
+    assert not (m.folder / projects.MEETING_FILE).exists()  # no longer a meeting
+    assert projects.list_meetings(p) == []
+    assert [s.id for s in projects.inbox_sessions()] == [w.dir.name]
+
+
+def test_move_between_subfolders_and_root_handles_name_clashes(tmp_path):
+    p = _club(tmp_path)
+    one = make_session("2026-11-20T10:00:00", LINES)
+    two = make_session("2026-11-20T11:00:00", LINES)
+    a = projects.create_meeting(p, one.dir, "Sync", "Board")
+    b = projects.create_meeting(p, two.dir, "Sync", "Dev team")
+    assert a.folder.name == b.folder.name == "2026-11-20 Sync"
+
+    moved = projects.move_meeting(two.dir, p, "Board")  # same name already in Board
+    assert moved.folder == p.path / "Meetings" / "Board" / "2026-11-20 Sync (2)"
+    assert a.folder.is_dir() and projects.type_of(two.dir) == "Board"
+    assert not b.folder.exists()
+    assert projects.move_meeting(two.dir, p, "Board").folder == moved.folder  # same place
+
+    root = projects.move_meeting(one.dir, p)
+    assert root.folder.parent == p.steno_dir and projects.type_of(one.dir) is None
+    sub = projects.move_meeting(one.dir, p, "Dev team")
+    assert sub.folder.parent == p.path / "Meetings" / "Dev team"
+    assert sorted(m.session for m in projects.list_meetings(p)) == sorted(
+        [one.dir.name, two.dir.name])
+
+
+def test_meeting_move_api_to_inbox_and_back(make_ui, tmp_path):
+    _, c = make_ui()
+    pid = c.post("/api/projects", {"path": str(tmp_path), "name": "Club",
+                                   "create": True})[1]["project"]["id"]
+    c.post(f"/api/projects/{pid}/types", {"types": [{"name": "Board"}]})
+    w = make_session("2026-11-20T10:00:00", LINES)
+    sid = w.dir.name
+    assert c.post(f"/api/meetings/{sid}/move", {"project": pid, "type": "Board"})[0] == 200
+    folder = Path(c.get(f"/api/projects/{pid}/meetings")[1]["meetings"][0]["folder"])
+    assert folder.is_dir()
+
+    assert c.post(f"/api/meetings/{sid}/move", {"project": "inbox", "type": "Board"})[0] == 400
+    status, res = c.post(f"/api/meetings/{sid}/move", {"project": "inbox"})
+    assert status == 200 and res["project"] == "inbox" and not folder.exists()
+    assert c.get(f"/api/projects/{pid}/meetings")[1]["meetings"] == []
+    inbox = c.get("/api/projects/inbox/meetings")[1]["meetings"]
+    assert [m["session"] for m in inbox] == [sid]
+    assert c.get("/api/projects")[1]["inbox"] == 1
+    assert c.get(f"/api/sessions/{sid}")[1]["project"] is None
+    assert c.post(f"/api/meetings/{sid}/move", {"project": "inbox"})[0] == 200  # no-op
+
+    assert c.post(f"/api/meetings/{sid}/move", {"project": pid})[0] == 200
+    assert c.get("/api/projects")[1]["inbox"] == 0
+    assert c.get(f"/api/sessions/{sid}")[1]["project"] == pid
+    assert c.post("/api/meetings/nosuch/move", {"project": "inbox"})[0] == 404
+
+
+def test_folder_to_open_is_resolved_from_ids_and_names(tmp_path, monkeypatch):
+    from steno import paths
+
+    p = _club(tmp_path)
+    assert projects.folder_to_open("project", p.id) == p.path
+    assert projects.folder_to_open("inbox") == paths.sessions_dir()
+
+    # a subfolder that is not there yet: the nearest existing parent inside the project
+    assert projects.folder_to_open("type", p.id, "Board") == p.path
+    (p.path / "Meetings").mkdir()
+    assert projects.folder_to_open("type", p.id, "Board") == p.path / "Meetings"
+    (p.path / "Meetings" / "Board").mkdir()
+    assert projects.folder_to_open("type", p.id, "Board") == p.path / "Meetings" / "Board"
+    assert projects.folder_to_open("type", p.id, "board") == p.path / "Meetings" / "Board"
+    assert projects.folder_to_open("type", p.id, None) == p.path  # no subfolder: the project
+
+    inbox_session = make_session("2026-11-20T10:00:00", LINES)
+    assert projects.folder_to_open("meeting", inbox_session.dir.name) == inbox_session.dir
+    m = projects.create_meeting(p, inbox_session.dir, "Lobby days", "Board")
+    assert projects.folder_to_open("meeting", inbox_session.dir.name) == m.folder
+
+    for kind, ref, mtype in [
+        ("type", p.id, "Nope"), ("project", "0" * 12, None), ("project", "../..", None),
+        ("project", None, None), ("project", str(tmp_path), None), ("meeting", "..", None),
+        ("meeting", "no-such-session", None), ("meeting", str(m.folder), None),
+        ("bogus", p.id, None), ("", p.id, None),
+    ]:
+        assert projects.folder_to_open(kind, ref, mtype) is None, (kind, ref, mtype)
+
+    # a subfolder that would leave the project is refused even if the registry says so
+    escaping = projects.Project(p.id, p.name, p.path,
+                                (projects.MeetingType("Out", "../elsewhere"),))
+    monkeypatch.setattr(projects, "get_project", lambda pid: escaping)
+    assert projects.folder_to_open("type", p.id, "Out") is None

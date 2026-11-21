@@ -386,8 +386,15 @@ class UiApp:
         d = self._session_dir(session_id)
         if session_id == self.recorder.active_session():
             raise ApiError(409, "stop the recording before moving it")
-        if body.get("project") == "inbox":
-            raise ApiError(400, "meetings can be moved to a project, not back to the inbox")
+        if body.get("project") == "inbox":  # back to the inbox: no folder in any project
+            if body.get("type") not in (None, ""):
+                raise ApiError(400, "the inbox has no meeting types")
+            try:
+                m = projects.move_to_inbox(d)
+            except OSError as exc:
+                raise ApiError(409, f"cannot move the meeting folder: {exc}") from exc
+            self.bus.publish("projects", {"session": session_id})
+            return {"title": m.title, "folder": "", "project": "inbox", "type": None}
         project = self._project(str(body.get("project") or ""))
         mtype = self._type(project, body.get("type"))
         try:

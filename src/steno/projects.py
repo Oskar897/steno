@@ -455,6 +455,92 @@ def move_meeting(session_dir: Path, project: Project, mtype: str | None = None) 
     return Meeting(session_dir.name, title, target)
 
 
+def move_to_inbox(session_dir: Path) -> Meeting:
+    """Take a meeting out of its project: it becomes an inbox session again.
+
+    The session (transcript, summary, to-do, voices, kept audio) always lives in the data dir,
+    so nothing has to be copied there; the meeting folder only holds readable copies. It is
+    removed when it holds nothing else. Files that are not copies of what the session has (a
+    hand-edited summary, the user's own notes) keep the folder: it then just stops being a
+    meeting (its marker goes) and stays where it is."""
+    session_dir = Path(session_dir)
+    folder = meeting_folder(session_dir)
+    title = meeting_title(session_dir)
+    if folder is None:
+        return Meeting(session_dir.name, title, session_dir)  # already in the inbox
+    place = _place(folder)
+    with _lock:
+        if place is not None and _only_copies(session_dir, folder):
+            shutil.rmtree(folder)
+        else:
+            log.warning("Meeting folder %s holds other files: kept without its marker", folder)
+            (folder / MEETING_FILE).unlink(missing_ok=True)
+        # last: until now the session still pointed at the folder (a failure above keeps it a
+        # meeting); a link to a folder that is gone already reads as inbox
+        atomic_write_text(session_dir / LINK_NAME,
+                          json.dumps({"title": title}, ensure_ascii=False) + "\n")
+    if place is not None:
+        write_index(place[0])
+    return Meeting(session_dir.name, title, session_dir)
+
+
+def _only_copies(session_dir: Path, folder: Path) -> bool:
+    """True when everything in the meeting folder is written by Steno from the session: the
+    marker, .gitignore, transcript.md and summary/to-do identical to the session's own."""
+    for f in folder.iterdir():
+        if f.name in (MEETING_FILE, ".gitignore", "transcript.md") and f.is_file():
+            continue
+        mine = session_dir / f.name
+        if f.name in COPIED and f.is_file() and mine.is_file():
+            try:
+                if f.read_text(encoding="utf-8") == mine.read_text(encoding="utf-8"):
+                    continue
+            except (OSError, ValueError):
+                pass
+        return False
+    return True
+
+
+_SESSION_REF = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_PROJECT_REF = re.compile(r"[0-9a-f]{12}")
+
+
+def folder_to_open(kind: str, ref: str | None = None, mtype: str | None = None) -> Path | None:
+    """The folder "Open in File Explorer" shows, found from ids and names only (never a path
+    from the page). ``kind``: ``meeting`` (``ref`` = session id: its meeting folder, or for an
+    inbox session its session folder), ``project`` (``ref`` = project id), ``type`` (a project's
+    subfolder: ``ref`` = project id, ``mtype`` = its name; if the folder is not there yet the
+    nearest existing parent inside the project), ``inbox`` (where inbox sessions live).
+    None when nothing suitable exists."""
+    if kind == "inbox":
+        return paths.sessions_dir()
+    if not isinstance(ref, str):
+        return None
+    if kind == "meeting":
+        if not _SESSION_REF.fullmatch(ref):
+            return None
+        d = transcript.resolve_session(ref)
+        if d is None:
+            return None
+        return meeting_folder(d) or d
+    if kind not in ("project", "type") or not _PROJECT_REF.fullmatch(ref):
+        return None
+    try:
+        project = get_project(ref)
+        kind_ = project.find_type(mtype) if kind == "type" and mtype else None
+    except ProjectError:
+        return None
+    if kind_ is None:
+        return project.path
+    root = Path(os.path.abspath(project.path))
+    folder = Path(os.path.abspath(project.type_dir(kind_)))
+    if root not in folder.parents:  # a folder that does not stay inside the project
+        return None
+    while not folder.is_dir() and folder != root:
+        folder = folder.parent
+    return folder
+
+
 def is_archived(session_dir: Path) -> bool:
     return (Path(session_dir) / ARCHIVED_NAME).is_file()
 

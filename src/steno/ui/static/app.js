@@ -37,6 +37,7 @@ const ICONS = {
   settings: "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
   folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
   folderPlus: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 10v6M9 13h6",
+  folderOpen: "M4 19a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v2M4 19h14.2a1 1 0 0 0 1-.8l1.6-6.2a1 1 0 0 0-1-1.2H7.8a1 1 0 0 0-1 .8L4 19z",
   inbox: "M3 13h5l1.5 3h5l1.5-3h5M5.5 5h13L21 13v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5z",
   chevron: "M6 9l6 6 6-6",
   tag: "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01",
@@ -77,13 +78,20 @@ function fillIcons(root) {  // <x data-icon="name"> placeholders in the static p
   }
 }
 
-// Speaker colours: muted, readable on dark glass; stable per name across meetings.
-// muted: low saturation, so names read as tints, not as signal colours
-const HUES = ["#9eaccb", "#a5b9a2", "#b9a8c6", "#c9b893", "#97b4b6", "#c3a19f", "#b3ab9e", "#a9aed0"];
-function speakerColor(name) {
-  let x = 0;
-  for (const ch of String(name || "")) x = (x * 31 + ch.codePointAt(0)) >>> 0;
-  return HUES[x % HUES.length];
+// Speaker colours: 8 clearly different hues (CSS tokens --spk-1..8, tuned per theme in style.css),
+// handed out per meeting in order of first appearance, so two speakers of one meeting never share a
+// colour (up to 8; after that they repeat). No name / "?" / "Unknown" get the neutral --spk-0.
+// `scope` is any object that lives as long as one shown meeting (its `spk` map is created on use);
+// renderLines() empties the map before it walks the transcript in order.
+const SPEAKER_HUES = 8;
+const LIVE_SCOPE = {};  // for the dock's "who is speaking" when that meeting is not the one shown
+const noSpeaker = (name) => !String(name || "").trim() || /^(\?+|unknown|unknown speaker)$/i.test(String(name).trim());
+function speakerColor(scope, name) {
+  if (noSpeaker(name)) return "var(--spk-0)";
+  const map = scope.spk || (scope.spk = new Map());
+  const key = String(name).trim();
+  if (!map.has(key)) map.set(key, map.size % SPEAKER_HUES + 1);
+  return `var(--spk-${map.get(key)})`;
 }
 const initials = (name) => {
   const n = String(name || "?").trim();
@@ -310,6 +318,9 @@ const S = {
   people: [], connected: false, fatal: false,
   jobStates: new Map(),
 };
+// Drag a meeting to another place (see "drag to move" below): `press` while the long-press is
+// pending, `active` while dragging, `suppress` swallows the click that ends a drag.
+const DRAG = { press: null, active: null, suppress: false };
 
 function initToken() {
   const url = new URL(location.href);
@@ -409,7 +420,8 @@ function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
 // ---------------------------------------------------------------- projects and sidebar
 
 const curProject = () => S.projects.find((p) => p.id === S.sel) || null;
-const projectName = (id) => (id === "inbox" || !id ? "Inbox" : (S.projects.find((p) => p.id === id) || {}).name || "project");
+const INBOX_NAME = "Inbox / TBD";
+const projectName = (id) => (id === "inbox" || !id ? INBOX_NAME : (S.projects.find((p) => p.id === id) || {}).name || "project");
 
 const projTypes = (pid) => ((S.projects.find((p) => p.id === pid) || {}).types || []);
 /* The meeting type the next recording in a project goes to: chosen (+ or the dock's menu),
@@ -450,7 +462,7 @@ async function loadProjects() {
   }
   const changed = ensureSelection();
   if (S.sel) S.expanded.add(S.sel);
-  const ids = new Set([...S.projects.map((p) => p.id), ...(S.inbox > 0 ? ["inbox"] : [])]);
+  const ids = new Set([...S.projects.map((p) => p.id), "inbox"]);
   for (const id of [...S.lists.keys()]) if (!ids.has(id)) S.lists.delete(id);
   await Promise.all([...S.expanded].filter((id) => ids.has(id) && id !== S.sel).map((id) => fetchList(id).catch(() => null)));
   renderSide(); renderTop();
@@ -476,11 +488,12 @@ function toggleExpanded(id) {
 
 function ensureSelection() {  // returns true when the selected project had to change
   if (S.view !== "project") return false;
-  const valid = S.sel === "inbox" ? S.inbox > 0 : S.projects.some((p) => p.id === S.sel);
-  if (valid) return false;
+  // the Inbox / TBD is always there, also when empty
+  const exists = (id) => id === "inbox" || S.projects.some((p) => p.id === id);
+  if (exists(S.sel)) return false;
   const saved = remember("steno-project");
   const pick = [recProjectId(), saved, (S.projects[0] || {}).id, S.inbox > 0 ? "inbox" : null]
-    .find((id) => id && (id === "inbox" ? S.inbox > 0 : S.projects.some((p) => p.id === id)));
+    .find((id) => id && exists(id));
   const next = pick || null;
   const changed = next !== S.sel;
   S.sel = next;
@@ -637,12 +650,13 @@ function sideMeetings(id) {
     const active = here && S.meeting === info.session;
     const more = h("button", { class: "mmore", type: "button", title: "Meeting actions", "aria-label": "Meeting actions", "aria-haspopup": "menu" }, icon("more"));
     more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => meetingItems(info, id, null)); });
-    return h("div", { class: "mrow" + (active ? " active" : "") + (info.archived ? " archived" : "") },
-      h("button", { class: "mitem" + (active ? " active" : ""), type: "button",
-        title: info.title || "Untitled meeting", onclick: () => selectMeeting(id, info.session) },
-      h("span", { class: "mi-title" + (info.title ? "" : " untitled"), text: info.title || "Untitled meeting" }),
-      live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: niceDate(info.started_at).replace(" · ", " ") })),
-      more);
+    const main = h("button", { class: "mitem" + (active ? " active" : ""), type: "button",
+      title: info.title || "Untitled meeting", onclick: () => selectMeeting(id, info.session) },
+    h("span", { class: "mi-title" + (info.title ? "" : " untitled"), text: info.title || "Untitled meeting" }),
+    live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: niceDate(info.started_at).replace(" · ", " ") }));
+    armDrag(main, info, id);
+    const dragged = DRAG.active && DRAG.active.info.session === info.session;
+    return h("div", { class: "mrow" + (active ? " active" : "") + (info.archived ? " archived" : "") + (dragged ? " dragging" : "") }, main, more);
   };
   const rows = (key, part) => {  // newest first, "Show all" past SIDE_MEETINGS
     const all = S.showAll.has(key);
@@ -660,27 +674,30 @@ function sideMeetings(id) {
     items.push(...rows(id, list));
     if (!items.length && S.lists.has(id)) items.push(h("div", { class: "mitem none", text: "No meetings yet" }));
   } else {
+    // subfolders first (level 1, meetings inside at level 2), then the meetings without a type (level 1)
     const chosen = drafting ? recType(id) : null;
-    const groups = types.map((t) => [t.name, t.name]);
     const untyped = list.filter((i) => !i.type || !types.some((t) => t.name === i.type));
-    if (untyped.length || chosen === "") groups.push(["", "No type"]);
-    for (const [type, label] of groups) {
-      const part = type ? list.filter((i) => i.type === type) : untyped;
+    for (const t of types) {
+      const type = t.name;
+      const part = list.filter((i) => i.type === type);
       const key = `${id}::${type}`;
       const open = !S.folded.has(key) || chosen === type;
       const body = [];
       if (chosen === type) body.push(draft());
       body.push(...rows(key, part));
       if (!body.length && S.lists.has(id)) body.push(h("div", { class: "mitem none", text: "No meetings yet" }));
-      items.push(h("div", { class: "tnode" + (open ? " open" : "") },
+      items.push(h("div", { class: "tnode" + (open ? " open" : ""), "data-drop": id, "data-drop-type": type },
         h("div", { class: "trow" },
-          h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: type ? `${label}: ${(types.find((t) => t.name === type) || {}).folder || ""}` : "Meetings without a type (in Steno/)",
+          h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: `${type}: ${t.folder || ""}`,
             onclick: () => { if (open) S.folded.add(key); else S.folded.delete(key); remember("steno-folded", JSON.stringify([...S.folded])); renderSide(); } },
-          icon("chevron"), h("span", { class: "tname", text: label }), open ? null : h("span", { class: "tcount", text: String(part.length) })),
-          type ? subfolderMore(id, type, part.length) : null,
-          h("button", { class: "padd", type: "button", title: `New ${type ? label + " " : ""}meeting`, "aria-label": `New ${label} meeting`, onclick: () => newMeeting(id, type) }, icon("plus"))),
+          icon("chevron"), h("i", { class: "ticon" }, icon("folder")), h("span", { class: "tname", text: type }), open ? null : h("span", { class: "tcount", text: String(part.length) })),
+          explorerButton(`${type} (${projectName(id)})`, "type", id, type),
+          subfolderMore(id, type, part.length),
+          h("button", { class: "padd", type: "button", title: `New ${type} meeting`, "aria-label": `New ${type} meeting`, onclick: () => newMeeting(id, type) }, icon("plus"))),
         open ? h("div", { class: "tlist" }, body) : null));
     }
+    if (chosen === "") items.push(draft());
+    items.push(...rows(`${id}::`, untyped));
     items.push(h("button", { class: "mitem more add-sub", type: "button", onclick: () => guarded(() => newSubfolder(id)) },
       icon("folderPlus"), h("span", { text: "New subfolder" })));
   }
@@ -701,20 +718,38 @@ function projectNode(id, name, count, canRecord, live) {
   const main = h("button", { class: "pmain", type: "button", onclick: () => selectProject(id) },
     h("i", { class: "picon" }, icon(id === "inbox" ? "inbox" : "folder")),
     h("span", { class: "pname", text: name }),
-    live ? h("i", { class: "live-dot", title: "Recording" }) : open ? null : h("span", { class: "pcount", text: String(count) }));
+    live ? h("i", { class: "live-dot", title: "Recording" }) : open || (id === "inbox" && !count) ? null : h("span", { class: "pcount", text: String(count) }));
   const add = canRecord ? h("button", { class: "padd", type: "button", title: `New meeting in ${name}`, "aria-label": `New meeting in ${name}`, onclick: () => newMeeting(id) }, icon("plus")) : null;
-  const sub = canRecord ? h("button", { class: "padd", type: "button", title: `New subfolder in ${name} (e.g. Board, 1-1)`, "aria-label": `New subfolder in ${name}`, onclick: () => guarded(() => newSubfolder(id)) }, icon("folderPlus")) : null;
-  return h("div", { class: "pnode" + (open ? " open" : "") + (here ? " here" : "") },
-    h("div", { class: "pitem prow" + (here && !open ? " active" : "") }, chev, main, sub, add),
+  const sub = canRecord && id !== "inbox" ? h("button", { class: "padd", type: "button", title: `New subfolder in ${name} (e.g. Board, 1-1)`, "aria-label": `New subfolder in ${name}`, onclick: () => guarded(() => newSubfolder(id)) }, icon("folderPlus")) : null;
+  const show = id === "inbox" ? explorerButton(name, "inbox") : explorerButton(name, "project", id);
+  return h("div", { class: "pnode" + (open ? " open" : "") + (here ? " here" : ""), "data-drop": id, "data-drop-type": "" },
+    h("div", { class: "pitem prow" + (here && !open ? " active" : "") }, chev, main, show, sub, add),
     open ? sideMeetings(id) : null);
+}
+
+/* Hover button on a project / subfolder / Inbox row: show its folder in File Explorer. The page
+   only sends what the row stands for (kind, project id, subfolder name); the desktop app works
+   out the path. Not shown in a plain browser. */
+function explorerButton(label, kind, ref, type) {
+  if (!pickerAvailable()) return null;
+  const tip = `Show ${label} in File Explorer`;
+  return h("button", { class: "padd pexp", type: "button", title: tip, "aria-label": tip,
+    onclick: (ev) => { ev.stopPropagation(); guarded(() => openInExplorer(kind, ref, type)); } }, icon("folderOpen"));
+}
+async function openInExplorer(kind, ref, type) {
+  const bridge = window.pywebview && window.pywebview.api;
+  if (!bridge || !bridge.open_folder) { toast("Opening folders needs the desktop app.", "error"); return; }
+  const ok = await bridge.open_folder(kind, ref || null, type || null);
+  if (!ok) toast("That folder was not found.", "error");
 }
 
 function renderSide() {
   const live = recProjectId();
   $("plist").replaceChildren(...S.projects.map((p) => projectNode(p.id, p.name, p.meetings, true, live === p.id)));
-  $("inbox-slot").replaceChildren(...(S.inbox > 0 ? [projectNode("inbox", "Inbox", S.inbox, false, live === "inbox")] : []));
+  $("inbox-slot").replaceChildren(projectNode("inbox", INBOX_NAME, S.inbox, true, live === "inbox"));
   $("nav-people").classList.toggle("active", S.view === "people");
   $("nav-settings").classList.toggle("active", S.view === "settings");
+  if (DRAG.active) paintDrop();
   $("people-count").textContent = S.people.length ? String(S.people.length) : "";
   const elsewhere = live && (S.view !== "project" || live !== S.sel);
   document.querySelectorAll(".menu-btn").forEach((b) => b.classList.toggle("badge", !!elsewhere));
@@ -782,7 +817,7 @@ function renderTop() {
   const active = st === "starting" || st === "recording" || st === "stopping";
   const proj = curProject();
   const ctype = proj ? curType() : "";
-  $("proj-name").textContent = S.sel === "inbox" ? "Inbox" : proj ? proj.name + (ctype ? "  ›  " + ctype : "") : "";
+  $("proj-name").textContent = S.sel === "inbox" ? INBOX_NAME : proj ? proj.name + (ctype ? "  ›  " + ctype : "") : "";
   renderTypeSelect(proj, active);
   $("btn-projmenu").hidden = !proj;
   const noProject = !S.sel;
@@ -831,7 +866,7 @@ function renderTypeSelect(proj, active) {
   const key = proj.id + "|" + types.map((t) => t.name).join("|");
   if (sel.dataset.key !== key) {
     sel.dataset.key = key;
-    sel.replaceChildren(...types.map((t) => h("option", { value: t.name, text: t.name })), h("option", { value: "", text: "No type" }));
+    sel.replaceChildren(...types.map((t) => h("option", { value: t.name, text: t.name })), h("option", { value: "", text: "Project root" }));
   }
   sel.value = recType(proj.id);
 }
@@ -920,6 +955,7 @@ async function removeSubfolder(pid, name, count) {
 function subfolderMore(pid, name, count) {
   const more = h("button", { class: "padd tmore", type: "button", title: `${name}: rename or remove`, "aria-label": `${name} actions`, "aria-haspopup": "menu" }, icon("more"));
   more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => [
+    ...(pickerAvailable() ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("type", pid, name)) }] : []),
     { label: "Rename...", icon: "pencil", onclick: () => guarded(() => renameSubfolder(pid, name)) },
     { label: "Remove", sub: count ? "Move its meetings out first" : "Files on disk stay", icon: "trash", danger: true, disabled: !!count, onclick: () => guarded(() => removeSubfolder(pid, name, count)) }]); });
   return more;
@@ -987,7 +1023,7 @@ function renderStrip() {
   if (st === "stopping") out.push(h("span", { class: "spinner" }));
   if (r.speaker && !r.paused && st === "recording") {
     const s = h("span", { class: "spk", text: r.speaker });
-    s.style.setProperty("--c", speakerColor(r.speaker));
+    s.style.setProperty("--c", speakerColor(S.feed.get(r.session) || LIVE_SCOPE, r.speaker));
     out.push(s);
   } else out.push(h("span", { text: word }));
   const rp = recProjectId();
@@ -1207,11 +1243,8 @@ function meetingItems(info, pid, titleBtn) {
   const live = info.recording || ((S.status.recorder || {}).session === sid && (S.status.recorder || {}).state !== "idle");
   const job = S.status.job && S.status.job.state === "running" && S.status.job.session === sid;
   const items = [];
-  if (pickerAvailable() && pid !== "inbox") {
-    items.push({ label: "Show in Explorer", icon: "folder", onclick: () => guarded(async () => {
-      const ok = await window.pywebview.api.open_meeting_folder(sid);
-      if (!ok) toast("The meeting folder was not found.", "error");
-    }) });
+  if (pickerAvailable()) {  // an inbox meeting opens its session folder in the data dir
+    items.push({ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("meeting", sid)) });
   }
   items.push(
     { label: "Copy transcript", icon: "copy", onclick: () => guarded(async () => copyText(await meetingTranscript(info), "Transcript")) },
@@ -1301,7 +1334,7 @@ function buildMeeting(m) {
 }
 
 function renderLines(m) {
-  m.linesEl.replaceChildren(); m.rows = new Map();
+  m.linesEl.replaceChildren(); m.rows = new Map(); m.spk = new Map();  // colours: by first appearance in this transcript
   const segs = m.detail.segments;
   const frag = document.createDocumentFragment();
   segs.forEach((s, i) => frag.append(segRow(m, s, segs[i - 1])));
@@ -1340,7 +1373,7 @@ function segRow(m, seg, prev) {
   const p = h("p", { text: seg.text, title: first ? null : clock(seg.t_start) });
   const row = h("div", { class: "seg" + (seg.provisional ? " prov" : "") + (first ? " first" : ""), "data-seq": seg.seq });
   if (first) {
-    const color = speakerColor(seg.speaker);
+    const color = speakerColor(m, seg.speaker);
     row.style.setProperty("--c", color);
     row.append(h("span", { class: "avatar", "aria-hidden": "true", text: initials(seg.speaker) }),
       h("div", { class: "seg-head" }, who, h("time", { class: "time", text: clock(seg.t_start) })));
@@ -1480,22 +1513,203 @@ async function moveMeeting(info, current) {
   const options = [];
   for (const p of S.projects) {
     const types = p.types || [];
-    options.push({ value: p.id, label: types.length ? `${p.name} (no type)` : p.name });
+    options.push({ value: p.id, label: types.length ? `${p.name} (project root)` : p.name });
     for (const t of types) options.push({ value: `${p.id}|${t.name}`, label: `${p.name} › ${t.name}` });
   }
+  options.push({ value: "inbox", label: INBOX_NAME });
   const here = current + (info.type ? "|" + info.type : "");
-  const v = await formModal({ title: "Move meeting", text: "The meeting folder is moved along: into the type's folder, or into Steno/ without a type.", fields: [{ key: "to", label: "Move to", options, value: here }], ok: "Move" });
+  const v = await formModal({ title: "Move meeting", text: "The meeting folder is moved along: into the subfolder, into Steno/ at the project root, or out of the project into the Inbox / TBD.", fields: [{ key: "to", label: "Move to", options, value: here }], ok: "Move" });
   if (!v || v.to === here) return;
   const cut = v.to.indexOf("|");
   const pid = cut < 0 ? v.to : v.to.slice(0, cut), type = cut < 0 ? null : v.to.slice(cut + 1);
-  v.project = pid;
+  await moveMeetingTo(info, current, pid, type);
+}
+
+/* Move a meeting (dialog or drag): pid is a project id or "inbox", type a subfolder name or null.
+   Keeps the meeting open if it was open, and refreshes the lists. */
+async function moveMeetingTo(info, current, pid, type) {
   await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: pid, type });
   toast(`Moved to ${projectName(pid)}${type ? " › " + type : ""}`);
   if (S.feed.has(info.session)) S.feed.get(info.session).info.type = type;
   const open = S.sel === current && S.meeting === info.session;
-  if (!S.expanded.has(v.project)) { S.expanded.add(v.project); saveExpanded(); }
+  if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
   await loadProjects();
-  if (open) selectMeeting(v.project, info.session); else if (S.sel === current) await loadFeed();
+  const list = await fetchList(pid);  // fresh, so the moved meeting is found when selecting it
+  if (S.sel === pid) S.meetings = list;
+  if (open) selectMeeting(pid, info.session); else if (S.sel === current) await loadFeed();
+}
+
+// ---------------------------------------------------------------- drag to move
+//
+// Press and hold a meeting in the sidebar (~350 ms, pointer events) to pick it up; a plain click
+// still opens it, and moving more than a few pixels before the hold is over cancels it (that is
+// a scroll or a click). While dragging, a label follows the pointer and the place under it
+// (a project, a subfolder, the Inbox / TBD: the nearest [data-drop] ancestor) is highlighted if
+// the meeting can go there. Release moves it (and its folder on disk), Escape or a release
+// anywhere else cancels. Same place = nothing happens.
+
+const HOLD_MS = 350, HOLD_SLOP = 6, EDGE_PX = 40, EXPAND_MS = 700;
+
+function armDrag(el, info, pid) {
+  el.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0 || DRAG.press || DRAG.active) return;
+    DRAG.press = { info, pid, el, id: ev.pointerId, x: ev.clientX, y: ev.clientY,
+      timer: setTimeout(() => beginDrag(), HOLD_MS) };
+  });
+}
+
+function cancelPress() {
+  if (DRAG.press) clearTimeout(DRAG.press.timer);
+  DRAG.press = null;
+}
+
+function beginDrag() {
+  const p = DRAG.press;
+  DRAG.press = null;
+  if (!p || !p.el.isConnected) return;
+  const r = S.status.recorder || {};
+  if (p.info.recording || (r.session === p.info.session && r.state && r.state !== "idle" && r.state !== "error")) {
+    toast("Stop the recording before moving it.", "error");
+    return;
+  }
+  closeMenu();
+  const to = h("span", { class: "dg-to" });
+  const ghost = h("div", { class: "drag-ghost", "aria-hidden": "true" },
+    icon("move"), h("span", { class: "dg-title", text: p.info.title || "Untitled meeting" }), to);
+  document.body.append(ghost);
+  document.body.classList.add("dragging");
+  // capture on the (permanent) sidebar: a release outside the window still ends the drag
+  try { $("side").setPointerCapture(p.id); } catch (e) { /* no capture: events still reach the document */ }
+  DRAG.active = { info: p.info, from: p.pid, fromType: p.info.type || null, id: p.id, x: p.x, y: p.y,
+    sx: p.x, sy: p.y, moved: false, ghost, to, target: null, key: "", expandTimer: null, raf: 0 };
+  placeGhost();
+  renderSide();  // the source row dims
+  DRAG.active.raf = requestAnimationFrame(dragTick);
+}
+
+function placeGhost() {
+  const d = DRAG.active;
+  d.ghost.style.transform = `translate(${Math.round(d.x + 14)}px, ${Math.round(d.y + 12)}px)`;
+}
+
+/* A place the meeting can be dropped on, from the pointer position: {pid, type, el} or null. */
+function dropTargetAt(x, y) {
+  const at = document.elementFromPoint(x, y);
+  const el = at && at.closest("#side [data-drop]");
+  return el ? { el, pid: el.dataset.drop, type: el.dataset.dropType || null } : null;
+}
+
+function canDrop(d, t) {
+  return !!t && !(t.pid === d.from && (t.type || null) === d.fromType);
+}
+
+const dropLabel = (t) => projectName(t.pid) + (t.type ? " › " + t.type : "");
+
+function paintDrop() {  // after every sidebar render, and when the target changes
+  const d = DRAG.active;
+  for (const el of document.querySelectorAll("#side .drop-target")) el.classList.remove("drop-target");
+  if (!d || !d.target) return;
+  for (const el of document.querySelectorAll("#side [data-drop]")) {
+    if (el.dataset.drop === d.target.pid && (el.dataset.dropType || null) === (d.target.type || null)) {
+      const row = el.querySelector(":scope > .prow, :scope > .trow");
+      if (row) row.classList.add("drop-target");
+    }
+  }
+}
+
+function updateDropTarget() {
+  const d = DRAG.active;
+  const t = dropTargetAt(d.x, d.y);
+  const ok = canDrop(d, t);
+  const key = ok ? t.pid + "\u0000" + (t.type || "") : "";
+  if (key === d.key) return;
+  d.key = key;
+  d.target = ok ? t : null;
+  d.to.textContent = ok ? dropLabel(t) : "";
+  d.ghost.classList.toggle("ok", ok);
+  clearTimeout(d.expandTimer);
+  // hovering a closed project that has subfolders for a moment opens it, so one can drop into them
+  if (ok && !t.type && t.pid !== "inbox" && !S.expanded.has(t.pid) && projTypes(t.pid).length) {
+    d.expandTimer = setTimeout(() => {
+      if (!DRAG.active || DRAG.active.key !== key) return;
+      S.expanded.add(t.pid);  // not remembered: only opened for this drag
+      renderSide();
+      if (!S.lists.has(t.pid)) guarded(() => fetchList(t.pid).then(renderSide));
+    }, EXPAND_MS);
+  }
+  paintDrop();
+}
+
+function dragTick() {  // scrolls the sidebar while the pointer rests near its top or bottom edge
+  const d = DRAG.active;
+  if (!d) return;
+  const side = $("side"), box = side.getBoundingClientRect();
+  let dy = 0;
+  if (d.y < box.top + EDGE_PX) dy = -Math.ceil((box.top + EDGE_PX - d.y) / 4);
+  else if (d.y > box.bottom - EDGE_PX) dy = Math.ceil((d.y - (box.bottom - EDGE_PX)) / 4);
+  if (dy && d.x >= box.left && d.x <= box.right) {
+    const before = side.scrollTop;
+    side.scrollTop += Math.max(-18, Math.min(18, dy));
+    if (side.scrollTop !== before) updateDropTarget();
+  }
+  d.raf = requestAnimationFrame(dragTick);
+}
+
+function endDrag() {
+  const d = DRAG.active;
+  if (!d) return null;
+  cancelAnimationFrame(d.raf);
+  clearTimeout(d.expandTimer);
+  d.ghost.remove();
+  document.body.classList.remove("dragging");
+  try { $("side").releasePointerCapture(d.id); } catch (e) { /* not captured */ }
+  DRAG.active = null;
+  DRAG.suppress = d.moved;  // the release would otherwise "click" a row; held but not moved: a click
+  setTimeout(() => { DRAG.suppress = false; }, 120);
+  renderSide();
+  return d;
+}
+
+async function finishDrag(drop) {
+  const d = endDrag();
+  if (!d || !drop || !d.target) return;
+  await guarded(() => moveMeetingTo(d.info, d.from, d.target.pid, d.target.type));
+}
+
+function initDrag() {
+  document.addEventListener("pointermove", (ev) => {
+    const p = DRAG.press, d = DRAG.active;
+    if (p && ev.pointerId === p.id && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) > HOLD_SLOP) cancelPress();
+    if (d && ev.pointerId === d.id) {
+      d.x = ev.clientX; d.y = ev.clientY;
+      if (Math.hypot(d.x - d.sx, d.y - d.sy) > HOLD_SLOP) d.moved = true;
+      placeGhost();
+      updateDropTarget();
+      ev.preventDefault();
+    }
+  });
+  document.addEventListener("pointerup", (ev) => {
+    if (DRAG.press && ev.pointerId === DRAG.press.id) cancelPress();  // a click: it opens the meeting
+    else if (DRAG.active && ev.pointerId === DRAG.active.id) finishDrag(true);
+  });
+  document.addEventListener("pointercancel", (ev) => {
+    if (DRAG.press && ev.pointerId === DRAG.press.id) cancelPress();
+    else if (DRAG.active && ev.pointerId === DRAG.active.id) finishDrag(false);
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape" || !(DRAG.press || DRAG.active)) return;
+    ev.stopImmediatePropagation(); ev.preventDefault();
+    if (DRAG.active) finishDrag(false); else cancelPress();
+  }, true);
+  window.addEventListener("blur", () => { cancelPress(); if (DRAG.active) finishDrag(false); });
+  document.addEventListener("click", (ev) => {
+    if (!DRAG.suppress) return;
+    DRAG.suppress = false;
+    ev.preventDefault(); ev.stopPropagation();
+  }, true);
+  for (const type of ["contextmenu", "selectstart", "dragstart"]) {
+    document.addEventListener(type, (ev) => { if (DRAG.press || DRAG.active) ev.preventDefault(); });
+  }
 }
 
 // ---------------------------------------------------------------- naming speakers
@@ -1604,9 +1818,9 @@ async function loadPeople() {
   renderSide();
 }
 
-function personRow(p) {
+function personRow(p, i) {
   const row = h("div", { class: "person" });
-  row.style.setProperty("--c", speakerColor(p.name));
+  row.style.setProperty("--c", `var(--spk-${i % SPEAKER_HUES + 1})`);  // by list position: neighbours differ
   const show = () => row.replaceChildren(
     h("span", { class: "avatar", "aria-hidden": "true", text: initials(p.name) }),
     h("div", { class: "pn" }, h("div", { text: p.name }), h("div", { class: "sub", text: `${p.embeddings} voice sample${p.embeddings === 1 ? "" : "s"} · updated ${niceDate(p.updated)}` })),
@@ -1897,7 +2111,7 @@ function markBrowserMode() { document.body.classList.toggle("browser", !window.p
 function init() {
   initToken();
   window.addEventListener("load", markBrowserMode);
-  window.addEventListener("pywebviewready", () => { markBrowserMode(); applyLook(); });
+  window.addEventListener("pywebviewready", () => { markBrowserMode(); applyLook(); renderSide(); });
   fillIcons();
   initResizer();
   $("btn-addmenu").addEventListener("click", () => showMenu($("btn-addmenu"), () => [
@@ -1906,9 +2120,12 @@ function init() {
   $("empty-new").addEventListener("click", () => guarded(newProject));
   $("empty-add").addEventListener("click", () => guarded(addProject));
   $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => [
+    ...(pickerAvailable() && S.sel && S.sel !== "inbox"
+      ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("project", S.sel)) }] : []),
     { label: "Subfolders...", sub: "Board, 1-1, ... each in its own folder", icon: "folderPlus", onclick: () => guarded(editTypes) },
     "-",
     { label: "Forget project", sub: "Files stay on disk", icon: "forget", danger: true, onclick: () => guarded(forgetProject) }]));
+  initDrag();
   $("nav-people").addEventListener("click", showPeople);
   $("nav-settings").addEventListener("click", showSettings);
   document.querySelectorAll(".menu-btn").forEach((b) => b.addEventListener("click", menuButton));

@@ -6,7 +6,7 @@ A map for working on the app (`steno app`). User-facing docs: [README](../README
 
 | Part | File | What it does |
 |---|---|---|
-| Window | `src/steno/ui/window.py`, `src/steno/ui/frame.py` | pywebview (WebView2) window around the local UI server; Windows 11 Acrylic backdrop (`apply_glass`); own title bar (`frame.py`: the caption strip is removed via `WM_NCCALCSIZE` and WS_SYSMENU, the window stays sizable so snapping/resizing/Win+arrows work; CSS `app-region: drag` on the header and brand row moves/snaps the window through WebView2's non-client region support; the page's minimize/maximize/close buttons call `Bridge.window_control`, close still asks while recording; any failure keeps the native title bar; WinForms would re-add the removed caption height on every restore from minimized/maximized, so rame.py keeps the last normal size and re-applies it right after a restore). The window opens centred above the taskbar and is moved inside the work area if needed (it_on_screen): a part that starts off screen is never painted and showed as a white rectangle; after a move the page is repainted once (stenoRepaint). A blank page loads first because that WebView2 setting applies from the next navigation, size fitted to the scaled screen, single instance (named mutex; a second start focuses the window), confirm on close while recording, log file `<data dir>/logs/app.log`. `Bridge` is the JS API (`window.pywebview.api.pick_folder()`, `open_meeting_folder(session_id)`: Explorer on that meeting's folder only); keep its attributes private (`_name`), pywebview exposes public ones to the page. |
+| Window | `src/steno/ui/window.py`, `src/steno/ui/frame.py` | pywebview (WebView2) window around the local UI server; Windows 11 Acrylic backdrop (`apply_glass`); own title bar (`frame.py`: the caption strip is removed via `WM_NCCALCSIZE` and WS_SYSMENU, the window stays sizable so snapping/resizing/Win+arrows work; CSS `app-region: drag` on the header and brand row moves/snaps the window through WebView2's non-client region support; the page's minimize/maximize/close buttons call `Bridge.window_control`, close still asks while recording; any failure keeps the native title bar; WinForms would re-add the removed caption height on every restore from minimized/maximized, so rame.py keeps the last normal size and re-applies it right after a restore). The window opens centred above the taskbar and is moved inside the work area if needed (it_on_screen): a part that starts off screen is never painted and showed as a white rectangle; after a move the page is repainted once (stenoRepaint). A blank page loads first because that WebView2 setting applies from the next navigation, size fitted to the scaled screen, single instance (named mutex; a second start focuses the window), confirm on close while recording, log file `<data dir>/logs/app.log`. `Bridge` is the JS API (`window.pywebview.api.pick_folder()`, `open_folder(kind, ref, mtype)`: Explorer on a meeting (ref = session id), project (ref = project id), subfolder (ref = project id, mtype = its name; the nearest existing parent inside the project if the folder is not there yet) or the inbox (the data dir's `sessions/`); the path is worked out by `projects.folder_to_open` from ids and names, never taken from the page; `open_meeting_folder(session_id)` is the meeting shorthand); keep its attributes private (`_name`), pywebview exposes public ones to the page. |
 | Server | `src/steno/ui/server.py` | stdlib `ThreadingHTTPServer` on 127.0.0.1, per-launch token (`X-Steno-Token`), Host/Origin checks, CSP, routes `/api/...` to `UiApp`, SSE at `/api/events`. |
 | API | `src/steno/ui/api.py` | `UiApp`: plain methods returning JSON dicts or raising `ApiError`. |
 | Recorder | `src/steno/ui/recorder.py` | Drives one `Engine` (same wiring as `steno record`, including refine models). Start into a project, pause/resume (samples replaced by silence, so the clock and kept audio stay aligned), mirrors `transcript.md` into the meeting folder every 2 s while recording. |
@@ -30,7 +30,7 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/record/start` `{project?, type?, title?, mic, loopback, keep_audio}`, `/api/record/pause`, `/resume`, `/stop` | |
 | GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
-| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type) |
+| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type; `project: "inbox"` = back to the inbox, see below) |
 | POST | `/api/meetings/<id>/archive` `{archived}` | hide/show it in the app (`archived.json` in the session dir; files stay) |
 | DELETE | `/api/meetings/<id>` | deletes the session dir and its meeting folder for good (not while recording it or while a job runs on it) |
 | POST | `/api/sessions/<id>/jobs` `{kind}` | `finalize`, `clean`, `summary`, `todo` |
@@ -58,24 +58,52 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
 
 ## Design (second pass)
 
-- Always dark glass: transparent page over the Acrylic backdrop; panels are translucent dark
-  fills with 1px light hairlines. In a normal browser `body.browser` adds a dark gradient.
-- Accent `#ff5a1f` for recording only (Record button, live dot, active marker, focus ring,
-  progress bars). Everything else white/gray.
+- Calm, flat surfaces in neutral warm greys (dark and light themes, optional transparency):
+  regions are separated by 1px low-contrast hairlines, not boxes or shadows. The app runs edge to
+  edge (no padding around the panels, no DWM window border). Settings, People, Summary and To-do
+  are lists between hairlines; inputs and secondary buttons are 1px outlined, radius 6px; menus,
+  dialogs and toasts 8px with a soft shadow. The dock is a flush bar with a top hairline.
+- Accent is used sparingly: selected-row marker, focus ring, primary and Record buttons (flat
+  `#c8470f`, white text), the live dot and the dock's top line while recording.
+- Speaker colours: eight clearly different hues (`--spk-1..8`, tuned per theme), handed out per
+  meeting in order of first appearance, so two speakers in one meeting never share a colour;
+  unnamed/"?" speakers are neutral grey (`--spk-0`). The People list colours by list index.
 - Fonts: system UI stack; `--display` (Segoe UI Variable Display / SF Pro Display) for titles,
   `--sans` (the Text cut) for the rest; mono only for model names. Design tokens live at the
   top of `style.css`: four text levels (`--text`, `--body`, `--dim`, `--faint`, plus `--ghost` for
-  times/counts), surfaces with a 1px top `--highlight`, radii 6/8/10/14, a 4px spacing grid.
+  times/counts), radii 6/8, a 4px spacing grid.
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
 - Subfolders = meeting types. Created from the sidebar: hover a project for the folder-plus button
   (next to `+`), or "New subfolder" under a project that has some; each subfolder row has `+` and
   a hover ⋯ (Rename, Remove when empty). Project ⋯ → Subfolders... edits them all at once.
-- Meeting types: a project with types shows one small group
-  per type in the sidebar (chevron, name, `+` for a new meeting of that type; folded state in
-  `steno-folded`), then "No type" when such meetings exist. The dock gets a type menu
-  (chosen with `+` or the menu, else the open meeting's type, else the last used,
-  `steno-type-<project>`); the header reads "Project › Type". Move... lists every project and
-  type. Without types everything looks as before.
+- Sidebar tree (subfolders = meeting types): under a project its subfolders come first (folder icon,
+  chevron, name, `+`, hover buttons; folded state in `steno-folded`), their meetings one level
+  deeper (16 px per level); meetings without a subfolder sit on the subfolders' level, after them,
+  with no icon. There is no "No type" group. A draft "New meeting" row appears where the meeting
+  will go. The dock gets a type menu ("Project root" = no subfolder; chosen with `+` or the menu,
+  else the open meeting's type, else the last used, `steno-type-<project>`); the header reads
+  "Project > Type". Move... lists every project, subfolder and the Inbox / TBD. Without types
+  everything looks as before.
+- Inbox / TBD: always the last node of the sidebar, also when empty (label `INBOX_NAME`), with `+`
+  to start a meeting there (`record/start` without a project). It holds the sessions that have no
+  meeting folder.
+- Open in File Explorer (desktop app only, via `Bridge.open_folder`): hover button on project,
+  subfolder and Inbox / TBD rows (small, revealed on hover like `+`), and an item in the project
+  header menu, the subfolder menu and the meeting menu (an inbox meeting opens its session
+  folder in the data dir).
+- Drag to move: press and hold a meeting row ~350 ms (pointer events; a click still opens it, moving
+  more than 6 px before the hold ends cancels it). A label follows the pointer; the place under it
+  (nearest `[data-drop]` ancestor: project node = project root, subfolder node, Inbox / TBD) lights
+  up when the meeting is not already there; hovering a closed project with subfolders for 0.7 s
+  opens it; the sidebar scrolls near its top/bottom edge. Release moves the meeting and its folder
+  (`POST /api/meetings/<id>/move`, same as Move...), Escape or a release elsewhere cancels. A
+  recording meeting cannot be picked up.
+- Moving to the inbox (`projects.move_to_inbox`): sessions always live in the data dir, so only the
+  meeting folder goes. It is deleted when it holds nothing but Steno's own copies (marker,
+  `.gitignore`, `transcript.md`, `summary.md`/`todo.md` identical to the session's); if it has
+  other files (own notes, a hand-edited summary) the folder stays where it is, just without its
+  marker. The session link is rewritten last to `{"title"}` only, so the id stays resolvable.
+  Moving back creates a fresh folder (`2026-11-20 Title (2)` on a name clash).
 - Layout: sidebar tree: each project (and the Inbox) folds open to its meetings, newest
   first (6, then "Show all"); `+` on a project opens a "New meeting" screen in it. The main
   area shows one meeting at a time (header with the project name, running-job chip, ⋯ menu;
@@ -83,9 +111,9 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   and the recording dock at the bottom (title, audio-source menu, Record; while recording:
   timer, level bars, speaker/status, Pause, Stop). Pressing Record opens the new meeting as
   soon as it is listed. Only Rename and Move sit in a meeting's ⋯ menu (owner's wish: main
-  actions stay in sight, not in submenus). Speakers get a stable colour from their name.
+  actions stay in sight, not in submenus).
   Open/closed projects are remembered in `localStorage` (`steno-expanded`). Hovering a
-  meeting in the sidebar shows ⋯ (Show in Explorer, Copy transcript, Rename, Move, Archive,
+  meeting in the sidebar shows ⋯ (Open in File Explorer, Copy transcript, Rename, Move, Archive,
   Delete); archived meetings sit under "Archived (N)" at the end of the project.
 - Sidebar width: drag its right edge (190-460 px); dragging past ~120 px hides it, the
   header's menu button, a drag from the left edge, double-click on the edge or Ctrl+B bring
@@ -113,11 +141,11 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
 
 - Design pass from the owner's feedback.
 - Swedish UI language; Mac/Linux; installer and first-run setup; global hotkey.
-- Moving a meeting back to the Inbox; noticing a project folder moved outside the app.
+- Noticing a project folder moved outside the app.
 
 ## Testing
 
-`tests/test_ui.py` (server, API, recorder with a fake engine), `tests/test_projects.py`,
+`tests/test_ui.py` (server, API, recorder with a fake engine), `tests/test_projects.py` (meeting folders, moves between subfolders/projects/inbox, `folder_to_open`),
 `tests/test_settings.py`, `tests/test_shortcuts.py`. For a manual run against an empty data
 dir: set `STENO_DATA_DIR` to a temp folder (link its `models/` to the real models folder) and
 start `steno ui --no-browser` or `steno app`.
