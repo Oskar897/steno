@@ -135,6 +135,8 @@ class Recorder:
         self.paused = False
         self.project: projects.Project | None = None
         self.mtype: str | None = None  # meeting type within the project
+        # Name the meeting from its transcript after Stop (only while the user typed no title).
+        self.auto_title = False
         self._title: str | None = None
         self._mirror_dirty = False
         self._engine: Engine | None = None
@@ -143,7 +145,8 @@ class Recorder:
         self._t0: float | None = None
         self._levels: dict[str, _Level] = {}
         self._stop_thread: threading.Thread | None = None
-        self.on_stopped: Callable[[str, bool], None] | None = None  # (session id, keep_audio)
+        # (session id, keep_audio, auto_title) once the recording has been finished
+        self.on_stopped: Callable[[str, bool, bool], None] | None = None
 
     # -- queries ------------------------------------------------------------------
 
@@ -169,6 +172,7 @@ class Recorder:
                 "paused": self.paused,
                 "project": self.project.id if self.project is not None else None,
                 "type": self.mtype,
+                "auto_title": self.auto_title,
                 "error": self.error,
                 "session": self.session_id,
                 "keep_audio": self.keep_audio,
@@ -186,7 +190,7 @@ class Recorder:
 
     def start(self, *, keep_audio: bool, mic: bool, loopback: bool,
               project: projects.Project | None = None, title: str | None = None,
-              mtype: str | None = None) -> None:
+              mtype: str | None = None, auto_title: bool = False) -> None:
         if not (mic or loopback):
             raise RecorderError("nothing to record: enable the microphone or system audio")
         with self._lock:
@@ -204,6 +208,7 @@ class Recorder:
             self.paused = False
             self.project = project
             self.mtype = mtype
+            self.auto_title = auto_title and not title  # a typed title is never replaced
             self._title = title
             self.last_segment_at = None
             self._t0 = None
@@ -258,6 +263,14 @@ class Recorder:
             self.paused = True
         self._publish_status()
 
+    def set_auto_title(self, on: bool) -> None:
+        """Switch the automatic title of the meeting being recorded (before Stop only)."""
+        with self._lock:
+            if self.state not in ("starting", "recording"):
+                raise RecorderError("not recording")
+            self.auto_title = on
+        self._publish_status()
+
     def resume(self) -> None:
         with self._lock:
             if self.state != "recording" or not self.paused:
@@ -297,7 +310,7 @@ class Recorder:
             log.exception("Error while stopping the recording")
             error = str(exc).strip() or type(exc).__name__
         self._drop_subscriptions()
-        session, keep = self.session_id, self.keep_audio
+        session, keep, auto_title = self.session_id, self.keep_audio, self.auto_title
         if engine is not None and self.project is not None:
             try:  # the finished text, and the index without the "recording" mark
                 projects.sync(engine.session_dir)
@@ -316,7 +329,7 @@ class Recorder:
         self._bus.publish("sessions", {"session": session})
         if session and self.on_stopped is not None:
             try:
-                self.on_stopped(session, keep)
+                self.on_stopped(session, keep, auto_title)
             except Exception:
                 log.exception("on_stopped hook failed")
 

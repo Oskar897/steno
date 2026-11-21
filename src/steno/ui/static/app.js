@@ -41,6 +41,10 @@ const ICONS = {
   inbox: "M3 13h5l1.5 3h5l1.5-3h5M5.5 5h13L21 13v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5z",
   chevron: "M6 9l6 6 6-6",
   tag: "M3 12V4a1 1 0 0 1 1-1h8l9 9-9 9zM7.5 7.5h.01",
+  heading: "M5 6h14M12 6v13M9 19h6",
+  login: "M14 4h5a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-5M10 8l-4 4 4 4M6 12h10",
+  refresh: "M20 11a8 8 0 0 0-14.5-4M4 4v3.5h3.5M4 13a8 8 0 0 0 14.5 4M20 20v-3.5h-3.5",
+  external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
   spark: "M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z",
   todo: "M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17",
   wand: "M4 20L15 9M14 4v2M18 8h2M17.5 4.5l-1.4 1.4M13 9l2 2",
@@ -112,6 +116,46 @@ function niceDate(iso) {
   const opts = { weekday: "short", day: "numeric", month: "short" };
   if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
   return `${d.toLocaleDateString("en-GB", opts)} · ${t}`;
+}
+
+/* Short, relative label for lists: Today, Yesterday, Monday (2-6 days), Last week, 2 weeks ago,
+   3 weeks ago, Last month, March (this year), March 2025 (older). `now` is injectable for tests. */
+function relDate(iso, now = new Date()) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const day = (x) => Date.UTC(x.getFullYear(), x.getMonth(), x.getDate());  // calendar days, DST-proof
+  const diff = Math.round((day(now) - day(d)) / 86400000);
+  if (diff <= 0) return "Today";  // a clock a little ahead counts as today
+  if (diff === 1) return "Yesterday";
+  if (diff < 7) return d.toLocaleDateString("en-GB", { weekday: "long" });
+  if (diff < 14) return "Last week";
+  if (diff < 28) return `${Math.floor(diff / 7)} weeks ago`;
+  const months = (now.getFullYear() - d.getFullYear()) * 12 + now.getMonth() - d.getMonth();
+  if (months <= 0) return "4 weeks ago";
+  if (months === 1) return "Last month";
+  const month = d.toLocaleDateString("en-GB", { month: "long" });
+  return d.getFullYear() === now.getFullYear() ? month : `${month} ${d.getFullYear()}`;
+}
+
+/* The labels above change with the date, not with data: repaint the lists when the day changes
+   (a timer at midnight, and when the window is shown or focused again after a sleep). */
+let dayStamp = "";
+function watchDay() {
+  const stamp = () => { const n = new Date(); return `${n.getFullYear()}-${n.getMonth()}-${n.getDate()}`; };
+  const check = () => {
+    const now = stamp();
+    if (dayStamp && now !== dayStamp && typeof renderSide === "function" && !DRAG.active) renderSide();
+    dayStamp = now;
+  };
+  const arm = () => {
+    const n = new Date();
+    const next = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1, 0, 0, 2);
+    setTimeout(() => { check(); arm(); }, Math.max(1000, next - n));
+  };
+  check(); arm();
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) check(); });
 }
 
 // ---------------------------------------------------------------- popover menu
@@ -317,6 +361,10 @@ const S = {
   opts: { mic: true, loop: true, keep: false },
   people: [], connected: false, fatal: false,
   jobStates: new Map(),
+  // Claude Code: {state: unknown | ok | logged_out | missing | error, method, plan, detail}; `llmWait` = the time
+  // until which we poll for the end of a sign-in; `autoTitle` = the dock's switch for the next meeting
+  llm: { state: "unknown", method: "", plan: "", detail: "" }, llmWait: 0, llmPoll: false,
+  autoTitle: true, autoTitleDefault: true,
 };
 // Drag a meeting to another place (see "drag to move" below): `press` while the long-press is
 // pending, `active` while dragging, `suppress` swallows the click that ends a drag.
@@ -358,13 +406,18 @@ async function api(method, path, body) {
 }
 const missing = (e) => e && e.status === 404;  // endpoint or item not there (yet): not an error to show
 
-function toast(text, kind) {
+/* action: {label, run} adds a small button to the toast (kept up a little longer). */
+function toast(text, kind, action) {
   const el = h("div", { class: "toast" + (kind ? " " + kind : "") }, icon(kind === "error" ? "alert" : "check"), h("span", { text: String(text) }));
   const dismiss = () => { if (el.classList.contains("out")) return; el.classList.add("out"); setTimeout(() => el.remove(), 230); };
   el.addEventListener("click", dismiss);
+  if (action) {
+    el.append(h("button", { class: "toast-act", type: "button", text: action.label,
+      onclick: (ev) => { ev.stopPropagation(); dismiss(); action.run(); } }));
+  }
   $("toasts").append(el);
   while ($("toasts").children.length > 4) $("toasts").firstChild.remove();
-  setTimeout(dismiss, kind === "error" ? 9000 : 4500);
+  setTimeout(dismiss, kind === "error" ? 9000 : action ? 8000 : 4500);
 }
 async function guarded(fn) {
   try { return await fn(); } catch (e) { toast(e instanceof Error ? e.message : e, "error"); return null; }
@@ -557,6 +610,7 @@ function showSettings() {
 
 const AUTO = [
   ["auto_finalize", "Sort out speakers automatically", "A few seconds after Stop, on this computer: who said what is worked out again from the whole meeting, more accurately than live. No kept audio needed."],
+  ["auto_title", "Automatic title", "Claude names a meeting you left untitled from what was said, e.g. \"Budgetgenomgång Q1\". A title you type is never replaced. Per meeting: the Auto title switch next to the title field."],
   ["auto_clean", "Clean up automatically", "After a recording stops, Claude fixes misheard words and punctuation."],
   ["auto_summary", "Summary automatically", "Then writes summary.md in the meeting folder."],
   ["auto_todo", "To-do automatically", "Then writes todo.md with explicit commitments."],
@@ -566,6 +620,7 @@ async function loadSettings() {
   let data;
   try { data = await api("GET", "/api/settings"); } catch (e) { if (!missing(e)) throw e; data = { settings: {} }; }
   const s = data.settings || {};
+  if (typeof s.auto_title === "boolean") setAutoTitleDefault(s.auto_title);
   const box = $("settings");
   const page = h("div", { class: "page" });
   box.replaceChildren(page);
@@ -604,8 +659,11 @@ async function loadSettings() {
       h("label", { class: "set-row", for: "set-mini" },
         h("div", { class: "pn" }, h("div", { text: "Mini strip while recording" }), h("div", { class: "sub", text: "A small bar with timer, Pause and Stop stays on top of other windows while Steno is not in front. Drag it anywhere; x hides it until the next recording. Hidden from screen sharing." })), strip)));
   const group = h("div", { class: "group" });
+  page.append(h("h2", { class: "set-h", text: "Claude" }),
+    h("div", { class: "group" }, h("div", { class: "set-row static", id: "set-llm" })));
+  renderSettingsLlm();
   page.append(h("h2", { class: "set-h", text: "After a meeting" }),
-    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Clean up, Summary and To-do use Claude (Haiku), about 10-30 s each. Off: use the buttons on each meeting." }),
+    h("p", { class: "set-hint", text: "Runs in this order once you press Stop. Title, Clean up, Summary and To-do use Claude (Haiku), about 10-30 s each. Off: use the buttons on each meeting." }),
     group);
   for (const [key, label, sub] of AUTO) {
     const box2 = h("input", { type: "checkbox", class: "switch", id: `set-${key}` });
@@ -613,6 +671,7 @@ async function loadSettings() {
     box2.addEventListener("change", async () => {
       const res = await guarded(() => api("POST", "/api/settings", { [key]: box2.checked }));
       if (!res) box2.checked = !box2.checked;
+      else if (key === "auto_title") setAutoTitleDefault(box2.checked);
     });
     group.append(h("label", { class: "set-row", for: `set-${key}` },
       h("div", { class: "pn" }, h("div", { text: label }), h("div", { class: "sub", text: sub })), box2));
@@ -650,13 +709,15 @@ function sideMeetings(id) {
     const active = here && S.meeting === info.session;
     const more = h("button", { class: "mmore", type: "button", title: "Meeting actions", "aria-label": "Meeting actions", "aria-haspopup": "menu" }, icon("more"));
     more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => meetingItems(info, id, null)); });
+    const full = niceDate(info.started_at);  // the row shows a relative label; the tooltip the exact time
     const main = h("button", { class: "mitem" + (active ? " active" : ""), type: "button",
-      title: info.title || "Untitled meeting", onclick: () => selectMeeting(id, info.session) },
+      title: (info.title || "Untitled meeting") + (full ? "\n" + full : ""), onclick: () => selectMeeting(id, info.session) },
     h("span", { class: "mi-title" + (info.title ? "" : " untitled"), text: info.title || "Untitled meeting" }),
-    live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: niceDate(info.started_at).replace(" · ", " ") }));
+    live ? h("i", { class: "live-dot", title: "Recording" }) : h("span", { class: "mi-date", text: relDate(info.started_at) }));
     armDrag(main, info, id);
     const dragged = DRAG.active && DRAG.active.info.session === info.session;
-    return h("div", { class: "mrow" + (active ? " active" : "") + (info.archived ? " archived" : "") + (dragged ? " dragging" : "") }, main, more);
+    return h("div", { class: "mrow" + (active ? " active" : "") + (info.archived ? " archived" : "") + (dragged ? " dragging" : ""),
+      "data-ts": String(Date.parse(info.started_at) || 0) }, main, more);
   };
   const rows = (key, part) => {  // newest first, "Show all" past SIDE_MEETINGS
     const all = S.showAll.has(key);
@@ -698,8 +759,6 @@ function sideMeetings(id) {
     }
     if (chosen === "") items.push(draft());
     items.push(...rows(`${id}::`, untyped));
-    items.push(h("button", { class: "mitem more add-sub", type: "button", onclick: () => guarded(() => newSubfolder(id)) },
-      icon("folderPlus"), h("span", { text: "New subfolder" })));
   }
   if (archived.length) {
     const open = S.showArchived.has(id);
@@ -749,7 +808,7 @@ function renderSide() {
   $("inbox-slot").replaceChildren(projectNode("inbox", INBOX_NAME, S.inbox, true, live === "inbox"));
   $("nav-people").classList.toggle("active", S.view === "people");
   $("nav-settings").classList.toggle("active", S.view === "settings");
-  if (DRAG.active) paintDrop();
+  if (DRAG.active && !DRAG.active.settled) { paintDrop(); syncGap(false); }
   $("people-count").textContent = S.people.length ? String(S.people.length) : "";
   const elsewhere = live && (S.view !== "project" || live !== S.sel);
   document.querySelectorAll(".menu-btn").forEach((b) => b.classList.toggle("badge", !!elsewhere));
@@ -761,7 +820,148 @@ function renderSideFoot() {
   foot.classList.toggle("off", !S.connected);
   foot.replaceChildren(h("i", { class: "state" }),
     h("span", { text: S.connected ? "On this computer" : "Reconnecting..." }));
-  foot.title = S.connected ? "Everything runs locally. Only Clean up, Summary and To-do send transcript text to Claude." : "";
+  foot.title = S.connected ? "Everything runs locally. Only Clean up, Summary, To-do and automatic titles send transcript text to Claude." : "";
+}
+
+// ---------------------------------------------------------------- Claude Code status (AI features)
+
+const aiOff = () => S.llm.state === "logged_out" || S.llm.state === "missing";
+const aiOk = () => S.llm.state === "ok";
+const AI_OFF_TEXT = { logged_out: "AI off: not logged in", missing: "AI off: Claude Code not installed" };
+const llmDetail = () => [S.llm.method, S.llm.plan].filter(Boolean).join(" · ");  // never an account name
+const llmWaiting = () => S.llmWait > Date.now();
+
+async function fetchLlm(refresh) {
+  try {
+    const res = await api("GET", "/api/llm/status" + (refresh ? "?refresh=1" : ""));
+    if (res && res.llm) S.llm = res.llm;
+  } catch (e) { return; }  // older server or not reachable: keep what we know
+  renderLlm();
+}
+
+function renderLlm() {
+  renderSideLlm(); renderSettingsLlm(); renderAutoTitle(); updateButtons();
+}
+
+async function llmLogin() {
+  const res = await api("POST", "/api/llm/login", {});
+  S.llmWait = Date.now() + 180000;
+  renderLlm();
+  toast(res.started ? "Sign-in window opened. Finish signing in to Claude in your browser." : "The sign-in window is already open.");
+  pollLlm();
+}
+
+async function pollLlm() {  // every few seconds for up to ~3 minutes, until the login shows up
+  if (S.llmPoll) return;
+  S.llmPoll = true;
+  try {
+    while (llmWaiting()) {
+      await new Promise((r) => setTimeout(r, 3000));
+      await fetchLlm(true);
+      if (aiOk()) { toast("Logged in to Claude"); break; }
+    }
+  } finally { S.llmWait = 0; S.llmPoll = false; renderLlm(); }
+}
+
+const llmInstall = () => api("POST", "/api/llm/install", {});
+
+function llmMenuItems() {
+  const st = S.llm.state, items = [];
+  if (st === "logged_out") {
+    items.push({ header: "AI is off: not logged in" },
+      { label: "Log in to Claude", sub: "Opens a sign-in window; finish in your browser", icon: "login", onclick: () => guarded(llmLogin) });
+  } else if (st === "missing") {
+    items.push({ header: "AI is off: Claude Code is not installed" },
+      { label: "Install Claude Code", sub: "Opens the install page in your browser", icon: "external", onclick: () => guarded(llmInstall) });
+  } else if (st === "ok") {
+    items.push({ header: "Claude is signed in" + (llmDetail() ? ` (${llmDetail()})` : "") });
+  } else {
+    items.push({ header: S.llm.detail || "Claude Code could not be checked" });
+  }
+  items.push({ label: "Check again", icon: "refresh", onclick: () => guarded(() => fetchLlm(true)) });
+  return items;
+}
+
+function renderSideLlm() {
+  const box = $("side-llm"), st = S.llm.state, waiting = llmWaiting();
+  if (st === "unknown" && !waiting) { box.hidden = true; box.dataset.key = ""; box.replaceChildren(); return; }
+  let label, tip, cls;
+  if (waiting) { label = "Waiting for sign-in..."; cls = "wait"; tip = "Finish signing in to Claude in the browser window that opened."; }
+  else if (st === "ok") {
+    label = "Claude"; cls = "ok";
+    tip = `Claude is signed in${llmDetail() ? " (" + llmDetail() + ")" : ""}. Summary, To-do, Clean up and automatic titles use it. Click to check again.`;
+  } else if (aiOff()) {
+    label = AI_OFF_TEXT[st]; cls = "warn";
+    tip = st === "missing" ? "Install Claude Code to use Summary, To-do, Clean up and automatic titles." : "Log in to Claude to use Summary, To-do, Clean up and automatic titles.";
+  } else { label = "AI status unknown"; cls = "warn"; tip = S.llm.detail || "Claude Code could not be checked."; }
+  const key = [label, cls, tip].join("|");
+  box.hidden = false;
+  if (box.dataset.key === key) return;
+  box.dataset.key = key;
+  const btn = h("button", { class: "llm-pill " + cls, type: "button", title: tip, "aria-haspopup": "menu" },
+    cls === "wait" ? h("i", { class: "spinner" }) : h("i", { class: "llm-dot" }), h("span", { text: label }));
+  btn.addEventListener("click", () => showMenu(btn, llmMenuItems));
+  box.replaceChildren(btn);
+}
+
+function renderSettingsLlm() {  // the status line in Settings, with the same buttons
+  const row = $("set-llm");
+  if (!row) return;
+  const st = S.llm.state;
+  let title, sub, action, cls = "warn";
+  const button = (text, fn, primary) => h("button", { class: "btn small" + (primary ? " primary" : ""), type: "button", text, onclick: () => guarded(fn) });
+  if (llmWaiting()) {
+    title = "Waiting for sign-in..."; cls = "wait";
+    sub = "Finish signing in to Claude in the browser. This updates by itself.";
+  } else if (st === "ok") {
+    title = "Claude is ready"; cls = "ok";
+    sub = `Signed in${llmDetail() ? " (" + llmDetail() + ")" : ""}. Only transcript text is sent; audio never leaves this computer.`;
+    action = button("Check again", () => fetchLlm(true));
+  } else if (st === "logged_out") {
+    title = AI_OFF_TEXT.logged_out;
+    sub = "Summary, To-do, Clean up and automatic titles use Claude Code with your own Claude account. The sign-in finishes in your browser.";
+    action = button("Log in to Claude", llmLogin, true);
+  } else if (st === "missing") {
+    title = AI_OFF_TEXT.missing;
+    sub = "Summary, To-do, Clean up and automatic titles use Claude Code, which signs in with your own Claude account.";
+    action = button("Install Claude Code", llmInstall, true);
+  } else {
+    title = st === "unknown" ? "Checking Claude ..." : "Claude could not be checked";
+    sub = S.llm.detail || "";
+    action = button("Check again", () => fetchLlm(true));
+  }
+  row.replaceChildren(
+    h("div", { class: "pn" }, h("div", { class: "llm-title " + cls }, h("i", { class: "llm-dot" }), h("span", { text: title })), h("div", { class: "sub", text: sub })),
+    action || null);
+}
+
+// The dock's per-meeting "Auto title" switch: Claude names the meeting after Stop, unless a title was typed.
+function setAutoTitleDefault(on) {
+  if (S.autoTitleDefault === on) return;
+  S.autoTitleDefault = on;
+  S.autoTitle = on;
+  renderAutoTitle();
+}
+
+function renderAutoTitle() {
+  const r = S.status.recorder || {}, st = r.state || "idle";
+  const active = st === "starting" || st === "recording" || st === "stopping";
+  const input = $("rec-title");
+  const typed = !active && !!input.value.trim();
+  const off = aiOff();
+  const on = (active ? !!r.auto_title : S.autoTitle) && !off && !typed;
+  input.placeholder = on && aiOk() ? "Title is written after the meeting" : "Untitled meeting";
+  let tip;
+  if (off) tip = AI_OFF_TEXT[S.llm.state];
+  else if (typed) tip = "Auto title is not used: you typed a title.";
+  else if (on) tip = "Auto title: ON. Claude names the meeting after it ends, if you do not. Click to turn off for this meeting.";
+  else tip = "Auto title: off. Click to let Claude name this meeting after it ends.";
+  for (const b of [$("btn-autotitle"), $("btn-autotitle-live")]) {
+    b.disabled = off || st === "stopping";
+    b.setAttribute("aria-pressed", String(on));
+    b.classList.toggle("on", on);
+    b.title = tip;
+  }
 }
 
 async function newProject() {
@@ -853,6 +1053,7 @@ function renderTop() {
   $("empty").hidden = !(S.view === "project" && !S.sel && S.projects.length === 0 && S.inbox === 0);
   $("feed").parentElement.hidden = !$("empty").hidden;
   dock.hidden = !$("empty").hidden;
+  renderAutoTitle();
   renderStrip();
   updateButtons();
 }
@@ -938,7 +1139,9 @@ async function newSubfolder(pid) {
     ok: "Create" });
   if (!v || !v.name) return;
   await saveTypes(pid, [...typeList(pid), { name: v.name, folder: v.folder }]);
-  toast(`Subfolder ${v.name} created`);
+  // the folder is made on disk together with the subfolder, so Explorer can show it right away
+  toast(`Subfolder ${v.name} created`, null, pickerAvailable()
+    ? { label: "Open in File Explorer", run: () => guarded(() => openInExplorer("type", pid, v.name)) } : null);
 }
 async function renameSubfolder(pid, name) {
   const v = await formModal({ title: "Rename subfolder", text: "Only the name in Steno changes; the folder on disk stays.",
@@ -1053,7 +1256,7 @@ function renderJobChip() {
 async function startRecording() {
   if (!S.sel) return;
   remember("steno-opts", JSON.stringify(S.opts));
-  const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep };
+  const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep, auto_title: S.autoTitle };
   const type = S.sel !== "inbox" ? recType(S.sel) : "";
   if (type) body.type = type;
   const title = $("rec-title").value.trim();
@@ -1066,6 +1269,7 @@ async function startRecording() {
   if (res) {
     if (res.recorder) S.status.recorder = res.recorder;
     $("rec-title").value = "";
+    S.autoTitle = S.autoTitleDefault;  // the switch is per meeting
     renderTop(); renderSide();
     scheduleFeed();
   } else {
@@ -1459,13 +1663,18 @@ function updateJobLines() {
 }
 
 function updateButtons() {
-  const busy = busyJob();
+  const busy = busyJob(), off = aiOff();
   for (const m of S.feed.values()) {
-    for (const b of Object.values(m.btns || {})) { b.disabled = busy; b.title = busy ? "Another job is running" : b.dataset.tip; }
+    for (const b of Object.values(m.btns || {})) {
+      b.disabled = busy;
+      b.classList.toggle("ai-off", off);  // stays visible; a click explains and offers the login
+      b.title = busy ? "Another job is running" : off ? `${AI_OFF_TEXT[S.llm.state]}. Click for options.` : b.dataset.tip;
+    }
   }
 }
 
 async function startJob(m, kind) {
+  if (aiOff()) { showMenu(m.btns[kind], llmMenuItems); return; }
   const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/jobs`, { kind }));
   if (res && res.job) { S.status.job = res.job; updateJobLines(); updateButtons(); renderStrip(); }
 }
@@ -1543,12 +1752,16 @@ async function moveMeetingTo(info, current, pid, type) {
 //
 // Press and hold a meeting in the sidebar (~350 ms, pointer events) to pick it up; a plain click
 // still opens it, and moving more than a few pixels before the hold is over cancels it (that is
-// a scroll or a click). While dragging, a label follows the pointer and the place under it
-// (a project, a subfolder, the Inbox / TBD: the nearest [data-drop] ancestor) is highlighted if
-// the meeting can go there. Release moves it (and its folder on disk), Escape or a release
-// anywhere else cancels. Same place = nothing happens.
+// a scroll or a click). Picked up, the row stays behind as a grey hole and a grey, translucent
+// copy of it follows the pointer. The place under the pointer (a project, a subfolder, the Inbox /
+// TBD: the nearest [data-drop] ancestor) is highlighted if the meeting can go there, and its
+// meetings slide apart to open a gap where the meeting's date puts it (newest first). Release
+// moves it (and its folder on disk): the copy settles into the gap. Escape or a release anywhere
+// else cancels: the copy flies back to the hole. Same place = nothing happens.
 
-const HOLD_MS = 350, HOLD_SLOP = 6, EDGE_PX = 40, EXPAND_MS = 700;
+const HOLD_MS = 350, HOLD_SLOP = 6, EDGE_PX = 40, EXPAND_MS = 700, MOVE_MS = 150;
+const reducedMotion = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function armDrag(el, info, pid) {
   el.addEventListener("pointerdown", (ev) => {
@@ -1573,23 +1786,28 @@ function beginDrag() {
     return;
   }
   closeMenu();
-  const to = h("span", { class: "dg-to" });
-  const ghost = h("div", { class: "drag-ghost", "aria-hidden": "true" },
-    icon("move"), h("span", { class: "dg-title", text: p.info.title || "Untitled meeting" }), to);
+  const box = (p.el.closest(".mrow") || p.el).getBoundingClientRect();
+  const copy = p.el.cloneNode(true);  // the row itself, without its listeners
+  copy.classList.remove("active");
+  copy.removeAttribute("title");
+  copy.tabIndex = -1;
+  const ghost = h("div", { class: "drag-ghost", "aria-hidden": "true" }, copy);
+  ghost.style.width = `${Math.round(box.width)}px`;
   document.body.append(ghost);
   document.body.classList.add("dragging");
   // capture on the (permanent) sidebar: a release outside the window still ends the drag
   try { $("side").setPointerCapture(p.id); } catch (e) { /* no capture: events still reach the document */ }
   DRAG.active = { info: p.info, from: p.pid, fromType: p.info.type || null, id: p.id, x: p.x, y: p.y,
-    sx: p.x, sy: p.y, moved: false, ghost, to, target: null, key: "", expandTimer: null, raf: 0 };
+    sx: p.x, sy: p.y, ox: p.x - box.left, oy: p.y - box.top, rowH: box.height,
+    moved: false, ghost, target: null, key: "", expandTimer: null, raf: 0, gap: null, opened: [], landing: false, settled: false };
   placeGhost();
-  renderSide();  // the source row dims
+  renderSide();  // the source row turns into the hole
   DRAG.active.raf = requestAnimationFrame(dragTick);
 }
 
 function placeGhost() {
   const d = DRAG.active;
-  d.ghost.style.transform = `translate(${Math.round(d.x + 14)}px, ${Math.round(d.y + 12)}px)`;
+  d.ghost.style.transform = `translate(${Math.round(d.x - d.ox)}px, ${Math.round(d.y - d.oy)}px)`;
 }
 
 /* A place the meeting can be dropped on, from the pointer position: {pid, type, el} or null. */
@@ -1603,46 +1821,98 @@ function canDrop(d, t) {
   return !!t && !(t.pid === d.from && (t.type || null) === d.fromType);
 }
 
-const dropLabel = (t) => projectName(t.pid) + (t.type ? " › " + t.type : "");
+/* The node of a place in the sidebar (project or subfolder), found again after a re-render. */
+function dropNode(t) {
+  for (const el of document.querySelectorAll("#side [data-drop]")) {
+    if (el.dataset.drop === t.pid && (el.dataset.dropType || null) === (t.type || null)) return el;
+  }
+  return null;
+}
 
 function paintDrop() {  // after every sidebar render, and when the target changes
   const d = DRAG.active;
   for (const el of document.querySelectorAll("#side .drop-target")) el.classList.remove("drop-target");
   if (!d || !d.target) return;
-  for (const el of document.querySelectorAll("#side [data-drop]")) {
-    if (el.dataset.drop === d.target.pid && (el.dataset.dropType || null) === (d.target.type || null)) {
-      const row = el.querySelector(":scope > .prow, :scope > .trow");
-      if (row) row.classList.add("drop-target");
-    }
-  }
+  const node = dropNode(d.target);
+  const row = node && node.querySelector(":scope > .prow, :scope > .trow");
+  if (row) row.classList.add("drop-target");
 }
+
+/* Where the meeting would land in the target's list: its date puts it among the meetings there
+   (newest first). Returns {box, before} (insert before `before`, null = at the end) or null while
+   the place is collapsed. */
+function gapPlace(d) {
+  const node = d.target && dropNode(d.target);
+  const box = node && node.querySelector(d.target.type ? ":scope > .tlist" : ":scope > .mlist");
+  if (!box) return null;
+  const ts = Date.parse(d.info.started_at) || 0;
+  let before = null, last = null;
+  for (const el of box.children) {
+    if (!el.classList.contains("mrow") || el.classList.contains("archived") || el.classList.contains("dragging")) continue;
+    last = el;
+    if (!before && (Number(el.dataset.ts) || 0) < ts) before = el;
+  }
+  if (!before) before = last ? last.nextElementSibling : box.querySelector(":scope > .mitem.more, :scope > .mitem.none, :scope > .arch-toggle");
+  while (before && before.classList.contains("drop-gap")) before = before.nextElementSibling;
+  return { box, before };
+}
+
+function closeGap(gap, animate) {
+  if (!gap || !gap.el.isConnected) return;
+  const { el } = gap;
+  if (!animate || reducedMotion()) { el.remove(); return; }
+  el.classList.remove("open");
+  el.style.height = "0px";
+  setTimeout(() => el.remove(), MOVE_MS + 20);
+}
+
+/* Open the gap at the landing place (and close the old one): the meetings below slide down. */
+function syncGap(animate) {
+  const d = DRAG.active;
+  if (!d) return;
+  const place = d.target ? gapPlace(d) : null;
+  const cur = d.gap;
+  if (cur && cur.el.isConnected && place && cur.box === place.box && cur.el.nextElementSibling === place.before) return;
+  closeGap(cur, animate);
+  d.gap = null;
+  if (!place) return;
+  const el = h("div", { class: "drop-gap", "aria-hidden": "true" });
+  el.style.height = "0px";
+  place.box.insertBefore(el, place.before);
+  d.gap = { el, box: place.box };
+  const open = () => { el.classList.add("open"); el.style.height = `${Math.round(d.rowH)}px`; };
+  if (animate && !reducedMotion()) { void el.offsetHeight; open(); } else { el.style.transition = "none"; open(); }
+}
+
+const collapsedTarget = (t) => (t.type ? S.folded.has(`${t.pid}::${t.type}`) : !S.expanded.has(t.pid));
 
 function updateDropTarget() {
   const d = DRAG.active;
+  if (!d || d.landing) return;
   const t = dropTargetAt(d.x, d.y);
   const ok = canDrop(d, t);
   const key = ok ? t.pid + "\u0000" + (t.type || "") : "";
   if (key === d.key) return;
   d.key = key;
   d.target = ok ? t : null;
-  d.to.textContent = ok ? dropLabel(t) : "";
-  d.ghost.classList.toggle("ok", ok);
   clearTimeout(d.expandTimer);
-  // hovering a closed project that has subfolders for a moment opens it, so one can drop into them
-  if (ok && !t.type && t.pid !== "inbox" && !S.expanded.has(t.pid) && projTypes(t.pid).length) {
+  // hovering a closed project or subfolder for a moment opens it, so the gap has a list to open in
+  if (ok && collapsedTarget(t)) {
     d.expandTimer = setTimeout(() => {
       if (!DRAG.active || DRAG.active.key !== key) return;
-      S.expanded.add(t.pid);  // not remembered: only opened for this drag
+      if (t.type) { S.folded.delete(`${t.pid}::${t.type}`); d.opened.push({ type: `${t.pid}::${t.type}` }); }
+      else { S.expanded.add(t.pid); d.opened.push({ pid: t.pid }); }  // not remembered: only opened for this drag
       renderSide();
       if (!S.lists.has(t.pid)) guarded(() => fetchList(t.pid).then(renderSide));
     }, EXPAND_MS);
   }
   paintDrop();
+  syncGap(true);
 }
 
 function dragTick() {  // scrolls the sidebar while the pointer rests near its top or bottom edge
   const d = DRAG.active;
-  if (!d) return;
+  if (!d || d.landing) return;
   const side = $("side"), box = side.getBoundingClientRect();
   let dy = 0;
   if (d.y < box.top + EDGE_PX) dy = -Math.ceil((box.top + EDGE_PX - d.y) / 4);
@@ -1655,32 +1925,60 @@ function dragTick() {  // scrolls the sidebar while the pointer rests near its t
   d.raf = requestAnimationFrame(dragTick);
 }
 
-function endDrag() {
-  const d = DRAG.active;
-  if (!d) return null;
-  cancelAnimationFrame(d.raf);
-  clearTimeout(d.expandTimer);
+/* The copy settles at `rect` (the gap, the hole or the target row); `fade`: it melts away there. */
+function flyTo(d, rect, fade) {
+  if (reducedMotion() || !rect) return false;
+  d.ghost.classList.add("landing");
+  d.ghost.style.width = `${Math.round(rect.width)}px`;
+  d.ghost.style.transform = `translate(${Math.round(rect.left)}px, ${Math.round(rect.top)}px)`;
+  if (fade) d.ghost.style.opacity = "0";
+  return true;
+}
+
+function endDrag(d) {
   d.ghost.remove();
+  closeGap(d.gap, false);
   document.body.classList.remove("dragging");
-  try { $("side").releasePointerCapture(d.id); } catch (e) { /* not captured */ }
   DRAG.active = null;
-  DRAG.suppress = d.moved;  // the release would otherwise "click" a row; held but not moved: a click
-  setTimeout(() => { DRAG.suppress = false; }, 120);
   renderSide();
-  return d;
 }
 
 async function finishDrag(drop) {
-  const d = endDrag();
-  if (!d || !drop || !d.target) return;
-  await guarded(() => moveMeetingTo(d.info, d.from, d.target.pid, d.target.type));
+  const d = DRAG.active;
+  if (!d || d.landing) return;
+  d.landing = true;
+  cancelAnimationFrame(d.raf);
+  clearTimeout(d.expandTimer);
+  try { $("side").releasePointerCapture(d.id); } catch (e) { /* not captured */ }
+  DRAG.suppress = d.moved;  // the release would otherwise "click" a row; held but not moved: a click
+  setTimeout(() => { DRAG.suppress = false; }, 120);
+  const target = drop ? d.target : null;
+  try {
+    if (!target) {  // cancelled: the gap closes, the copy flies back to the hole
+      d.target = null; d.key = "";
+      paintDrop(); syncGap(true);
+      const hole = document.querySelector("#side .mrow.dragging");
+      if (flyTo(d, hole && hole.getBoundingClientRect(), !hole)) await sleep(MOVE_MS + 20);
+      for (const o of d.opened) { if (o.type) S.folded.add(o.type); else S.expanded.delete(o.pid); }
+      return;
+    }
+    const gap = d.gap && d.gap.el.isConnected ? d.gap.el : null;
+    const node = dropNode(target);
+    const row = node && node.querySelector(":scope > .prow, :scope > .trow");
+    const dest = gap || row;
+    if (flyTo(d, dest && dest.getBoundingClientRect(), !gap)) await sleep(MOVE_MS + 20);
+    d.settled = true;  // from here the lists are refreshed from the server: no more gap painting
+    await guarded(() => moveMeetingTo(d.info, d.from, target.pid, target.type));
+  } finally {
+    endDrag(d);
+  }
 }
 
 function initDrag() {
   document.addEventListener("pointermove", (ev) => {
     const p = DRAG.press, d = DRAG.active;
     if (p && ev.pointerId === p.id && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) > HOLD_SLOP) cancelPress();
-    if (d && ev.pointerId === d.id) {
+    if (d && ev.pointerId === d.id && !d.landing) {
       d.x = ev.clientX; d.y = ev.clientY;
       if (Math.hypot(d.x - d.sx, d.y - d.sy) > HOLD_SLOP) d.moved = true;
       placeGhost();
@@ -1995,8 +2293,11 @@ function handleEvent(name, data) {
     else for (const id of S.feed.keys()) guarded(() => refreshMeeting(id));
   } else if (name === "enroll") {
     onEnroll(data);
+  } else if (name === "llm") {
+    fetchLlm(false);  // a job failed to log in, or the sign-in console closed
   } else if (name === "settings") {
     applyLook(data);
+    if (typeof data.auto_title === "boolean") setAutoTitleDefault(data.auto_title);
   } else if (name === "sessions" || name === "projects") {
     scheduleProjects(); scheduleFeed();
   }
@@ -2028,7 +2329,7 @@ function onJob(job) {
   else if (S.status.job && S.status.job.id === job.id) S.status.job = null;
   updateJobLines(); updateButtons(); renderStrip();
   if (job.state !== "running" && prev !== job.state) {
-    if (job.state === "error") toast(`${job.kind} failed: ${job.error}`, "error");
+    if (job.state === "error") toast(/^Not logged in to Claude/.test(job.error) ? job.error : `${job.kind} failed: ${job.error}`, "error");
     else {
       toast(`${job.kind} done${job.message ? ": " + job.message : ""}`);
       guarded(() => refreshMeeting(job.session, job.kind === "summary" || job.kind === "todo" ? job.kind : null));
@@ -2126,6 +2427,7 @@ function init() {
     "-",
     { label: "Forget project", sub: "Files stay on disk", icon: "forget", danger: true, onclick: () => guarded(forgetProject) }]));
   initDrag();
+  watchDay();
   $("nav-people").addEventListener("click", showPeople);
   $("nav-settings").addEventListener("click", showSettings);
   document.querySelectorAll(".menu-btn").forEach((b) => b.addEventListener("click", menuButton));
@@ -2138,6 +2440,13 @@ function init() {
   $("btn-stop").addEventListener("click", () => recordCmd("stop"));
   $("btn-src").addEventListener("click", () => showMenu($("btn-src"), sourceMenu));
   $("btn-keep").addEventListener("click", () => { S.opts.keep = !S.opts.keep; renderTop(); });  // until Steno closes
+  $("btn-autotitle").addEventListener("click", () => { S.autoTitle = !S.autoTitle; renderAutoTitle(); });
+  $("btn-autotitle-live").addEventListener("click", async () => {
+    const res = await guarded(() => api("POST", "/api/record/auto_title", { enabled: !(S.status.recorder || {}).auto_title }));
+    if (res && res.recorder) { S.status.recorder = res.recorder; renderAutoTitle(); }
+  });
+  $("rec-title").addEventListener("input", renderAutoTitle);
+  window.addEventListener("focus", () => fetchLlm(false));  // cheap: the server keeps the answer for a minute
   $("rec-type").addEventListener("change", () => { if (S.sel && S.sel !== "inbox") { setRecType(S.sel, $("rec-type").value); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); } });
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });
@@ -2154,7 +2463,12 @@ function init() {
     S.opts.keep = false;  // never remembered: raw audio is sensitive
     await loadProjects();
     showView(); renderSide(); renderTop();
-    try { applyLook((await api("GET", "/api/settings")).settings); } catch (e) { /* defaults */ }
+    try {
+      const set = (await api("GET", "/api/settings")).settings;
+      applyLook(set);
+      if (typeof set.auto_title === "boolean") setAutoTitleDefault(set.auto_title);
+    } catch (e) { /* defaults */ }
+    fetchLlm(false);
   });
   connect();
 }

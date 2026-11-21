@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
 
 from steno import labels, transcript
 from steno.config import ASR_MODES, Config, ConfigError, load_config
@@ -28,10 +31,20 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="save each stream as 16 kHz FLAC in the session dir (sensitive data)")
     _add_asr_overrides(p)
 
-    p = sub.add_parser("new", help="print transcript text not yet seen by a consumer")
-    p.add_argument("--session", default="latest", help="'latest' (default) or a session id")
-    p.add_argument("--consumer", default="claude")
+    p = sub.add_parser(
+        "new", help="print only the transcript text that is new (stored cursor or --since token)")
+    p.add_argument("--session", default="latest",
+                   help="'latest' (default) or a session id; 'latest' means the latest meeting "
+                        "of the project you are in (with --since) or of --project")
+    p.add_argument("--consumer", default=None,
+                   help="stored per-session cursor of this reader (default 'claude')")
     p.add_argument("--peek", action="store_true", help="do not advance the cursor")
+    p.add_argument("--since", metavar="TOKEN",
+                   help="stateless mode: 'start', or the token after 'next:' in the previous "
+                        "output; delivers what is new after it and writes no cursor files")
+    p.add_argument("--project", metavar="PATH",
+                   help="a Steno project folder: 'latest' = its latest meeting (with --since "
+                        "the project is detected from the current folder if this is left out)")
 
     sub.add_parser("sessions", help="list recorded sessions")
 
@@ -259,14 +272,31 @@ def cmd_ui(args: argparse.Namespace, cfg: Config) -> int:
     return run_ui(cfg, port=args.port, open_browser=not args.no_browser)
 
 
-def cmd_new(args: argparse.Namespace) -> int:
-    session_dir = transcript.resolve_session(args.session)
-    if session_dir is None:
-        print(f"(no such session: {args.session})", file=sys.stderr)
-        return 0
-    new = transcript.fetch_new_best(
-        session_dir, args.consumer, peek=args.peek, resolve=labels.resolve_segments
-    )
+def _project_at(path: Path):
+    """The registered Steno project that contains ``path`` (the deepest one), or None."""
+    from steno import projects
+
+    here = os.path.normcase(str(path.resolve()))
+    best = None
+    for p in projects.list_projects():
+        root = os.path.normcase(str(p.path.resolve()))
+        if here == root or here.startswith(root.rstrip("\\/") + os.sep):
+            if best is None or len(str(p.path)) > len(str(best.path)):
+                best = p
+    return best
+
+
+def _latest_in_project(project) -> Path | None:
+    from steno import paths, projects
+
+    for m in reversed(projects.list_meetings(project)):
+        d = paths.sessions_dir() / m.session
+        if d.is_dir():
+            return d
+    return None
+
+
+def _print_new(new: transcript.NewText) -> None:
     if new.new:
         print(transcript.render_markdown(new.new))
     if new.corrections:
@@ -274,6 +304,129 @@ def cmd_new(args: argparse.Namespace) -> int:
             print()
         print("Corrections: these lines were sent before; the text below replaces the old text.")
         print(transcript.render_markdown(new.corrections))
+
+
+def cmd_new(args: argparse.Namespace) -> int:
+    if args.since is not None:
+        return _cmd_new_since(args)
+    session_dir = transcript.resolve_session(args.session)
+    if args.project:
+        project = _project_at(Path(args.project))
+        if project is None:
+            print(f"error: {args.project} is not inside a Steno project folder", file=sys.stderr)
+            return 1
+        if args.session == "latest":
+            session_dir = _latest_in_project(project)
+    if session_dir is None:
+        print(f"(no such session: {args.session})", file=sys.stderr)
+        return 0
+    new = transcript.fetch_new_best(
+        session_dir, args.consumer or "claude", peek=args.peek, resolve=labels.resolve_segments
+    )
+    _print_new(new)
+    return 0
+
+
+def _clock(iso: str | None) -> str:
+    try:
+        return datetime.fromisoformat(str(iso)).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return "?"
+
+
+def _meeting_header(session_dir: Path) -> list[str]:
+    """Title, project/type, state and time range of a meeting (the top of ``--since`` output)."""
+    from steno import projects
+
+    info = transcript.load_session_info(session_dir)
+    project = projects.project_of(session_dir)
+    kind = projects.type_of(session_dir)
+    started = _clock(info.started_at)
+    if info.ended_at is None:
+        state, span = "recording live", f"{started} - now"
+    else:
+        ended = _clock(info.ended_at)
+        same_day = started[:10] == ended[:10]
+        state, span = "finished", f"{started} - {ended[11:] if same_day else ended}"
+    parts = [f"project: {project.name}" if project else "project: (none)"]
+    if kind:
+        parts.append(f"type: {kind}")
+    parts += [f"state: {state}", span]
+    return [f"# Meeting: {projects.meeting_title(session_dir)}", " | ".join(parts),
+            f"session: {session_dir.name}"]
+
+
+def _summary_hint(session_dir: Path) -> str | None:
+    from steno import projects
+
+    folder = projects.meeting_folder(session_dir)
+    names = [n for n in projects.COPIED if folder and (folder / n).is_file()]
+    if folder is None or not names:
+        return None
+    project = projects.project_of(session_dir)
+    where = folder.name
+    if project:
+        try:
+            where = folder.relative_to(project.path).as_posix()
+        except ValueError:
+            pass
+    return (f"note: this meeting is finished and has {' and '.join(names)} in {where}/ - "
+            "read that first if you only need an overview of it.")
+
+
+def _cmd_new_since(args: argparse.Namespace) -> int:
+    """Stateless "only what is new": the position travels in the token, nothing is stored."""
+    if args.consumer is not None or args.peek:
+        print("error: --since is stateless; it cannot be combined with --consumer or --peek",
+              file=sys.stderr)
+        return 2
+    try:
+        if args.since == "start":
+            token_session, last_seq, last_rev = None, 0, 0
+        else:
+            token_session, last_seq, last_rev = transcript.parse_token(args.since)
+    except transcript.TokenError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    project = None
+    if args.project:
+        project = _project_at(Path(args.project))
+        if project is None:
+            print(f"error: {args.project} is not inside a Steno project folder", file=sys.stderr)
+            return 1
+    elif args.session == "latest":
+        project = _project_at(Path.cwd())
+    if args.session == "latest" and project is not None:
+        session_dir = _latest_in_project(project)
+        missing = f"in project {project.name}"
+    else:
+        session_dir = transcript.resolve_session(args.session)
+        missing = f"({args.session})"
+    if session_dir is None:
+        print(f"(no meeting found {missing})")
+        print("next: start")
+        return 0
+
+    lines = _meeting_header(session_dir)
+    if token_session is not None and token_session != session_dir.name:
+        lines.append(f"note: your token was for meeting {token_session}; this is a different "
+                     "meeting, so it is delivered from its start. Earlier text is outdated.")
+        last_seq = last_rev = 0
+    if (last_seq, last_rev) == (0, 0) and not transcript.load_session_info(session_dir).recording:
+        hint = _summary_hint(session_dir)
+        if hint:
+            lines.append(hint)
+    new, next_seq, next_rev = transcript.compute_new(
+        session_dir, last_seq, last_rev, resolve=labels.resolve_segments)
+    print("\n".join(lines))
+    print()
+    if new:
+        _print_new(new)
+    else:
+        print("(nothing new)")
+    print()
+    print(f"next: {transcript.format_token(session_dir.name, next_seq, next_rev)}")
     return 0
 
 

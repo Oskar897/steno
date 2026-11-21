@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -196,6 +197,11 @@ def set_types(pid: str, types: list[dict]) -> Project:
                 entry["types"] = [{"name": t.name, "folder": t.folder} for t in new]
         _save_entries(entries)
     project = get_project(pid)
+    for t in project.types:  # the folder exists from the start: visible in Explorer, ready to use
+        try:
+            project.type_dir(t).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.debug("Could not create the folder of %s", t.name, exc_info=True)
     write_index(project)
     return project
 
@@ -267,11 +273,15 @@ here; meetings with a type (Board, 1-1, ...) are in that type's folder in the pr
 
 How to read them (save tokens):
 1. Start with `index.md`.
-2. For earlier meetings read `summary.md` and `todo.md` first; open `transcript.md` only
+2. Earlier meetings: read `summary.md` and `todo.md` first; open `transcript.md` only
    when the question needs details that are not in them.
-3. The meeting marked **recording** in `index.md` is happening right now: its
-   `transcript.md` is rewritten every few seconds with the best text so far (lines
-   may still improve). Re-read it when asked about the meeting "now".
+3. The meeting marked **recording** in `index.md` is live; for it, or the latest one, do
+   not re-read `transcript.md`. Run `steno new --since start` the first time (from this
+   project folder it picks this project's latest meeting). The output ends with a line
+   `next: <token>`; on every later question run `steno new --since <that token>` and you
+   get only what was said since. Lines under "Corrections" replace their earlier wording.
+   If the header says it is a different meeting, the older text no longer applies.
+4. If the `steno` command is missing, read `transcript.md` (rewritten every few seconds).
 
 Transcript lines look like `[MM:SS] Speaker: text`. Speech recognition errors happen,
 mostly with names and English terms inside Swedish sentences.
@@ -582,6 +592,35 @@ def render_transcript(session_dir: Path, title: str, *, recording: bool = False)
     return head + transcript.render_markdown(segments) + "\n"
 
 
+_LOCK_RETRIES = 4  # tries per write; 0.05 s, 0.1 s, 0.2 s between them
+_LOCK_BACKOFF = 0.05
+
+
+def _write_synced(path: Path, text: str) -> bool:
+    """Atomic write into a meeting folder, tolerant of another program holding the file.
+
+    On Windows Explorer's preview pane, OneDrive, an editor or a virus scanner can lock
+    ``transcript.md`` (or its ``.tmp``) for a moment: ``PermissionError``. Retry a few times
+    with a short backoff; if it stays locked return False and let the caller skip this round
+    (the file is rewritten every few seconds while recording, and once more at the end).
+    Other errors still raise."""
+    delay = _LOCK_BACKOFF
+    for attempt in range(_LOCK_RETRIES):
+        try:
+            atomic_write_text(path, text)
+            return True
+        except PermissionError:
+            if attempt + 1 < _LOCK_RETRIES:
+                time.sleep(delay)
+                delay *= 2
+    try:
+        path.with_name(path.name + ".tmp").unlink(missing_ok=True)  # best effort: not left behind
+    except OSError:
+        pass
+    log.debug("%s is locked by another program, skipped this round", path)
+    return False
+
+
 def sync(session_dir: Path, *, recording: bool = False, docs: bool = True) -> Path | None:
     """Write the readable files of a session into its meeting folder (if it has one)."""
     session_dir = Path(session_dir)
@@ -590,13 +629,13 @@ def sync(session_dir: Path, *, recording: bool = False, docs: bool = True) -> Pa
         return None
     title = meeting_title(session_dir)
     try:
-        atomic_write_text(folder / "transcript.md",
-                          render_transcript(session_dir, title, recording=recording))
+        _write_synced(folder / "transcript.md",
+                      render_transcript(session_dir, title, recording=recording))
         if docs:
             for name in COPIED:
                 src = session_dir / name
                 if src.is_file():
-                    atomic_write_text(folder / name, src.read_text(encoding="utf-8"))
+                    _write_synced(folder / name, src.read_text(encoding="utf-8"))
     except OSError:
         log.exception("Could not write the meeting folder %s", folder)
     return folder

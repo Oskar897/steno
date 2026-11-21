@@ -356,6 +356,8 @@ def clean_session(
         try:
             edits = llm.parse_json_array(
                 llm.run_claude(prompt, "\n".join(render_line(s) for s in chunk), cfg, runner))
+        except llm.LlmAuthError:
+            raise  # not logged in: every other chunk would fail the same way
         except LlmError as exc:
             log.warning("clean chunk %d/%d failed: %s", i + 1, len(chunks), exc)
             failed += 1

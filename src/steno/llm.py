@@ -5,7 +5,7 @@ Only transcript *text* is sent (on stdin, never in argv); audio and voiceprints 
 leave the machine. The CLI is started in an empty temporary directory with all tools
 switched off and no session saved, so it cannot read or change files.
 
-Three features, each with its prompt in ``steno/prompts/*.md``:
+Four features, each with its prompt in ``steno/prompts/*.md``:
 
 * ``summarize``  -> ``summary.md`` (overview, decisions, open questions)
 * ``extract_todos`` -> ``todo.json`` / ``todo.md``: explicit commitments only, taken from the
@@ -13,6 +13,12 @@ Three features, each with its prompt in ``steno/prompts/*.md``:
   verbatim (after normalising case, punctuation and whitespace) in the transcript is dropped.
 * ``llm_fix`` (``steno finalize --llm-fix``): the model returns diffs ``{id, old, new}``;
   an edit is applied only when ``old`` occurs in that line and the change is small.
+* ``suggest_title``: a short meeting title from the start of the transcript (the app's
+  automatic title, only for a meeting the user did not name).
+
+Whether the CLI is installed and logged in is asked with ``claude auth status``
+(``probe_status`` / ``StatusCache``); ``start_login`` opens ``claude auth login`` in a visible
+console so the user completes the browser sign-in themselves.
 
 The clean transcript (``steno clean``, see ``steno.clean``) is used when it exists and still
 matches its source, else the final transcript, else the live one with current speaker names;
@@ -23,10 +29,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from importlib import resources
@@ -53,6 +63,51 @@ class LlmError(RuntimeError):
     """The Claude CLI is missing, failed, or answered with something unusable."""
 
 
+class LlmAuthError(LlmError):
+    """Claude Code is not logged in (never, or the session expired)."""
+
+
+class LlmLimitError(LlmError):
+    """The account's usage limit or credit balance is used up."""
+
+
+AUTH_MESSAGE = "Not logged in to Claude: log in to use AI features."
+LIMIT_MESSAGE = "Claude usage limit or credit balance reached: try again later."
+INSTALL_URL = "https://docs.claude.com/en/docs/claude-code/setup"
+MAX_DETAIL = 300
+
+_AUTH_RE = re.compile(
+    r"failed to authenticate|oauth|not logged in|not authenticated|/login|invalid api key"
+    r"|invalid x-api-key|authentication[_ ]error|unauthori[sz]ed|session (?:has )?expired"
+    r"|token (?:has )?expired|credentials? (?:are |is )?(?:missing|invalid|expired)",
+    re.IGNORECASE)
+_LIMIT_RE = re.compile(
+    r"credit balance|usage limit|limit reached|out of (?:extra )?usage|quota", re.IGNORECASE)
+
+
+def classify_failure(detail: str, prefix: str = "the Claude CLI failed") -> LlmError:
+    """The error to raise for a failure message of the CLI (friendly text for known causes)."""
+    detail = " ".join((detail or "").split()) or "no output"
+    if _AUTH_RE.search(detail):
+        return LlmAuthError(AUTH_MESSAGE)
+    if _LIMIT_RE.search(detail):
+        return LlmLimitError(LIMIT_MESSAGE)
+    return LlmError(f"{prefix}: {detail[:MAX_DETAIL]}")
+
+
+def _json_of(text: str) -> dict[str, Any] | None:
+    """The CLI's JSON object: the whole output, else its last line."""
+    text = (text or "").strip()
+    for candidate in (text, text.rsplit("\n", 1)[-1]):
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 # --------------------------------------------------------------------------- the CLI
 
 
@@ -76,7 +131,7 @@ def build_command(cfg: LlmConfig, prompt_file: Path) -> list[str]:
     own CLAUDE.md, hooks and MCP servers out of the call: the run is deterministic, cheap
     (about 1k instead of 15k tokens of overhead) and nothing but the transcript is sent.
     """
-    exe = shutil.which(cfg.command) or cfg.command
+    exe = find_cli(cfg.command) or cfg.command
     cmd = [exe, "-p", "--model", cfg.model, "--output-format", "json", "--tools", "",
            "--no-session-persistence", "--disable-slash-commands",
            "--setting-sources", "", "--strict-mcp-config",
@@ -92,8 +147,6 @@ def no_window() -> dict[str, Any]:
     The desktop app runs under ``pythonw`` (no console), so each child would otherwise get a
     new console window of its own (``claude.cmd`` goes through ``cmd.exe``).
     """
-    import sys
-
     if sys.platform != "win32":
         return {}
     info = subprocess.STARTUPINFO()
@@ -123,19 +176,147 @@ def run_claude(
     except subprocess.TimeoutExpired as exc:
         raise LlmError(f"the Claude CLI did not answer within {cfg.timeout_s} s") from exc
     out = (proc.stdout or "").strip()
+    data = _json_of(out)
     if proc.returncode != 0:
-        detail = (proc.stderr or out).strip().splitlines()[-1:] or ["no output"]
-        raise LlmError(f"the Claude CLI failed (exit {proc.returncode}): {detail[0][:300]}")
-    try:
-        data = json.loads(out)
-    except ValueError:
+        # The real reason is the JSON's `result` on stdout; stderr is often empty.
+        reason = data.get("result") if data is not None else None
+        if not isinstance(reason, str) or not reason.strip():
+            lines = (proc.stderr or "").strip().splitlines() or out.splitlines()
+            reason = lines[-1] if lines else "no output"
+        raise classify_failure(reason, f"the Claude CLI failed (exit {proc.returncode})")
+    if data is None:
         return out  # plain text: older CLI or a different output format
-    if isinstance(data, dict):
-        if data.get("is_error"):
-            raise LlmError(f"the Claude CLI reported an error: {str(data.get('result'))[:300]}")
-        if isinstance(data.get("result"), str):
-            return data["result"].strip()
+    if data.get("is_error"):
+        raise classify_failure(str(data.get("result") or ""), "the Claude CLI reported an error")
+    if isinstance(data.get("result"), str):
+        return data["result"].strip()
     raise LlmError("unexpected output from the Claude CLI")
+
+
+# --------------------------------------------------------------------------- login status
+
+
+def find_cli(command: str) -> str | None:
+    """Path of the Claude Code executable, or None.
+
+    ``PATH`` first, then the usual install places: the desktop app runs under ``pythonw`` and
+    may not see the PATH of the user's terminal (native installer: ``~/.local/bin``,
+    npm: ``%APPDATA%/npm``).
+    """
+    found = shutil.which(command)
+    if found:
+        return found
+    if Path(command).is_file():
+        return command
+    name = Path(command).name
+    dirs = [Path.home() / ".local" / "bin", Path.home() / ".claude" / "local",
+            Path.home() / ".npm-global" / "bin"]
+    if os.environ.get("APPDATA"):
+        dirs.append(Path(os.environ["APPDATA"]) / "npm")
+    if sys.platform != "win32":
+        dirs += [Path("/usr/local/bin"), Path("/opt/homebrew/bin")]
+    for d in dirs:
+        for candidate in (name, f"{name}.exe", f"{name}.cmd"):
+            if (d / candidate).is_file():
+                return str(d / candidate)
+    return None
+
+
+@dataclass(frozen=True)
+class ClaudeStatus:
+    """``state``: ``ok`` (logged in), ``logged_out``, ``missing`` (no CLI) or ``error``."""
+
+    state: str
+    method: str = ""  # how it is logged in ("claude.ai", "api_key", ...), never an account name
+    plan: str = ""  # subscription type when the CLI says so ("pro", "max", ...)
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"state": self.state, "method": self.method, "plan": self.plan,
+                "detail": self.detail}
+
+
+def _label(value: Any) -> str:
+    return " ".join(value.split())[:40] if isinstance(value, str) else ""
+
+
+def probe_status(cfg: LlmConfig, runner: Runner | None = None) -> ClaudeStatus:
+    """Ask ``claude auth status`` whether Claude Code is installed and logged in.
+
+    Costs no tokens. The CLI exits 1 when logged out but still prints its JSON, so the output
+    is read whatever the exit code. The account's e-mail address is never kept.
+    """
+    exe = find_cli(cfg.command)
+    if exe is None:
+        return ClaudeStatus("missing", detail=f"'{cfg.command}' was not found")
+    runner = runner or subprocess.run
+    try:
+        proc = runner([exe, "auth", "status"], capture_output=True, text=True,
+                      encoding="utf-8", timeout=20, check=False, stdin=subprocess.DEVNULL,
+                      **no_window())
+    except FileNotFoundError:
+        return ClaudeStatus("missing", detail=f"'{cfg.command}' could not be started")
+    except subprocess.TimeoutExpired:
+        return ClaudeStatus("error", detail="Claude Code did not answer in time")
+    data = _json_of(proc.stdout or "")
+    if data is not None and isinstance(data.get("loggedIn"), bool):
+        if not data["loggedIn"]:
+            return ClaudeStatus("logged_out")
+        return ClaudeStatus("ok", method=_label(data.get("authMethod")),
+                            plan=_label(data.get("subscriptionType")))
+    text = " ".join(((proc.stderr or "") + " " + (proc.stdout or "")).split())
+    if _AUTH_RE.search(text):
+        return ClaudeStatus("logged_out")
+    return ClaudeStatus("error", detail=text[:MAX_DETAIL] or f"exit {proc.returncode}")
+
+
+class StatusCache:
+    """``probe()`` result kept for ``ttl`` seconds; ``invalidate()`` after an auth failure."""
+
+    def __init__(self, probe: Callable[[], ClaudeStatus], ttl: float = 60.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self._probe, self._ttl, self._clock = probe, ttl, clock
+        self._lock = threading.Lock()
+        self._value: ClaudeStatus | None = None
+        self._at = 0.0
+
+    def get(self, refresh: bool = False) -> ClaudeStatus:
+        with self._lock:  # one probe at a time; the others reuse its answer
+            value = self._value
+            if refresh or value is None or self._clock() - self._at >= self._ttl:
+                try:
+                    value = self._probe()
+                except Exception as exc:  # a status check must never break the page
+                    log.warning("Claude status check failed: %s", exc)
+                    value = ClaudeStatus("error", detail=str(exc)[:MAX_DETAIL])
+                self._value, self._at = value, self._clock()
+            return value
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._value = None
+
+
+def start_login(cfg: LlmConfig, popen: Callable[..., Any] | None = None) -> Any:
+    """Start ``claude auth login`` in a visible console; the user finishes it in the browser.
+
+    Returns the process. Windows: a console window of its own (``CREATE_NEW_CONSOLE``, not the
+    hidden-window flags of the normal calls) so the user sees what the CLI prints.
+    """
+    exe = find_cli(cfg.command)
+    if exe is None:
+        raise LlmError(f"cannot run '{cfg.command}': install Claude Code first")
+    popen = popen or subprocess.Popen
+    if sys.platform == "win32":
+        extra: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_CONSOLE}
+    else:
+        extra = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                 "stderr": subprocess.DEVNULL, "start_new_session": True}
+    try:
+        return popen([exe, "auth", "login"], **extra)
+    except OSError as exc:
+        raise LlmError(f"could not start the Claude login: {exc}") from exc
+
 
 
 # --------------------------------------------------------------------------- transcript
@@ -246,6 +427,76 @@ def summarize(
     path = Path(session_dir) / SUMMARY_NAME
     atomic_write_text(path, f"{reply.strip()}\n\n{text_note(kind)}\n")
     return path, kind
+
+
+# --------------------------------------------------------------------------- title
+
+TITLE_SAMPLE_CHARS = 6000  # sent to the model: the start plus a piece of the middle
+TITLE_MIN_CHARS = 40  # less text than this says nothing about the topic
+MAX_TITLE_CHARS = 60
+MAX_TITLE_WORDS = 10
+_TITLE_BAD_RE = re.compile(r'[<>:"/\|?*\x00-\x1f]')
+_TITLE_LABEL_RE = re.compile(r"^(?:title|titel|meeting title|mötestitel)\s*[:\-]\s*", re.I)
+_TITLE_QUOTES = "\"'`“”„‘’«»*_# \t"
+_TITLE_TRAIL = " .,:;!?-–—…"
+_GENERIC_TITLES = {"meeting", "möte", "untitled", "untitled meeting", "namnlöst möte"}
+
+
+def sample_for_title(segments: list[Segment], cap: int = TITLE_SAMPLE_CHARS) -> str:
+    """The start of the transcript, plus a piece of the middle when it is longer than ``cap``."""
+    lines = [f"{s.speaker}: {s.text.strip()[:500]}" for s in segments if s.text.strip()]
+    if sum(len(x) + 1 for x in lines) <= cap:
+        return "\n".join(lines)
+    head_budget = cap * 3 // 4
+    head: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > head_budget:
+            break
+        head.append(line)
+        used += len(line) + 1
+    rest = lines[len(head):]
+    mid: list[str] = []
+    used = 0
+    for line in rest[len(rest) // 2:]:
+        if used + len(line) + 1 > cap - head_budget:
+            break
+        mid.append(line)
+        used += len(line) + 1
+    return "\n".join(head + ["[...]"] + mid) if mid else "\n".join(head)
+
+
+def clean_title_reply(text: str) -> str | None:
+    """A usable meeting title from a model reply, or None.
+
+    First line only; markdown, quotes, a leading "Title:" and trailing punctuation removed;
+    characters a folder name cannot hold dropped; at most 60 characters (cut at a word).
+    """
+    line = next((x for x in (text or "").splitlines() if x.strip()), "")
+    line = line.strip().lstrip("#").strip(_TITLE_QUOTES)
+    line = _TITLE_BAD_RE.sub(" ", _TITLE_LABEL_RE.sub("", line))  # label first: it has a colon
+    line = " ".join(line.split()).strip(_TITLE_TRAIL + _TITLE_QUOTES)
+    if len(line) > MAX_TITLE_CHARS:
+        line = line[:MAX_TITLE_CHARS].rsplit(" ", 1)[0] if " " in line[:MAX_TITLE_CHARS] \
+            else line[:MAX_TITLE_CHARS]
+        line = line.strip(_TITLE_TRAIL + _TITLE_QUOTES)
+    if len(line) < 2 or len(line.split()) > MAX_TITLE_WORDS or line.casefold() in _GENERIC_TITLES:
+        return None
+    return line
+
+
+def suggest_title(
+    session_dir: Path, cfg: LlmConfig, runner: Runner | None = None
+) -> str:
+    """A short title for the meeting, from the best transcript text (nothing is written)."""
+    segments, _ = load_transcript(session_dir)
+    text = sample_for_title(segments)
+    if len(text) < TITLE_MIN_CHARS:
+        raise LlmError("too little text to name the meeting")
+    title = clean_title_reply(run_claude(load_prompt("title"), text, cfg, runner))
+    if title is None:
+        raise LlmError("the model did not return a usable title")
+    return title
 
 
 # --------------------------------------------------------------------------- to-do
@@ -453,10 +704,14 @@ def llm_fix(
         size += len(s.text)
     current = list(segments)
     report: dict[str, Any] = {"proposed": 0, "applied": 0, "rejected": [], "failed_batches": 0}
-    for batch in batches:
+    for n, batch in enumerate(batches):
         text = "\n".join(f"[{s.seq}] {s.text}" for s in batch)
         try:
             edits = parse_json_array(run_claude(prompt, text, cfg, runner))
+        except LlmAuthError as exc:  # every other batch would fail the same way
+            log.warning("llm-fix stopped: %s", exc)
+            report["failed_batches"] += len(batches) - n
+            break
         except LlmError as exc:
             log.warning("llm-fix batch failed: %s", exc)
             report["failed_batches"] += 1

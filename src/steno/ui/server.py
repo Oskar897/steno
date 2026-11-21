@@ -222,6 +222,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.projects_list()
             if segs == ["settings"]:
                 return app.settings_get()
+            if segs == ["llm", "status"]:
+                return app.llm_status(refresh=(query.get("refresh") or ["0"])[0] in ("1", "true"))
             if n == 3 and segs[0] == "projects" and segs[2] == "meetings":
                 return app.project_meetings(segs[1])
             if n == 4 and segs[0] == "sessions" and segs[2] == "doc":
@@ -235,6 +237,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.record_pause()
             if segs == ["record", "resume"]:
                 return app.record_resume()
+            if segs == ["record", "auto_title"]:
+                return app.record_auto_title(body)
+            if segs == ["llm", "login"]:
+                return app.llm_login()
+            if segs == ["llm", "install"]:
+                return app.llm_install_page()
             if segs == ["projects"]:
                 return app.project_add(body)
             if n == 3 and segs[0] == "projects" and segs[2] == "types":

@@ -26,6 +26,9 @@ class AppSettings:
     # After a recording stops: finalize (better speakers, seconds, local, no kept audio needed
     # with the default [post] modes), then these jobs in this order (each needs the Claude CLI).
     auto_finalize: bool = True
+    # Name a meeting the user left untitled from its transcript (Claude, haiku, a few seconds).
+    # The dock has a per-meeting switch that starts from this value.
+    auto_title: bool = True
     auto_clean: bool = False
     auto_summary: bool = False
     auto_todo: bool = False

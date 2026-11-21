@@ -10,7 +10,7 @@ recognition, built to work alongside [Claude Code](https://claude.com/claude-cod
 ## Principles
 
 - **Local first.** Audio, transcription and voice recognition run on your
-  machine (CPU only). Only text you explicitly send (summary / to-do) leaves it.
+  machine (CPU only). Only transcript text sent to Claude (summary, to-do, clean-up, automatic title) leaves it; automatic titles are on by default and can be turned off in Settings.
 - **Private by default.** Recordings, transcripts and voice profiles are stored
   in your user data folder (`%USERPROFILE%\.steno`), never in this repository.
 - **Consent.** Voiceprints are biometric personal data (GDPR). Tell everyone
@@ -192,7 +192,7 @@ background CPU), `--thorough` 18 %. Looping one recording gives bit-identical em
 fool the speaker count (8 "speakers" for one person in the 11 min run), so those runs say
 nothing about speaker accuracy.
 
-`summary`, `todo`, `clean` and `finalize --llm-fix` call the Claude Code CLI (`claude -p`, your own
+`summary`, `todo`, `clean`, `finalize --llm-fix` and the app's automatic title call the Claude Code CLI (`claude -p`, your own
 login, no API key in Steno): only the transcript *text* goes to Claude, on stdin, with all
 tools disabled; audio and voiceprints never leave the machine. `[llm]` sets the model
 (default the Haiku alias), effort (default medium) and output language (default Swedish).
@@ -209,6 +209,39 @@ drops content or changes numbers, weekdays or names. The result is `clean.jsonl`
 are never touched, and `summary` / `todo` use the clean text while it matches its source.
 `--dry-run` shows what would change. See `docs/formats.md` for the rules. In Claude Code the slash
 commands `/sammanfatta` and `/todo` run these and show the result.
+
+## Using Steno from Claude Code in your project folders
+
+Every project folder gets `Steno/CLAUDE.md` (and `Steno/index.md`) that tell Claude Code how to
+read the meetings: summaries first, and for a live or the latest meeting only what is new.
+For that, `steno` has to be callable from any folder. Install it once as a tool:
+
+```powershell
+uv tool install --editable <path-to-this-repo>      # core only: enough for `steno new`
+uv tool update-shell                               # once, if `steno` is not found afterwards
+# with the app and recording as well:
+uv tool install --editable "<path-to-this-repo>[audio,asr,speakers,app]"
+```
+
+`--editable` means the command always runs the code of this checkout (no reinstall after a
+`git pull`). `steno new` only reads `%USERPROFILE%\.steno`, so it works from any folder; the
+recording/app commands need the extras above.
+
+```powershell
+steno new --since start                  # header + the whole meeting; ends with  next: 20261121-195539:42:7
+steno new --since 20261121-195539:42:7   # only what was said since (and "Corrections" of earlier lines)
+```
+
+The token (`session:last_seq:last_rev`) carries the position, so it is stateless: nothing is
+stored, several Claude conversations can read the same meeting independently, and repeating a
+call with the same token gives the same answer. Inside a project folder (or its `Steno/`) "latest"
+is that project's latest meeting; elsewhere it is the latest meeting overall, and
+`--project PATH` / `--session ID` choose explicitly. If a new meeting has started since the
+token, the header says so and the new meeting is delivered from its start. A finished meeting
+that has `summary.md` / `todo.md` points to them first. The older `steno new --consumer NAME`
+(stored cursor per session and reader, used by the `/nytt` command in this repository) is
+unchanged; `/nytt` keeps it because a slash command cannot carry a token between calls.
+Format: `docs/formats.md`.
 
 ## Browser UI (`steno ui`)
 

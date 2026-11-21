@@ -544,6 +544,43 @@ class NewText:
         return bool(self.new or self.corrections)
 
 
+def compute_new(
+    session_dir: Path,
+    last_seq: int,
+    last_rev: int,
+    *,
+    resolve: Callable[[Path, list[Segment]], list[Segment]] | None = None,
+) -> tuple[NewText, int, int]:
+    """What is new after the position ``(last_seq, last_rev)``, without touching any cursor.
+
+    Returns the text plus the position after it, ``(new_text, next_seq, next_rev)``: the
+    newest line and the newest revision that were read. ``fetch_new_best`` (stored cursor) and
+    the stateless token mode of ``steno new --since`` are both built on this.
+    """
+    session_dir = Path(session_dir)
+    revisions = read_revisions(session_dir)
+    drafts = read_segments(session_dir)
+    newest = latest_revisions(revisions)
+    seen = latest_revisions(revisions, max_rev=last_rev)  # what the reader was shown
+    new = [apply_revision(s, newest.get(s.seq)) for s in drafts if s.seq > last_seq]
+    corrections = []
+    for s in drafts:
+        if s.seq > last_seq:
+            continue
+        cur = newest.get(s.seq)
+        if cur is None or cur.rev <= last_rev:
+            continue
+        shown = seen[s.seq].text if s.seq in seen else s.text
+        if not same_words(shown, cur.text):
+            corrections.append(apply_revision(s, cur))
+    top_rev = max((r.rev for r in revisions), default=0)
+    next_seq = max(last_seq, new[-1].seq if new else 0)
+    next_rev = max(last_rev, top_rev)
+    if resolve:
+        new, corrections = resolve(session_dir, new), resolve(session_dir, corrections)
+    return NewText(new, corrections), next_seq, next_rev
+
+
 def fetch_new_best(
     session_dir: Path,
     consumer: str,
@@ -564,29 +601,35 @@ def fetch_new_best(
     """
     session_dir = Path(session_dir)
     last_seq, last_rev = read_cursor_state(session_dir, consumer)
-    revisions = read_revisions(session_dir)
-    drafts = read_segments(session_dir)
-    newest = latest_revisions(revisions)
-    seen = latest_revisions(revisions, max_rev=last_rev)  # what the consumer was shown
-    new = [apply_revision(s, newest.get(s.seq)) for s in drafts if s.seq > last_seq]
-    corrections = []
-    for s in drafts:
-        if s.seq > last_seq:
-            continue
-        cur = newest.get(s.seq)
-        if cur is None or cur.rev <= last_rev:
-            continue
-        shown = seen[s.seq].text if s.seq in seen else s.text
-        if not same_words(shown, cur.text):
-            corrections.append(apply_revision(s, cur))
-    top_rev = max((r.rev for r in revisions), default=0)
-    if not peek and (new or top_rev > last_rev):
-        write_cursor(
-            session_dir, consumer, max(last_seq, new[-1].seq if new else 0), max(last_rev, top_rev)
-        )
-    if resolve:
-        new, corrections = resolve(session_dir, new), resolve(session_dir, corrections)
-    return NewText(new, corrections)
+    text, next_seq, next_rev = compute_new(session_dir, last_seq, last_rev, resolve=resolve)
+    if not peek and (next_seq, next_rev) != (last_seq, last_rev):
+        write_cursor(session_dir, consumer, next_seq, next_rev)
+    return text
+
+
+# --------------------------------------------------------------------------- tokens
+
+_TOKEN_SESSION = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+class TokenError(ValueError):
+    """A ``--since`` token that is not ``<session>:<seq>:<rev>`` (the message says how)."""
+
+
+def format_token(session_id: str, last_seq: int, last_rev: int) -> str:
+    """Position in a session as a compact, stateless cursor: ``20261121-195539:42:7``."""
+    return f"{session_id}:{int(last_seq)}:{int(last_rev)}"
+
+
+def parse_token(token: str) -> tuple[str, int, int]:
+    """``(session_id, last_seq, last_rev)`` of a token from ``format_token``."""
+    parts = token.strip().split(":")
+    if (len(parts) != 3 or not _TOKEN_SESSION.fullmatch(parts[0])
+            or not all(p.isascii() and p.isdigit() for p in parts[1:])):
+        raise TokenError(
+            f"not a valid token: {token!r}. Use 'start' or the value after 'next:' in the "
+            "previous output (SESSION:SEQ:REV, e.g. 20261121-195539:42:7).")
+    return parts[0], int(parts[1]), int(parts[2])
 
 
 # --------------------------------------------------------------------------- sessions

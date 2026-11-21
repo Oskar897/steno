@@ -32,6 +32,7 @@
       <button class="pitem" id="nav-people" type="button"><i class="picon" data-icon="people"></i><span class="pname">People</span><span class="pcount" id="people-count"></span></button>
       <button class="pitem" id="nav-settings" type="button"><i class="picon" data-icon="settings"></i><span class="pname">Settings</span></button>
     </nav>
+    <div class="side-llm" id="side-llm" hidden></div>
     <div class="side-foot" id="side-foot"></div>
   </aside>
   <div class="resizer" id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the sidebar (drag all the way left to hide it)" tabindex="0" title="Drag to resize · drag left to hide · double-click to hide/show (Ctrl+B)"></div>
@@ -68,7 +69,8 @@
       <div class="dock" id="dock" data-state="idle">
         <div class="dock-idle">
           <select class="text dock-type" id="rec-type" aria-label="Meeting type" title="Meeting type: where the meeting is saved" hidden></select>
-          <input class="text dock-title" id="rec-title" type="text" placeholder="Meeting title (optional)" maxlength="80" aria-label="Meeting title" autocomplete="off">
+          <input class="text dock-title" id="rec-title" type="text" placeholder="Untitled meeting" maxlength="80" aria-label="Meeting title" autocomplete="off">
+          <button class="btn keep-btn title-btn" id="btn-autotitle" type="button" aria-pressed="true"><i data-icon="heading"></i><span class="lbl">Auto title</span></button>
           <button class="icon-btn src-btn" id="btn-src" type="button" aria-label="Audio sources" title="Audio sources"></button>
           <button class="btn keep-btn" id="btn-keep" type="button" aria-pressed="false"><i data-icon="keep"></i><span class="lbl">Keep audio</span></button>
           <button class="btn rec" id="btn-rec" type="button"><span class="rec-ico"></span><span id="btn-rec-label">Record</span></button>
@@ -79,6 +81,7 @@
           <span class="meters" id="meters"></span>
           <span class="live-status" id="live-status"></span>
           <span class="grow"></span>
+          <button class="btn keep-btn title-btn" id="btn-autotitle-live" type="button" aria-pressed="true"><i data-icon="heading"></i><span class="lbl">Auto title</span></button>
           <button class="btn" id="btn-pause" type="button"><i data-icon="pause"></i><span class="lbl">Pause</span></button>
           <button class="btn stop" id="btn-stop" type="button"><i data-icon="stop"></i><span class="lbl">Stop</span></button>
         </div>

@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import webbrowser
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from steno import __version__, labels, projects, settings, transcript
+from steno import __version__, labels, llm, projects, settings, transcript
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
@@ -32,8 +34,9 @@ _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 MAX_PATH_LEN = 1000
 DOCS = {"summary": "summary.md", "todo": "todo.md"}
 AUTO_JOB = "auto"  # the jobs that run by themselves after a recording (Settings)
-STEP_LABELS = {"finalize": "finalize", "clean": "clean-up", "summary": "summary",
-               "todo": "to-do"}
+STEP_LABELS = {"finalize": "finalize", "clean": "clean-up", "title": "title",
+               "summary": "summary", "todo": "to-do"}
+QUIET_STEPS = {"title"}  # a failing automatic step that only gets a log line, no error
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -90,8 +93,23 @@ def default_runners(cfg: Config, store_factory: Callable[[], ProfileStore]) -> d
             session_dir, cfg.llm, person=params.get("person"))
         return f"{len(items)} to-do item(s) ({kind} transcript), {dropped} dropped without evidence"
 
-    return {"finalize": run_finalize, "clean": run_clean, "summary": run_summary,
-            "todo": run_todo}
+    def run_title(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
+        """Name an untitled meeting from its transcript; a title the user gave stays."""
+
+        def untitled() -> bool:
+            return projects.meeting_title(session_dir) == projects.DEFAULT_TITLE
+
+        if not untitled():
+            raise RuntimeError("the meeting already has a title")
+        progress("waiting for Claude", 0, 0)
+        title = llm.suggest_title(session_dir, cfg.llm)
+        if not untitled():  # the user named it while Claude was thinking
+            raise RuntimeError("the meeting was named meanwhile")
+        meeting = projects.rename_meeting(session_dir, title)
+        return f"titled: {meeting.title}"
+
+    return {"finalize": run_finalize, "clean": run_clean, "title": run_title,
+            "summary": run_summary, "todo": run_todo}
 
 
 class UiApp:
@@ -103,12 +121,22 @@ class UiApp:
         runners: dict[str, Runner] | None = None,
         store_factory: Callable[[], ProfileStore] = ProfileStore,
         enroller_deps: dict[str, Any] | None = None,
+        llm_probe: Callable[[], llm.ClaudeStatus] | None = None,
+        llm_login: Callable[[Any], Any] | None = None,
+        open_url: Callable[[str], Any] | None = None,
     ):
         self.cfg = cfg
         self.bus = EventBus()
         self._store_factory = store_factory
         self.recorder = Recorder(cfg, self.bus, engine_factory)
-        base = dict(runners or default_runners(cfg, store_factory))
+        # Is Claude Code installed and logged in? Asked with `claude auth status`, kept 60 s.
+        self._llm = llm.StatusCache(llm_probe or (lambda: llm.probe_status(cfg.llm)))
+        self._llm_login = llm_login or llm.start_login
+        self._open_url = open_url or webbrowser.open
+        self._login_proc: Any = None
+        self._login_lock = threading.Lock()
+        base = {kind: self._notice_auth(fn)
+                for kind, fn in dict(runners or default_runners(cfg, store_factory)).items()}
         base[AUTO_JOB] = self._auto_runner(base)
         self.jobs = JobManager(self.bus, self._with_sync(base))
         self.recorder.on_stopped = self._after_recording
@@ -172,10 +200,27 @@ class UiApp:
         post = self.cfg.post
         return post.diarization == "thorough" or post.asr_mode in ("longform", "selective")
 
-    def _after_recording(self, session_id: str, keep_audio: bool) -> None:
+    def _notice_auth(self, fn: Runner) -> Runner:
+        """A job that fails because Claude is not logged in: forget the cached status, so the
+        page's indicator turns to "not logged in" at once."""
+
+        def run(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
+            try:
+                return fn(session_dir, params, progress)
+            except llm.LlmAuthError:
+                self._llm.invalidate()
+                self.bus.publish("llm", {})
+                raise
+
+        return run
+
+    def _after_recording(self, session_id: str, keep_audio: bool,
+                         auto_title: bool = False) -> None:
         s = settings.load()
         can_finalize = keep_audio or not self._finalize_needs_audio()
         steps = ["finalize"] if (s.auto_finalize or self.cfg.post.auto) and can_finalize else []
+        if auto_title:  # the dock's per-meeting switch (it starts from the Settings value)
+            steps.append("title")
         steps += [kind for kind, on in (("clean", s.auto_clean), ("summary", s.auto_summary),
                                         ("todo", s.auto_todo)) if on]
         steps = [k for k in steps if k in self.jobs.kinds]
@@ -192,7 +237,7 @@ class UiApp:
         """Run ``params["steps"]`` one after the other; a failing step does not stop the rest."""
 
         def run(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
-            done, failed = [], []
+            done, failed, skipped = [], [], []
             for step in params.get("steps", []):
                 def step_progress(stage: str, d: int = 0, t: int = 0, _step=step) -> None:
                     progress(f"{STEP_LABELS.get(_step, _step)}: {stage}", d, t)
@@ -202,12 +247,17 @@ class UiApp:
                     base[step](session_dir, {}, step_progress)
                     done.append(STEP_LABELS.get(step, step))
                 except Exception as exc:
+                    if step in QUIET_STEPS:  # e.g. the title: not logged in -> stays untitled
+                        log.warning("automatic %s skipped: %s", step, exc)
+                        skipped.append(f"{STEP_LABELS.get(step, step)} ({exc})")
+                        continue
                     log.exception("automatic %s failed", step)
                     failed.append(f"{STEP_LABELS.get(step, step)} ({exc})")
             if failed and not done:
                 raise RuntimeError("failed: " + "; ".join(failed))
-            return "done: " + ", ".join(done) + (
+            text = ("done: " + ", ".join(done) if done else "nothing to do") + (
                 f"; failed: {'; '.join(failed)}" if failed else "")
+            return text + (f"; skipped: {'; '.join(skipped)}" if skipped else "")
 
         return run
 
@@ -249,8 +299,9 @@ class UiApp:
         mic = body.get("mic", cfg.capture_mic)
         loopback = body.get("loopback", cfg.capture_loopback)
         keep = body.get("keep_audio", False)
-        if not all(isinstance(v, bool) for v in (mic, loopback, keep)):
-            raise ApiError(400, "mic, loopback and keep_audio must be true or false")
+        auto_title = body.get("auto_title", settings.load().auto_title)
+        if not all(isinstance(v, bool) for v in (mic, loopback, keep, auto_title)):
+            raise ApiError(400, "mic, loopback, keep_audio and auto_title must be true or false")
         pid = body.get("project")
         project = self._project(pid) if pid and pid != "inbox" else None
         title = body.get("title")
@@ -258,7 +309,7 @@ class UiApp:
         mtype = self._type(project, body.get("type"))
         try:
             self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback, project=project,
-                                title=title, mtype=mtype)
+                                title=title, mtype=mtype, auto_title=auto_title)
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
@@ -277,6 +328,57 @@ class UiApp:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
 
+    def record_auto_title(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Switch the automatic title for the meeting being recorded."""
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ApiError(400, "enabled must be true or false")
+        try:
+            self.recorder.set_auto_title(enabled)
+        except RecorderError as exc:
+            raise ApiError(409, str(exc)) from exc
+        return {"recorder": self.recorder.snapshot()}
+
+    # -- Claude Code (AI features) -------------------------------------------------
+
+    def llm_status(self, refresh: bool = False) -> dict[str, Any]:
+        """Is Claude Code installed and logged in? (``claude auth status``, cached 60 s)"""
+        status = self._llm.get(refresh=refresh)
+        with self._login_lock:
+            waiting = self._login_proc is not None and self._login_proc.poll() is None
+        return {"llm": {**status.as_dict(), "login_running": waiting}}
+
+    def llm_login(self) -> dict[str, Any]:
+        """Open ``claude auth login`` in a console window; the user finishes it in the browser."""
+        with self._login_lock:
+            if self._login_proc is not None and self._login_proc.poll() is None:
+                return {"started": False, "running": True}
+            try:
+                proc = self._llm_login(self.cfg.llm)
+            except llm.LlmError as exc:
+                raise ApiError(409, str(exc)) from exc
+            self._login_proc = proc
+        threading.Thread(target=self._after_login, args=(proc,), name="claude-login",
+                         daemon=True).start()
+        return {"started": True, "running": True}
+
+    def _after_login(self, proc: Any) -> None:
+        try:
+            proc.wait()
+        except Exception:
+            log.debug("could not wait for the login console", exc_info=True)
+            return
+        self._llm.invalidate()
+        self.bus.publish("llm", {})
+
+    def llm_install_page(self) -> dict[str, Any]:
+        """Open the Claude Code install page in the default browser (a fixed address)."""
+        try:
+            self._open_url(llm.INSTALL_URL)
+        except Exception as exc:
+            raise ApiError(500, f"could not open the browser: {exc}") from exc
+        return {"ok": True}
+
     # -- settings -----------------------------------------------------------------
 
     def settings_get(self) -> dict[str, Any]:
@@ -285,8 +387,8 @@ class UiApp:
     def settings_set(self, body: dict[str, Any]) -> dict[str, Any]:
         if "glossary" in body and not isinstance(body["glossary"], list | str):
             raise ApiError(400, "glossary must be a list of words")
-        for key in ("auto_finalize", "auto_clean", "auto_summary", "auto_todo", "transparent",
-                    "mini_strip"):
+        for key in ("auto_finalize", "auto_title", "auto_clean", "auto_summary", "auto_todo",
+                    "transparent", "mini_strip"):
             if key in body and not isinstance(body[key], bool):
                 raise ApiError(400, f"{key} must be true or false")
         if "theme" in body and body["theme"] not in settings.THEMES:

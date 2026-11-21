@@ -45,7 +45,7 @@ it from lists and counts; nothing else changes.
 
 ```
 <data_dir>/projects.json              # {"projects": [{"path": "...", "types": [{"name", "folder"}]}]}
-<data_dir>/settings.json              # app settings: auto_finalize, auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
+<data_dir>/settings.json              # app settings: auto_finalize, auto_title, auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
 <project folder>/Steno/
   .gitignore                          # "*": meeting text is never committed by accident
   CLAUDE.md                           # how Claude Code should read the meetings (summaries first)
@@ -428,3 +428,35 @@ With refinement (`revisions.jsonl`) the rule is:
   skipped silently.
 - The cursor moves to the newest line and the newest revision read. `--peek` changes nothing.
   Cursors are per consumer.
+
+### Stateless mode: `steno new --since`
+
+```
+steno new --since start
+steno new --since <session>:<last_seq>:<last_rev>
+```
+
+Same delivery rule as above, but the position is a **token** passed back and forth instead of a
+cursor file; nothing is written (no `cursors/` entry), so any number of readers can follow the
+same meeting. The token is `<session id>:<last_seq>:<last_rev>`, e.g. `20261121-195539:42:7`:
+the session id (`[A-Za-z0-9_-]`, up to 64 characters), the newest line delivered and the newest
+revision read, both non-negative integers (`start` = `session:0:0` of the target meeting). A token
+that does not match gives exit code 2 and an error on stderr.
+
+Output (stdout, Markdown): a header, a blank line, the new lines, an optional
+`Corrections: ...` block (as above), a blank line and the last line `next: <token>`, always last
+and always present; use that value for the next call. Without anything new the body is
+`(nothing new)` and the token is unchanged.
+
+```
+# Meeting: <title>
+project: <name or (none)> | type: <type, if any> | state: recording live | finished | <time range>
+session: <session id>
+note: ...            (optional: new meeting since the token; summary.md / todo.md exist)
+```
+
+The target meeting is `--session ID`, else the latest meeting of the project that contains the
+current folder (or `--project PATH`), else the latest meeting overall. If it differs from the
+session in the token, a `note:` line says so and it is delivered from its start. With no meeting
+at all the output is `(no meeting found ...)` and `next: start`. `--since` cannot be combined with
+`--consumer` or `--peek`.

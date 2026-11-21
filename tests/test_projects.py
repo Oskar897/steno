@@ -332,12 +332,16 @@ def test_folder_to_open_is_resolved_from_ids_and_names(tmp_path, monkeypatch):
     assert projects.folder_to_open("project", p.id) == p.path
     assert projects.folder_to_open("inbox") == paths.sessions_dir()
 
-    # a subfolder that is not there yet: the nearest existing parent inside the project
-    assert projects.folder_to_open("type", p.id, "Board") == p.path
-    (p.path / "Meetings").mkdir()
-    assert projects.folder_to_open("type", p.id, "Board") == p.path / "Meetings"
-    (p.path / "Meetings" / "Board").mkdir()
+    # a new subfolder is created on disk right away
+    assert (p.path / "Meetings" / "Board").is_dir()
     assert projects.folder_to_open("type", p.id, "Board") == p.path / "Meetings" / "Board"
+    # one that was removed from disk meanwhile: the nearest existing parent inside the project
+    (p.path / "Meetings" / "Board").rmdir()
+    assert projects.folder_to_open("type", p.id, "Board") == p.path / "Meetings"
+    (p.path / "Meetings" / "Dev team").rmdir()
+    (p.path / "Meetings").rmdir()
+    assert projects.folder_to_open("type", p.id, "Board") == p.path
+    (p.path / "Meetings" / "Board").mkdir(parents=True)
     assert projects.folder_to_open("type", p.id, "board") == p.path / "Meetings" / "Board"
     assert projects.folder_to_open("type", p.id, None) == p.path  # no subfolder: the project
 
@@ -359,3 +363,59 @@ def test_folder_to_open_is_resolved_from_ids_and_names(tmp_path, monkeypatch):
                                 (projects.MeetingType("Out", "../elsewhere"),))
     monkeypatch.setattr(projects, "get_project", lambda pid: escaping)
     assert projects.folder_to_open("type", p.id, "Out") is None
+
+
+# --------------------------------------------------------------------------- locked files
+
+
+def test_sync_retries_when_another_program_holds_the_file(tmp_path, monkeypatch, caplog):
+    import logging
+    import os
+
+    p = projects.add_project(tmp_path, name="Club", create=True)
+    w = make_session("2026-11-20T10:00:00", LINES)
+    m = projects.create_meeting(p, w.dir, "Lobby days")
+    monkeypatch.setattr(projects, "_LOCK_BACKOFF", 0.0)
+    real_replace = os.replace
+    fails = {"n": 2}
+
+    def locked_replace(src, dst):  # Windows: [WinError 32] while Explorer/OneDrive holds it
+        if fails["n"] > 0 and str(dst).endswith("transcript.md"):
+            fails["n"] -= 1
+            raise PermissionError(32, "The process cannot access the file", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", locked_replace)
+    with caplog.at_level(logging.DEBUG, logger="steno.projects"):
+        projects.sync(w.dir)
+    assert fails["n"] == 0  # two failures, then the third try wrote it
+    assert "Lobby days" in (m.folder / "transcript.md").read_text(encoding="utf-8")
+    assert not (m.folder / "transcript.md.tmp").exists()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_sync_skips_quietly_when_the_file_stays_locked(tmp_path, monkeypatch, caplog):
+    import logging
+    import os
+
+    p = projects.add_project(tmp_path, name="Club", create=True)
+    w = make_session("2026-11-20T10:00:00", LINES)
+    m = projects.create_meeting(p, w.dir, "Lobby days")
+    before = (m.folder / "transcript.md").read_text(encoding="utf-8")
+    monkeypatch.setattr(projects, "_LOCK_BACKOFF", 0.0)
+    calls = {"n": 0}
+
+    def always_locked(src, dst):
+        calls["n"] += 1
+        raise PermissionError(32, "The process cannot access the file", str(dst))
+
+    monkeypatch.setattr(os, "replace", always_locked)
+    with caplog.at_level(logging.DEBUG, logger="steno.projects"):
+        folder = projects.sync(w.dir, recording=True)  # must not raise
+    assert folder == m.folder
+    assert calls["n"] >= projects._LOCK_RETRIES  # it did try again before giving up
+    assert (m.folder / "transcript.md").read_text(encoding="utf-8") == before  # old text intact
+    assert not (m.folder / "transcript.md.tmp").exists()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING and r.exc_info]
+    assert any("locked" in r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
+

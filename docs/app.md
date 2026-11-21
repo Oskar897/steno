@@ -13,7 +13,7 @@ A map for working on the app (`steno app`). User-facing docs: [README](../README
 | Jobs | `src/steno/ui/jobs.py` | One background job at a time (finalize, clean, summary, todo, and `auto`: the after-meeting chain from Settings). |
 | Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`) and meeting folders (`<project>/Steno/<YYYY-MM-DD title>/`; with meeting types `<project>/<type folder>/<YYYY-MM-DD title>/`, e.g. `Meetings/Board/2026-11-20 Lobby days/`). See [formats](formats.md). |
 | Mini strip | `src/steno/ui/window.py` (`MiniBridge`, `watch_mini`, `prepare_mini`, `save/restore_mini_place`), `src/steno/ui/static/mini.*` | Second pywebview window (196x34, frameless, always on top, no focus steal) made hidden at start. `watch_mini` polls the recorder: shown while `starting`/`recording`, except when the main window is the foreground window, after x (`MiniBridge.dismiss`, until the recording ends) or with `settings.mini_strip` off; hidden from `stopping` on. Page `/mini?token=` (own SSE stream): grip, dot (opens Steno), timer, level bars, Pause/Resume, Stop (also brings the main window forward), x. Dragging anywhere but a button moves it through `MiniBridge.drag_start/drag_to/drag_end` (Win32 `SetWindowPos`; pywebview's own drag region calls `SetWindowPos` with `None` and fails); the place is kept in `<data dir>/mini-strip.json` and used again if still on a screen. Excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`), rounded corners. |
-| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_finalize` (on: finalize after every recording; the default `[post]` modes need no kept audio), `auto_clean`, `auto_summary`, `auto_todo` (off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
+| Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_finalize` (on: finalize after every recording; the default `[post]` modes need no kept audio), `auto_title` (on: name untitled meetings, see "Automatic title"), `auto_clean`, `auto_summary`, `auto_todo` (off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
 | Shortcuts | `src/steno/shortcuts.py` | `steno install-shortcuts`: Start menu and desktop `.lnk` running `pythonw -m steno.cli app`. The icon (`steno.ico`, 16-256 px: dark rounded tile, orange four-bar wave) is drawn in code with numpy, bars snapped to whole pixels at small sizes. The app rewrites it on each start and sets it as window/taskbar icon with its own AppUserModelID (`Steno.Desktop`), so it does not show as Python. |
 | Page | `src/steno/ui/static/` | `index.html`, `style.css`, `app.js`. Plain JS, no build step, no CDN, no web fonts, no inline scripts or styles (CSP). Only these three files are served (`STATIC_TYPES`). |
 
@@ -27,7 +27,10 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count and `types`) / add `{path, name?, create?}` / forget (files stay) |
 | POST | `/api/projects/<id>/types` `{types: [{name, folder?}]}` | replace the meeting types (folder defaults to `Meetings/<name>`) |
 | GET | `/api/projects/<id>/meetings` | oldest first; id `inbox` = sessions without a meeting folder |
-| POST | `/api/record/start` `{project?, type?, title?, mic, loopback, keep_audio}`, `/api/record/pause`, `/resume`, `/stop` | |
+| POST | `/api/record/start` `{project?, type?, title?, mic, loopback, keep_audio, auto_title?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it |
+| POST | `/api/record/auto_title` `{enabled}` | switch the automatic title of the meeting being recorded (409 when not recording) |
+| GET | `/api/llm/status` (`?refresh=1`) | `{llm: {state, method, plan, detail, login_running}}`, see "AI status" |
+| POST | `/api/llm/login`, `/api/llm/install` | open `claude auth login` in a visible console / open the Claude Code install page in the default browser (a fixed address) |
 | GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
 | POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type; `project: "inbox"` = back to the inbox, see below) |
@@ -42,7 +45,7 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/people/enroll/cancel` | finish early: processes what was recorded if >= 10 s, else cancels |
 
 SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{session, seq, text}`
-(refined text of a line: swap in place), `job`, `names`, `sessions`, `projects`, `settings`, `enroll` (the enrolment state above, about 4 times a second while recording).
+(refined text of a line: swap in place), `job`, `names`, `sessions`, `projects`, `settings`, `llm` (Claude status may have changed: ask `/api/llm/status` again), `enroll` (the enrolment state above, about 4 times a second while recording).
 
 ## Speakers and kept audio
 
@@ -55,6 +58,62 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   recording stays in the session dir in the data dir, e.g. to compare speech models later.
 - Pressing Record clears the recorder's session id until the new one exists, and the page only
   opens a session that is recording and differs from the previous one.
+
+## AI status (Claude Code)
+
+Every AI feature goes through the Claude Code CLI (`llm.run_claude`), so the app asks it whether it can work.
+
+- `llm.probe_status` runs `claude auth status` (no tokens, no console window, 20 s timeout). The CLI is
+  found with `llm.find_cli`: `PATH`, then `~/.local/bin`, `%APPDATA%\npm` and a few more, because the
+  app runs under `pythonw` with its own PATH. The CLI exits 1 when logged out but still prints its
+  JSON, so the output is read whatever the exit code. States: `ok` (`method`, `plan` from `authMethod`
+  / `subscriptionType`; the account name is never read), `logged_out`, `missing` (no CLI), `error`
+  (unknown; the buttons stay usable). `llm.StatusCache` keeps the answer 60 s; `?refresh=1` asks again.
+- A job that fails with `LlmAuthError` (`llm.classify_failure`: "Failed to authenticate", OAuth
+  expired, not logged in, invalid API key) invalidates the cache and sends the `llm` event, so the
+  indicator turns at once. Failures read the JSON `result` of the CLI (exit code or `is_error`), not
+  the raw output: auth -> "Not logged in to Claude: log in to use AI features.", credit balance /
+  usage limit -> `LlmLimitError` with a short message. `clean` stops at the first auth error instead
+  of trying every chunk.
+- Login: `POST /api/llm/login` starts `claude auth login` with `CREATE_NEW_CONSOLE` (a visible window,
+  not the hidden flags of normal calls); the user finishes the OAuth flow in the browser. One at a
+  time. When that console exits the cache is invalidated and `llm` is sent. The page also polls
+  `?refresh=1` every 3 s for up to 3 minutes. `POST /api/llm/install` opens the install page with
+  `webbrowser` (the address is a constant in `llm.INSTALL_URL`, never taken from the page).
+- UI: the sidebar footer has a small line above "On this computer" (`#side-llm`): dot + "Claude"
+  (tooltip: method and plan) when ok, "AI off: not logged in" / "AI off: Claude Code not installed" in
+  the danger colour otherwise; a click opens a menu (Log in to Claude / Install Claude Code, Check
+  again). Settings has a "Claude" section with the same status and button. Summary, To-do and Clean up
+  stay visible while AI is off, dimmed with a tooltip; a click shows the same menu instead of
+  starting a job. A job error for a missing login shows the friendly message as it is.
+
+## Automatic title
+
+A meeting the user did not name gets a title from its transcript after Stop (setting `auto_title`,
+on by default; the dock has a per-meeting "Auto title" switch that starts from it).
+
+- Dock: next to the title field, before and during recording (`#btn-autotitle`, `#btn-autotitle-live`).
+  `record/start` takes `auto_title`; the recorder keeps it (`Recorder.auto_title`, also in the snapshot)
+  and `POST /api/record/auto_title` changes it while recording. A typed title always wins (the
+  recorder turns it off; the switch is shown off with a tooltip). The switch is disabled with the
+  tooltip "AI off: ..." while Claude is not available, but its choice is kept: logging in during the
+  recording is enough. Placeholder of the title field: "Title is written after the meeting" when the
+  switch is on and Claude status is ok, else "Untitled meeting".
+- Chain: `_after_recording` adds the `title` step right after `finalize` (before clean-up, summary and
+  to-do) when the recording's `auto_title` is on, in the same `auto` job. `title` is also a normal job
+  kind (`run_title` in `default_runners`).
+- `run_title`: skips unless the meeting's title is still `projects.DEFAULT_TITLE` ("Meeting"; a title
+  the user typed or set with Rename differs), asks `llm.suggest_title` (haiku from `[llm]`,
+  prompt `prompts/title.md`: 2-6 words, main language of the text, no date/quotes/punctuation), checks
+  the title again (the user may have renamed meanwhile) and applies it with `projects.rename_meeting`,
+  so the meeting folder is renamed too (`YYYY-MM-DD <title>`) and the sidebar updates.
+- Text sent: the best transcript (clean > final > live), `llm.sample_for_title`: all of it up to
+  6000 characters, else the first 3/4 plus a piece from the middle after a `[...]` line; less than
+  40 characters is never sent. The reply is cleaned (`llm.clean_title_reply`: first line, markdown,
+  quotes, "Title:" label, trailing punctuation and path-illegal characters removed, at most 60
+  characters cut at a word; "Meeting" / "Untitled" or more than 10 words is rejected).
+- Failures are quiet (`QUIET_STEPS` in `api.py`): the meeting stays untitled, the log has a line,
+  the job message ends with "skipped: title (...)" and no error toast appears; the other steps go on.
 
 ## Design (second pass)
 
@@ -73,9 +132,16 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   top of `style.css`: four text levels (`--text`, `--body`, `--dim`, `--faint`, plus `--ghost` for
   times/counts), radii 6/8, a 4px spacing grid.
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
-- Subfolders = meeting types. Created from the sidebar: hover a project for the folder-plus button
-  (next to `+`), or "New subfolder" under a project that has some; each subfolder row has `+` and
+- Subfolders = meeting types. Created only from the folder-plus button on a project row (hover,
+  next to `+`; there is no "New subfolder" row in the tree); each subfolder row has `+` and
   a hover ⋯ (Rename, Remove when empty). Project ⋯ → Subfolders... edits them all at once.
+  `projects.set_types` creates the (empty) folder on disk right away, so Explorer can show it;
+  after "New subfolder" the confirmation toast has an "Open in File Explorer" button (desktop app
+  only). Removing a type never deletes its folder.
+- Meeting dates in the sidebar are relative (`relDate` in app.js): Today, Yesterday, weekday
+  (2-6 days), Last week, 2/3 weeks ago, Last month, month name, "March 2025" for older years. The
+  row's tooltip has the exact date and time. The labels are repainted when the day changes (timer
+  at midnight, window focus, `visibilitychange`: `watchDay`). Headers and dialogs keep the full date.
 - Sidebar tree (subfolders = meeting types): under a project its subfolders come first (folder icon,
   chevron, name, `+`, hover buttons; folded state in `steno-folded`), their meetings one level
   deeper (16 px per level); meetings without a subfolder sit on the subfolders' level, after them,
@@ -92,12 +158,17 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   header menu, the subfolder menu and the meeting menu (an inbox meeting opens its session
   folder in the data dir).
 - Drag to move: press and hold a meeting row ~350 ms (pointer events; a click still opens it, moving
-  more than 6 px before the hold ends cancels it). A label follows the pointer; the place under it
-  (nearest `[data-drop]` ancestor: project node = project root, subfolder node, Inbox / TBD) lights
-  up when the meeting is not already there; hovering a closed project with subfolders for 0.7 s
-  opens it; the sidebar scrolls near its top/bottom edge. Release moves the meeting and its folder
-  (`POST /api/meetings/<id>/move`, same as Move...), Escape or a release elsewhere cancels. A
-  recording meeting cannot be picked up.
+  more than 6 px before the hold ends cancels it). The row stays behind as a grey hole and a grey
+  translucent copy of it (a clone of the row) follows the pointer. The place under it (nearest
+  `[data-drop]` ancestor: project node = project root, subfolder node, Inbox / TBD) lights up when
+  the meeting is not already there, and its meetings slide apart (a `.drop-gap` spacer, 150 ms
+  height transition) to open a gap where the meeting's date puts it (`gapPlace`: newest first, rows
+  carry `data-ts`); leaving the place closes the gap. Hovering a closed project or subfolder for
+  0.7 s opens it (only for this drag: restored on cancel); the sidebar scrolls near its top/bottom
+  edge. Release: the copy settles into the gap, then the meeting and its folder move
+  (`POST /api/meetings/<id>/move`, same as Move...). Escape or a release elsewhere cancels: the copy
+  flies back to the hole. `prefers-reduced-motion`: no animation, same result. A recording meeting
+  cannot be picked up.
 - Moving to the inbox (`projects.move_to_inbox`): sessions always live in the data dir, so only the
   meeting folder goes. It is deleted when it holds nothing but Steno's own copies (marker,
   `.gitignore`, `transcript.md`, `summary.md`/`todo.md` identical to the session's); if it has
@@ -135,7 +206,13 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   `backdrop-filter` is off in the desktop window (`html.glass`), where it does nothing and WebView2
   could paint white patches.
 - Own title bar in the desktop window (`html.custom-frame`): window buttons top right, the header
-  and brand row are drag regions; in a normal browser none of this shows.
+  and brand row are drag regions; in a normal browser none of this shows. The header is fixed at
+  48 px (the window buttons 46x47, the 1px hairline stays visible below them) at every width, so
+  the header's controls (⋯, job chip) and the buttons share one centre line.
+- Files in a meeting folder can be locked by another program for a moment (Explorer preview,
+  OneDrive, an editor: `PermissionError`, WinError 32). `projects.sync` retries the atomic write a
+  few times (50/100/200 ms) and otherwise skips that round with a debug log; the next sync (every
+  2 s while recording, and at the end) writes it.
 
 ## Not done yet (owner's list)
 
@@ -146,6 +223,6 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
 ## Testing
 
 `tests/test_ui.py` (server, API, recorder with a fake engine), `tests/test_projects.py` (meeting folders, moves between subfolders/projects/inbox, `folder_to_open`),
-`tests/test_settings.py`, `tests/test_shortcuts.py`. For a manual run against an empty data
+`tests/test_settings.py`, `tests/test_shortcuts.py`, `tests/test_ai_status.py` (Claude status, login, readable CLI errors, automatic title). For a manual run against an empty data
 dir: set `STENO_DATA_DIR` to a temp folder (link its `models/` to the real models folder) and
 start `steno ui --no-browser` or `steno app`.
