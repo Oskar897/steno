@@ -18,6 +18,7 @@ SETTINGS_NAME = "settings.json"
 MAX_TERMS = 200
 MAX_TERM_LEN = 60
 THEMES = ("system", "dark", "light")
+PALETTES = ("mono", "teal", "wine", "vintage", "deepsea")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -37,6 +38,8 @@ class AppSettings:
     glossary: list[str] = field(default_factory=list)
     # Look of the desktop app: "system" follows Windows' app mode, or "dark" / "light".
     theme: str = "system"
+    # Accent colours (surfaces stay grey): one of PALETTES, each with a dark and a light variant.
+    palette: str = "mono"
     # Desktop app: the desktop shows through the window (Mica); off = solid panels.
     transparent: bool = True
     # Desktop app: a small always-on-top strip (timer, pause, stop) while recording.
@@ -73,6 +76,9 @@ def from_dict(data: dict[str, Any], base: AppSettings | None = None) -> AppSetti
             updates[f.name] = clean_terms(value)
         elif f.name == "theme":
             if value in THEMES:
+                updates[f.name] = value
+        elif f.name == "palette":
+            if value in PALETTES:
                 updates[f.name] = value
         elif isinstance(value, bool):
             updates[f.name] = value

@@ -393,6 +393,8 @@ class UiApp:
                 raise ApiError(400, f"{key} must be true or false")
         if "theme" in body and body["theme"] not in settings.THEMES:
             raise ApiError(400, "theme must be system, dark or light")
+        if "palette" in body and body["palette"] not in settings.PALETTES:
+            raise ApiError(400, "palette must be one of: " + ", ".join(settings.PALETTES))
         s = settings.update(body)
         self.bus.publish("settings", asdict(s))
         return {"settings": asdict(s)}

@@ -640,6 +640,23 @@ async function loadSettings() {
       onclick: async () => { LOOK.theme = v; paintSeg(); applyLook(); await saveLook({ theme: v }); paintSeg(); } }));
   }
   paintSeg();
+  const pal = h("div", { class: "pal-grid", role: "radiogroup", "aria-label": "Colours" });
+  const paintPal = () => {
+    const light = document.documentElement.classList.contains("light");
+    for (const [id, label, dark, lite] of PALETTES) {
+      const on = id === LOOK.palette;
+      const b = pal.querySelector(`[data-v="${id}"]`);
+      b.classList.toggle("on", on); b.setAttribute("aria-checked", String(on));
+      b.querySelectorAll("i").forEach((d, i) => { d.style.background = (light ? lite : dark)[i]; });
+    }
+  };
+  for (const [id, label] of PALETTES) {
+    pal.append(h("button", { type: "button", role: "radio", class: "pal-opt", "data-v": id,
+      onclick: async () => { LOOK.palette = id; applyLook(); paintPal(); await saveLook({ palette: id }); paintPal(); } },
+      h("span", { class: "pal-dots" }, h("i"), h("i")), label));
+  }
+  paintPal();
+  seg.addEventListener("click", () => setTimeout(paintPal, 0));
   const strip = h("input", { type: "checkbox", class: "switch", id: "set-mini" });
   strip.checked = s.mini_strip !== false;
   strip.addEventListener("change", async () => {
@@ -657,6 +674,8 @@ async function loadSettings() {
     h("div", { class: "group" },
       h("div", { class: "set-row static" },
         h("div", { class: "pn" }, h("div", { text: "Theme" }), h("div", { class: "sub", text: "System follows Windows' light or dark app mode." })), seg),
+      h("div", { class: "set-row static" },
+        h("div", { class: "pn" }, h("div", { text: "Colours" }), h("div", { class: "sub", text: "Accent colour on grey surfaces. Every palette has a dark and a light version." })), pal),
       h("label", { class: "set-row", for: "set-transparent" },
         h("div", { class: "pn" }, h("div", { text: "Transparent background" }), h("div", { class: "sub", text: "Your wallpaper shows softly through the window. Off: solid background." })), glass),
       h("label", { class: "set-row", for: "set-mini" },
@@ -2406,17 +2425,27 @@ async function connect() {
 
 // ---------------------------------------------------------------- look: theme and transparency
 
-const LOOK = { theme: "system", transparent: true };
+const PALETTES = [
+  // [id, label, dark swatches, light swatches]: the accent colours of each palette
+  ["mono", "Mono", ["#bdbdbd", "#4a4a4a"], ["#3a3a3a", "#1c1c1c"]],
+  ["teal", "Teal", ["#aec3b0", "#356a7e"], ["#124559", "#598392"]],
+  ["wine", "Wine", ["#c4474d", "#a01820"], ["#800e13", "#640d14"]],
+  ["vintage", "Vintage", ["#bcabae", "#716969"], ["#716969", "#2d2e2e"]],
+  ["deepsea", "Deep sea", ["#1b98e0", "#006494"], ["#006494", "#247ba0"]],
+];
+const LOOK = { theme: "system", palette: "mono", transparent: true };
 const systemLight = window.matchMedia("(prefers-color-scheme: light)");
 function applyLook(s) {
   if (s && typeof s === "object") {
     if (["system", "dark", "light"].includes(s.theme)) LOOK.theme = s.theme;
+    if (PALETTES.some((p) => p[0] === s.palette)) LOOK.palette = s.palette;
     if (typeof s.transparent === "boolean") LOOK.transparent = s.transparent;
   }
   const light = LOOK.theme === "light" || (LOOK.theme === "system" && systemLight.matches);
   const root = document.documentElement;
   root.classList.toggle("light", light);
   root.classList.toggle("solid", !LOOK.transparent);
+  root.dataset.palette = LOOK.palette;
   root.style.colorScheme = light ? "light" : "dark";
   remember("steno-look", JSON.stringify(LOOK));  // no flash of the wrong theme on the next start
   const api = window.pywebview && window.pywebview.api;
