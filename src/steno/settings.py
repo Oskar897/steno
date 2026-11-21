@@ -18,6 +18,7 @@ SETTINGS_NAME = "settings.json"
 MAX_TERMS = 200
 MAX_TERM_LEN = 60
 THEMES = ("system", "dark", "light")
+UI_SCALES = (90, 100, 110, 125, 140)  # interface size in percent
 INTENSITIES = ("subtle", "medium", "strong")
 PALETTES = ("mono", "teal", "wine", "vintage", "deepsea")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -43,6 +44,8 @@ class AppSettings:
     palette: str = "mono"
     # How far the surfaces lean toward the palette colour: subtle (grey), medium or strong.
     intensity: str = "subtle"
+    # Interface size in percent: text, icons and controls scale together.
+    ui_scale: int = 100
     # Desktop app: the desktop shows through the window (Mica); off = solid panels.
     transparent: bool = True
     # Desktop app: a small always-on-top strip (timer, pause, stop) while recording.
@@ -79,6 +82,9 @@ def from_dict(data: dict[str, Any], base: AppSettings | None = None) -> AppSetti
             updates[f.name] = clean_terms(value)
         elif f.name == "theme":
             if value in THEMES:
+                updates[f.name] = value
+        elif f.name == "ui_scale":
+            if type(value) is int and value in UI_SCALES:
                 updates[f.name] = value
         elif f.name == "intensity":
             if value in INTENSITIES:

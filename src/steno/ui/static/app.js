@@ -196,10 +196,11 @@ function showMenu(anchor, build) {
   fill();
   document.body.append(el);
   const r = anchor.getBoundingClientRect(), mw = el.offsetWidth, mh = el.offsetHeight;
-  const up = r.bottom + mh + 8 > window.innerHeight && r.top - mh - 8 > 0;
+  const z = zoom(), rb = r.bottom / z, rt = r.top / z, rr = r.right / z;  // menu styles are in zoomed px
+  const up = rb + mh + 8 > window.innerHeight / z && rt - mh - 8 > 0;
   el.classList.toggle("up", up);
-  el.style.left = Math.max(8, Math.min(window.innerWidth - mw - 8, r.right - mw)) + "px";
-  el.style.top = (up ? r.top - mh - 6 : r.bottom + 6) + "px";
+  el.style.left = Math.max(8, Math.min(window.innerWidth / z - mw - 8, rr - mw)) + "px";
+  el.style.top = (up ? rt - mh - 6 : rb + 6) + "px";
   anchor.setAttribute("aria-expanded", "true");
   openMenu = { el, anchor };
   const first = el.querySelector(".mi:not(:disabled)");
@@ -275,7 +276,7 @@ function initResizer() {
   });
   bar.addEventListener("pointermove", (ev) => {
     if (!dragging) return;
-    const w = ev.clientX - 8;
+    const w = ev.clientX / zoom() - 8;
     if (w < SIDE_HIDE) { sideW = startW; applySide(true, false); return; }
     sideW = w; applySide(false, false);
   });
@@ -669,6 +670,18 @@ async function loadSettings() {
   }
   paintStr();
   seg.addEventListener("click", () => setTimeout(paintPal, 0));
+  const sizeSeg = h("div", { class: "seg-ctl", role: "radiogroup", "aria-label": "Interface size" });
+  const paintSize = () => {
+    for (const b of sizeSeg.children) {
+      const on = Number(b.dataset.v) === LOOK.scale;
+      b.classList.toggle("on", on); b.setAttribute("aria-checked", String(on));
+    }
+  };
+  for (const v of [90, 100, 110, 125, 140]) {
+    sizeSeg.append(h("button", { type: "button", role: "radio", "data-v": String(v), text: v + "%",
+      onclick: async () => { LOOK.scale = v; paintSize(); applyLook(); await saveLook({ ui_scale: v }); paintSize(); } }));
+  }
+  paintSize();
   const strip = h("input", { type: "checkbox", class: "switch", id: "set-mini" });
   strip.checked = s.mini_strip !== false;
   strip.addEventListener("change", async () => {
@@ -686,6 +699,8 @@ async function loadSettings() {
     h("div", { class: "group" },
       h("div", { class: "set-row static" },
         h("div", { class: "pn" }, h("div", { text: "Theme" }), h("div", { class: "sub", text: "System follows Windows' light or dark app mode." })), seg),
+      h("div", { class: "set-row static" },
+        h("div", { class: "pn" }, h("div", { text: "Interface size" }), h("div", { class: "sub", text: "Text, icons and controls, in the sidebar and the transcript alike. 100% is the default." })), sizeSeg),
       h("div", { class: "set-row static" },
         h("div", { class: "pn" }, h("div", { text: "Colours" }), h("div", { class: "sub", text: "Accent colour on grey surfaces. Every palette has a dark and a light version." })), pal),
       h("div", { class: "set-row static" },
@@ -1854,7 +1869,7 @@ function beginDrag() {
   copy.removeAttribute("title");
   copy.tabIndex = -1;
   const ghost = h("div", { class: "drag-ghost", "aria-hidden": "true" }, copy);
-  ghost.style.width = `${Math.round(box.width)}px`;
+  ghost.style.width = `${Math.round(box.width / zoom())}px`;
   document.body.append(ghost);
   document.body.classList.add("dragging");
   // capture on the (permanent) sidebar: a release outside the window still ends the drag
@@ -1869,7 +1884,7 @@ function beginDrag() {
 
 function placeGhost() {
   const d = DRAG.active;
-  d.ghost.style.transform = `translate(${Math.round(d.x - d.ox)}px, ${Math.round(d.y - d.oy)}px)`;
+  d.ghost.style.transform = `translate(${Math.round((d.x - d.ox) / zoom())}px, ${Math.round((d.y - d.oy) / zoom())}px)`;
 }
 
 /* A place the meeting can be dropped on, from the pointer position: {pid, type, el} or null. */
@@ -1942,7 +1957,7 @@ function syncGap(animate) {
   el.style.height = "0px";
   place.box.insertBefore(el, place.before);
   d.gap = { el, box: place.box };
-  const open = () => { el.classList.add("open"); el.style.height = `${Math.round(d.rowH)}px`; };
+  const open = () => { el.classList.add("open"); el.style.height = `${Math.round(d.rowH / zoom())}px`; };
   if (animate && !reducedMotion()) { void el.offsetHeight; open(); } else { el.style.transition = "none"; open(); }
 }
 
@@ -1991,8 +2006,8 @@ function dragTick() {  // scrolls the sidebar while the pointer rests near its t
 function flyTo(d, rect, fade) {
   if (reducedMotion() || !rect) return false;
   d.ghost.classList.add("landing");
-  d.ghost.style.width = `${Math.round(rect.width)}px`;
-  d.ghost.style.transform = `translate(${Math.round(rect.left)}px, ${Math.round(rect.top)}px)`;
+  d.ghost.style.width = `${Math.round(rect.width / zoom())}px`;
+  d.ghost.style.transform = `translate(${Math.round(rect.left / zoom())}px, ${Math.round(rect.top / zoom())}px)`;
   if (fade) d.ghost.style.opacity = "0";
   return true;
 }
@@ -2447,13 +2462,15 @@ const PALETTES = [
   ["vintage", "Vintage", ["#bcabae", "#716969"], ["#716969", "#2d2e2e"]],
   ["deepsea", "Deep sea", ["#1b98e0", "#006494"], ["#006494", "#247ba0"]],
 ];
-const LOOK = { theme: "system", palette: "mono", intensity: "subtle", transparent: true };
+const zoom = () => LOOK.scale / 100;  // CSS zoom of the app: pointer and rect coordinates are in screen px
+const LOOK = { theme: "system", palette: "mono", intensity: "subtle", scale: 100, transparent: true };
 const systemLight = window.matchMedia("(prefers-color-scheme: light)");
 function applyLook(s) {
   if (s && typeof s === "object") {
     if (["system", "dark", "light"].includes(s.theme)) LOOK.theme = s.theme;
     if (PALETTES.some((p) => p[0] === s.palette)) LOOK.palette = s.palette;
     if (["subtle", "medium", "strong"].includes(s.intensity)) LOOK.intensity = s.intensity;
+    if ([90, 100, 110, 125, 140].includes(s.ui_scale)) LOOK.scale = s.ui_scale;
     if (typeof s.transparent === "boolean") LOOK.transparent = s.transparent;
   }
   const light = LOOK.theme === "light" || (LOOK.theme === "system" && systemLight.matches);
@@ -2462,6 +2479,7 @@ function applyLook(s) {
   root.classList.toggle("solid", !LOOK.transparent);
   root.dataset.palette = LOOK.palette;
   root.dataset.intensity = LOOK.intensity;
+  root.style.setProperty("--ui-zoom", String(zoom()));
   root.style.colorScheme = light ? "light" : "dark";
   remember("steno-look", JSON.stringify(LOOK));  // no flash of the wrong theme on the next start
   const api = window.pywebview && window.pywebview.api;

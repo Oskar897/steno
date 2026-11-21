@@ -393,6 +393,10 @@ class UiApp:
                 raise ApiError(400, f"{key} must be true or false")
         if "theme" in body and body["theme"] not in settings.THEMES:
             raise ApiError(400, "theme must be system, dark or light")
+        scale = body.get("ui_scale", 100)
+        if type(scale) is not int or scale not in settings.UI_SCALES:
+            allowed = ", ".join(map(str, settings.UI_SCALES))
+            raise ApiError(400, f"ui_scale must be one of: {allowed}")
         if "intensity" in body and body["intensity"] not in settings.INTENSITIES:
             raise ApiError(400, "intensity must be subtle, medium or strong")
         if "palette" in body and body["palette"] not in settings.PALETTES:
