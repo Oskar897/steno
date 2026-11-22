@@ -4,12 +4,12 @@ Layout::
 
     <project folder>/
       Steno/
-        .gitignore            # "*": meeting text never ends up in a git repo by accident
+        .gitignore            # "*", only inside a git repo: meeting text is never committed
         CLAUDE.md             # how Claude Code should read the meetings (cheap first)
         index.md              # one line per meeting, newest first
         2026-11-19 Sprint planning/
-          .gitignore          # "*", also in meeting folders outside Steno/
-          .steno-meeting.json # {"session": "<id>", "title": "..."}
+          .gitignore          # "*", also in meeting folders outside Steno/ (git repos only)
+          .steno-meeting.json # {"session": "<id>", "title": "..."}, hidden on Windows
           transcript.md       # best text so far; rewritten while recording
           summary.md, todo.md # only after you asked for them
       Meetings/Board/         # optional meeting types: each has its own folder
@@ -251,13 +251,52 @@ def remove_project(pid: str) -> None:
         _save_entries(entries)
 
 
+_STENO_GITIGNORE = "# Meeting transcripts are private: keep them out of git.\n*\n"
+_MEETING_GITIGNORE = "# Meeting text is private: keep it out of git.\n*\n"
+
+
+def _in_git(folder: Path) -> bool:
+    """True when ``folder`` lies inside a git work tree (a ``.git`` in it or a parent).
+
+    The ``.gitignore`` files that keep meeting text out of git are only written there; in a
+    plain or cloud-synced folder (Google Drive, OneDrive) they would just be clutter."""
+    folder = Path(os.path.abspath(folder))
+    return any((d / ".git").exists() for d in (folder, *folder.parents))
+
+
+def _remove_if_ours(path: Path, text: str) -> None:
+    """Delete a file Steno wrote, only while it still holds exactly what Steno wrote."""
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == text:
+            path.unlink()
+    except OSError:
+        log.debug("Could not remove %s", path, exc_info=True)
+
+
+def _set_hidden(path: Path, hidden: bool) -> None:
+    """Windows: show or hide a file in Explorer (the meeting marker is not for reading)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        attrs = kernel32.GetFileAttributesW(str(path))
+        if attrs in (-1, 0xFFFFFFFF):
+            return
+        new = attrs | 0x2 if hidden else attrs & ~0x2  # FILE_ATTRIBUTE_HIDDEN
+        if new != attrs:
+            kernel32.SetFileAttributesW(str(path), new)
+    except Exception:
+        log.debug("Could not change the hidden flag of %s", path, exc_info=True)
+
+
 def ensure_steno_dir(project: Project) -> Path:
     d = project.steno_dir
     d.mkdir(exist_ok=True)
     gi = d / ".gitignore"
-    if not gi.exists():
-        gi.write_text("# Meeting transcripts are private: keep them out of git.\n*\n",
-                      encoding="utf-8")
+    if not gi.exists() and _in_git(d):
+        gi.write_text(_STENO_GITIGNORE, encoding="utf-8")
     claude = d / "CLAUDE.md"
     if not claude.exists() or _CLAUDE_MARK in claude.read_text(encoding="utf-8"):
         atomic_write_text(claude, CLAUDE_MD)
@@ -379,28 +418,111 @@ def _free_folder(parent: Path, name: str, keep: Path | None = None) -> Path:
     return candidate
 
 
-def _link(session_dir: Path, folder: Path, title: str) -> None:
+def _own_folder(folder: Path) -> bool:
+    """True when the meeting was recorded into a folder the user made (its name is kept)."""
+    return bool(_read_json(folder / MEETING_FILE).get("own_folder"))
+
+
+def _link(session_dir: Path, folder: Path, title: str, own_folder: bool | None = None) -> None:
+    if own_folder is None:
+        own_folder = _own_folder(folder)
     gi = folder / ".gitignore"
-    if not gi.exists():
-        gi.write_text("# Meeting text is private: keep it out of git.\n*\n", encoding="utf-8")
-    atomic_write_text(folder / MEETING_FILE, json.dumps(
-        {"session": session_dir.name, "title": title}, ensure_ascii=False) + "\n")
+    if not gi.exists() and _in_git(folder):
+        gi.write_text(_MEETING_GITIGNORE, encoding="utf-8")
+    marker = folder / MEETING_FILE
+    if marker.exists():
+        _set_hidden(marker, False)  # replacing a hidden file can be refused on Windows
+    meta = {"session": session_dir.name, "title": title}
+    if own_folder:
+        meta["own_folder"] = True
+    atomic_write_text(marker, json.dumps(meta, ensure_ascii=False) + "\n")
+    _set_hidden(marker, True)
     atomic_write_text(session_dir / LINK_NAME, json.dumps(
         {"folder": str(folder), "title": title}, ensure_ascii=False) + "\n")
 
 
+#: Files Steno writes into a meeting folder; a folder that already has its own cannot be used.
+STENO_FILES = ("transcript.md", *COPIED)
+_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \d{2}\.\d{2})?\s+")
+
+
+def _claimed(folder: Path) -> bool:
+    """True when the folder's marker names a session that still points at this folder."""
+    d = _session_dir_of(str(_read_json(folder / MEETING_FILE).get("session") or ""))
+    linked = meeting_folder(d) if d is not None else None
+    return linked is not None and _key(linked) == _key(folder)
+
+
+def _session_dir_of(sid: str) -> Path | None:
+    """The session dir of an id read from a marker file (never "latest" or a path)."""
+    if not sid or sid == "latest" or not _SESSION_REF.fullmatch(sid):
+        return None
+    return transcript.resolve_session(sid)
+
+
+def _blocking_files(folder: Path) -> list[str]:
+    return [n for n in STENO_FILES if (folder / n).exists()]
+
+
+def check_existing_folder(project: Project, folder: str | Path
+                          ) -> tuple[MeetingType | None, str, Path]:
+    """Can a new meeting of ``project`` be recorded into this existing folder (the user's own
+    meeting folder with agenda and notes)? Returns ``(type, title, folder)``.
+
+    The folder must lie directly in ``Steno/`` or in one of the project's subfolders (that is
+    where the app finds meetings), must not be a meeting already and must not have its own
+    ``transcript.md``/``summary.md``/``todo.md`` (Steno would overwrite them). The title is the
+    folder name without its leading date."""
+    f = Path(folder)
+    if not f.is_dir():
+        raise ProjectError(f"folder not found: {f}")
+    f = f.resolve()
+    parent = _key(f.parent)
+    places: list[tuple[str, MeetingType | None]] = [(_key(project.steno_dir), None)]
+    places += [(_key(project.type_dir(t)), t) for t in project.types]
+    if any(key == _key(f) for key, _t in places):
+        raise ProjectError(f"{f.name} is a subfolder itself; pick a meeting folder inside it")
+    kind = next((t for key, t in places if key == parent), "none")
+    if kind == "none":
+        where = ", ".join(f"{t.name} ({t.folder})" for t in project.types) or "none yet"
+        raise ProjectError(
+            f"Pick a meeting folder that lies directly in one of {project.name}'s subfolders "
+            f"(subfolders: {where}). Add the subfolder first if it is missing.")
+    if _claimed(f):
+        raise ProjectError(f"{f.name} already holds a Steno meeting")
+    blocking = _blocking_files(f)
+    if blocking:
+        raise ProjectError(f"{f.name} already has its own {', '.join(blocking)}; rename "
+                           "or move it first (Steno writes files with those names)")
+    title = clean_title(_DATE_PREFIX.sub("", f.name))
+    return (kind if isinstance(kind, MeetingType) else None), title, f
+
+
 def create_meeting(project: Project, session_dir: Path, title: str | None = None,
-                   mtype: str | None = None) -> Meeting:
-    title = clean_title(title)
-    kind = project.find_type(mtype)
+                   mtype: str | None = None, folder: str | Path | None = None) -> Meeting:
+    """Give a session its meeting folder. ``folder``: record into that existing folder (see
+    ``check_existing_folder``; its type follows from where it lies). Otherwise a folder
+    ``YYYY-MM-DD title`` in the type's folder is used: an existing one of that name that is
+    not a meeting yet (made by hand for the agenda) is taken as it is, else a new one."""
     with _lock:
-        parent = _parent_dir(project, kind)
-        folder = _free_folder(parent, f"{_prefix(session_dir.name)} {title}")
-        folder.mkdir()
-        _link(session_dir, folder, title)
+        if folder is not None:
+            _kind, own_title, target = check_existing_folder(project, folder)
+            title = clean_title(title) if title else own_title
+            ensure_steno_dir(project)
+            own = True
+        else:
+            title = clean_title(title)
+            parent = _parent_dir(project, project.find_type(mtype))
+            name = f"{_prefix(session_dir.name)} {title}"
+            target = parent / name
+            own = target.is_dir() and not _claimed(target) and not _blocking_files(target)
+            if not own:
+                target = _free_folder(parent, name)
+                target.mkdir()
+        _link(session_dir, target, title, own_folder=own)
     sync(session_dir, recording=True)
     write_index(project, recording=session_dir.name)
-    return Meeting(session_dir.name, title, folder)
+    return Meeting(session_dir.name, title, target)
 
 
 def list_meetings(project: Project) -> list[Meeting]:
@@ -430,8 +552,11 @@ def rename_meeting(session_dir: Path, title: str) -> Meeting:
                           json.dumps({"title": title}, ensure_ascii=False) + "\n")
         return Meeting(Path(session_dir).name, title, Path(session_dir))
     with _lock:
-        target = _free_folder(folder.parent, f"{_prefix(Path(session_dir).name)} {title}",
-                              keep=folder)
+        if _own_folder(folder):  # the user's folder: only the title in Steno changes
+            target = folder
+        else:
+            target = _free_folder(folder.parent, f"{_prefix(Path(session_dir).name)} {title}",
+                                  keep=folder)
         if target != folder:
             folder.rename(target)
         _link(Path(session_dir), target, title)
@@ -452,7 +577,9 @@ def move_meeting(session_dir: Path, project: Project, mtype: str | None = None) 
         parent = _parent_dir(project, kind)
         if folder is not None and _key(folder.parent) == _key(parent):
             return Meeting(session_dir.name, title, folder)  # already there
-        target = _free_folder(parent, f"{_prefix(session_dir.name)} {title}")
+        own = folder is not None and _own_folder(folder)
+        name = folder.name if own else f"{_prefix(session_dir.name)} {title}"
+        target = _free_folder(parent, name)
         if folder is None:
             target.mkdir()
         else:
@@ -480,10 +607,12 @@ def move_to_inbox(session_dir: Path) -> Meeting:
         return Meeting(session_dir.name, title, session_dir)  # already in the inbox
     place = _place(folder)
     with _lock:
-        if place is not None and _only_copies(session_dir, folder):
-            shutil.rmtree(folder)
+        if place is not None:
+            _remove_steno_files(session_dir, folder)  # the folder goes only when empty then
         else:
-            log.warning("Meeting folder %s holds other files: kept without its marker", folder)
+            log.warning("Meeting folder %s is outside its project: kept without its marker",
+                        folder)
+            _set_hidden(folder / MEETING_FILE, False)
             (folder / MEETING_FILE).unlink(missing_ok=True)
         # last: until now the session still pointed at the folder (a failure above keeps it a
         # meeting); a link to a folder that is gone already reads as inbox
@@ -492,23 +621,6 @@ def move_to_inbox(session_dir: Path) -> Meeting:
     if place is not None:
         write_index(place[0])
     return Meeting(session_dir.name, title, session_dir)
-
-
-def _only_copies(session_dir: Path, folder: Path) -> bool:
-    """True when everything in the meeting folder is written by Steno from the session: the
-    marker, .gitignore, transcript.md and summary/to-do identical to the session's own."""
-    for f in folder.iterdir():
-        if f.name in (MEETING_FILE, ".gitignore", "transcript.md") and f.is_file():
-            continue
-        mine = session_dir / f.name
-        if f.name in COPIED and f.is_file() and mine.is_file():
-            try:
-                if f.read_text(encoding="utf-8") == mine.read_text(encoding="utf-8"):
-                    continue
-            except (OSError, ValueError):
-                pass
-        return False
-    return True
 
 
 _SESSION_REF = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -565,19 +677,120 @@ def set_archived(session_dir: Path, archived: bool) -> None:
         marker.unlink(missing_ok=True)
 
 
+def _remove_steno_files(session_dir: Path | None, folder: Path) -> None:
+    """Take Steno's files out of a meeting folder; the folder goes only if it is empty then.
+
+    Removed: the marker, Steno's own ``.gitignore``, ``transcript.md`` and ``summary.md`` /
+    ``todo.md`` while they are identical to the session's copy. Everything else (the user's
+    agenda and notes, a hand-edited summary) stays, and so does the folder that holds it."""
+    (folder / "transcript.md").unlink(missing_ok=True)
+    for name in COPIED:
+        mine = session_dir / name if session_dir is not None else None
+        if mine is not None and mine.is_file():
+            _remove_if_ours(folder / name, mine.read_text(encoding="utf-8"))
+    _remove_if_ours(folder / ".gitignore", _MEETING_GITIGNORE)
+    marker = folder / MEETING_FILE
+    if marker.exists():
+        _set_hidden(marker, False)
+        marker.unlink()
+    try:
+        folder.rmdir()  # only succeeds when nothing is left
+    except OSError:
+        log.info("Meeting folder %s keeps the user's own files", folder)
+
+
 def delete_meeting(session_dir: Path) -> None:
-    """Delete a meeting for good: its session dir (transcript, embeddings, audio) and its
-    meeting folder in the project. Only a folder whose marker names this session is removed."""
+    """Delete a meeting for good: its session dir (transcript, embeddings, audio) and Steno's
+    files in its meeting folder. The folder itself only goes when nothing else is in it, so
+    the user's own files (agenda, notes) are never deleted. Only a folder whose marker names
+    this session is touched."""
     session_dir = Path(session_dir)
     folder = meeting_folder(session_dir)
     place = _place(folder) if folder is not None else None
     project = place[0] if place else None
     with _lock:
         if folder is not None and place is not None:  # only where Steno puts meetings
-            shutil.rmtree(folder)
+            _remove_steno_files(session_dir, folder)
         shutil.rmtree(session_dir)
     if project is not None:
         write_index(project)
+
+
+def type_meetings(project: Project, mtype: MeetingType | None) -> list[Meeting]:
+    """The meetings in one subfolder (``None``: the meetings without a type, in ``Steno/``)."""
+    parent = project.steno_dir if mtype is None else project.type_dir(mtype)
+    out = []
+    for f in _meeting_dirs(parent):
+        sid = str(_read_json(f / MEETING_FILE).get("session") or "")
+        out.append(Meeting(sid, meeting_title_of(f), f))
+    return sorted(out, key=lambda m: m.session)
+
+
+def meeting_title_of(folder: Path) -> str:
+    return str(_read_json(folder / MEETING_FILE).get("title") or DEFAULT_TITLE)
+
+
+def _delete_folder_meeting(m: Meeting) -> None:
+    """Delete a meeting found by its folder (its session may already be gone)."""
+    d = _session_dir_of(m.session)
+    linked = meeting_folder(d) if d is not None else None
+    if linked is not None and _key(linked) == _key(m.folder):
+        delete_meeting(d)
+    else:  # an orphaned marker: only Steno's files go
+        with _lock:
+            _remove_steno_files(None, m.folder)
+
+
+def _prune_empty(folder: Path, root: Path) -> None:
+    """Remove ``folder`` and then its parents while they are empty, never ``root`` itself."""
+    root = Path(os.path.abspath(root))
+    folder = Path(os.path.abspath(folder))
+    while folder != root and root in folder.parents:
+        try:
+            folder.rmdir()
+        except OSError:
+            return
+        folder = folder.parent
+
+
+def delete_type(pid: str, name: str) -> int:
+    """Delete a subfolder: its meetings (as ``delete_meeting``), the subfolder in Steno, and
+    its folder on disk only while it is empty (the user's own files keep it). Returns how many
+    meetings were deleted."""
+    project = get_project(pid)
+    kind = project.find_type(name)
+    if kind is None:
+        raise ProjectError("no such subfolder")
+    meetings = type_meetings(project, kind)
+    for m in meetings:
+        _delete_folder_meeting(m)
+    set_types(pid, [{"name": t.name, "folder": t.folder} for t in project.types if t != kind])
+    _prune_empty(project.type_dir(kind), project.path)
+    return len(meetings)
+
+
+def delete_project(pid: str, *, meetings: bool) -> int:
+    """Remove a project from Steno. ``meetings``: also delete all its meetings (as
+    ``delete_meeting``), then Steno's own files in ``Steno/`` and the subfolder folders that
+    are left empty. The project folder and every file Steno did not write stay. Returns how
+    many meetings were deleted."""
+    project = get_project(pid)
+    count = 0
+    if meetings:
+        found = [*type_meetings(project, None), *(m for t in project.types
+                                                  for m in type_meetings(project, t))]
+        for m in found:
+            _delete_folder_meeting(m)
+        count = len(found)
+        d = project.steno_dir
+        (d / "index.md").unlink(missing_ok=True)
+        _remove_if_ours(d / "CLAUDE.md", CLAUDE_MD)
+        _remove_if_ours(d / ".gitignore", _STENO_GITIGNORE)
+        _prune_empty(d, project.path)
+        for t in project.types:
+            _prune_empty(project.type_dir(t), project.path)
+    remove_project(pid)
+    return count
 
 
 # --------------------------------------------------------------------------- files

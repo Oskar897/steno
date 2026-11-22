@@ -356,6 +356,7 @@ const S = {
   expanded: loadExpanded(), showAll: new Set(), showArchived: new Set(),
   folded: loadFolded(),   // "pid::type" groups closed in the sidebar
   newType: new Map(),     // project id -> meeting type for the next recording ("" = none)
+  recFolder: null,        // {pid, folder, name, type, title}: record the next meeting into it
   feed: new Map(),        // session id -> {info, detail, docs, open, el, ...}
   loadingFeed: false, buffer: [], unknown: new Set(),
   stick: true, unseen: 0,
@@ -429,12 +430,15 @@ async function guarded(fn) {
 function pickerAvailable() {
   return !!(window.pywebview && window.pywebview.api && window.pywebview.api.pick_folder);
 }
-async function pickFolder() {  // path | null (cancelled) | undefined (no native picker)
+// path | null (cancelled) | undefined (no native picker). start/ref/type: where it opens
+// ("project" + id, or "type" + id + subfolder name), resolved by the app from ids, not paths.
+async function pickFolder(start = null, ref = null, type = null) {
   if (!pickerAvailable()) return undefined;
-  try { return (await window.pywebview.api.pick_folder()) || null; } catch (e) { return null; }
+  try { return (await window.pywebview.api.pick_folder(start, ref, type)) || null; } catch (e) { return null; }
 }
 
-/* fields: [{key, label, value, placeholder, browse, options:[{value,label}]}] -> values | null */
+/* fields: [{key, label, value, placeholder, browse, options:[{value,label}], checkbox}] -> values | null
+   (a checkbox field gives true/false) */
 function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
   return new Promise((resolve) => {
     const dlg = $("modal");
@@ -442,6 +446,12 @@ function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
     const finish = (v) => { resolve(v); if (dlg.open) dlg.close(); };
     const rows = fields.map((f) => {
       let input;
+      if (f.checkbox) {
+        input = h("input", { type: "checkbox" });
+        input.checked = !!f.value;
+        inputs[f.key] = input;
+        return h("label", { class: "mcheck" }, input, h("span", { text: f.label }));
+      }
       if (f.options) {
         input = h("select", null, f.options.map((o) => h("option", { value: o.value, text: o.label })));
         input.value = f.value ?? f.options[0].value;
@@ -457,7 +467,7 @@ function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
     });
     const form = h("form", { class: "mform", onsubmit: (ev) => {
       ev.preventDefault();
-      finish(Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.value.trim()])));
+      finish(Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.type === "checkbox" ? i.checked : i.value.trim()])));
     } },
     h("h3", { text: title }), text ? h("p", { text }) : null, rows,
     h("div", { class: "btns" },
@@ -996,12 +1006,15 @@ function renderAutoTitle() {
   const r = S.status.recorder || {}, st = r.state || "idle";
   const active = st === "starting" || st === "recording" || st === "stopping";
   const input = $("rec-title");
-  const typed = !active && !!input.value.trim();
+  const folder = !active && S.sel ? recFolderOf(S.sel) : null;
+  const typed = !active && (!!input.value.trim() || !!folder);  // a folder brings its own title
   const off = aiOff();
   const on = (active ? !!r.auto_title : S.autoTitle) && !off && !typed;
-  input.placeholder = on && aiOk() ? "Title, or let Claude name it" : "Meeting title (optional)";
+  input.placeholder = folder ? `${folder.title} (from the folder)`
+    : on && aiOk() ? "Title, or let Claude name it" : "Meeting title (optional)";
   let tip;
   if (off) tip = `${AI_OFF_TEXT[S.llm.state]}. Log in under Settings to use Auto title.`;
+  else if (typed && folder) tip = "Auto title is not needed: the meeting is named after its folder.";
   else if (typed) tip = "Auto title is not needed: you typed a title. Clear the field to use it.";
   else if (st === "stopping") tip = "The meeting is being saved.";
   else if (on) tip = "Auto title is ON: Claude names the meeting when it ends. Click to turn it off for this meeting.";
@@ -1048,16 +1061,41 @@ async function afterProjectAdded(project) {
   if (project && project.id) selectProject(project.id);
 }
 
-async function forgetProject() {
+async function removeProject() {
   const p = curProject();
   if (!p) return;
-  const ok = await formModal({ title: "Forget project", text: `Remove "${p.name}" from Steno? Its folder and meetings stay on disk.`, ok: "Forget", danger: true });
+  const listed = await guarded(() => api("GET", `/api/projects/${encodeURIComponent(p.id)}/meetings`));
+  if (!listed) return;
+  const n = (listed.meetings || []).length + (listed.archived || 0);
+  const v = await formModal({
+    title: "Remove project",
+    text: `Remove "${p.name}" from Steno? The project folder and your own files in it are never deleted.`,
+    fields: n ? [{ key: "meetings", checkbox: true, value: false,
+      label: `Also delete its ${n} meeting${n === 1 ? "" : "s"} for good: recordings, transcripts, summaries and to-dos (Steno's files only)` }] : [],
+    ok: "Remove", danger: true });
+  if (!v) return;
+  const res = await guarded(() => api("POST", `/api/projects/${encodeURIComponent(p.id)}/delete`, { meetings: !!v.meetings }));
+  if (!res) return;
+  S.sel = null; S.feed.clear();
+  await guarded(loadProjects);
+  renderTop(); renderSide(); renderFeed();
+  toast(res.deleted ? `${p.name} removed, ${res.deleted} meeting${res.deleted === 1 ? "" : "s"} deleted` : `${p.name} removed from Steno`);
+}
+
+async function deleteInbox() {
+  const n = S.inbox;
+  if (!n) { toast("Inbox / TBD is empty."); return; }
+  const ok = await formModal({
+    title: "Delete Inbox / TBD meetings",
+    text: `Delete all ${n} meeting${n === 1 ? "" : "s"} in ${INBOX_NAME} for good? Recordings, transcripts, summaries and to-dos are deleted. This cannot be undone.`,
+    ok: `Delete ${n}`, danger: true });
   if (!ok) return;
-  if (await guarded(() => api("DELETE", `/api/projects/${encodeURIComponent(p.id)}`))) {
-    S.sel = null; S.feed.clear();
-    await guarded(loadProjects);
-    renderTop(); renderFeed();
-  }
+  const res = await guarded(() => api("POST", "/api/inbox/delete", {}));
+  if (!res) return;
+  if (S.sel === "inbox") S.feed.clear();
+  await guarded(loadProjects);
+  renderTop(); renderSide(); renderFeed();
+  toast(`${res.deleted} meeting${res.deleted === 1 ? "" : "s"} deleted`);
 }
 
 // ---------------------------------------------------------------- top bar: recording controls and status strip
@@ -1069,7 +1107,8 @@ function renderTop() {
   const ctype = proj ? curType() : "";
   $("proj-name").textContent = S.sel === "inbox" ? INBOX_NAME : proj ? proj.name + (ctype ? "  ›  " + ctype : "") : "";
   renderTypeSelect(proj, active);
-  $("btn-projmenu").hidden = !proj;
+  renderFolderButton(proj, active);
+  $("btn-projmenu").hidden = !proj && S.sel !== "inbox";
   const noProject = !S.sel;
   const dock = $("dock");
   dock.dataset.state = st === "recording" ? (r.paused ? "paused" : "recording") : st;
@@ -1108,6 +1147,48 @@ function renderTop() {
   updateButtons();
 }
 
+// "Existing folder": record the next meeting into a folder that is already there (agenda and
+// notes made before the meeting). Steno's files go next to the user's own.
+const recFolderOf = (pid) => (S.recFolder && S.recFolder.pid === pid ? S.recFolder : null);
+function renderFolderButton(proj, active) {
+  const btn = $("rec-folder");
+  btn.hidden = !proj || !pickerAvailable();
+  btn.disabled = active;
+  if (btn.hidden) return;
+  const f = recFolderOf(proj.id);
+  const key = f ? f.folder : "-";
+  if (btn.dataset.key !== key) {
+    btn.dataset.key = key;
+    btn.classList.toggle("on", !!f);
+    btn.replaceChildren(icon("folderOpen"), h("span", { class: "dt-name", text: f ? f.name : "Existing folder" }));
+  }
+  btn.title = f
+    ? `Recording into ${f.name}${f.type ? ` (${f.type})` : ""}: Steno's transcript goes next to your files. Click to change.`
+    : "Record into a meeting folder you already made (agenda, notes). Steno's files go next to yours.";
+  btn.setAttribute("aria-label", f ? `Recording into ${f.name}` : "Record into an existing folder");
+}
+async function chooseRecFolder() {
+  const proj = curProject();
+  if (!proj) return;
+  const type = recType(proj.id);
+  const path = await pickFolder(type ? "type" : "project", proj.id, type || null);
+  if (!path) return;
+  const res = await api("POST", `/api/projects/${encodeURIComponent(proj.id)}/folder`, { folder: path });
+  S.recFolder = { pid: proj.id, ...res };
+  setRecType(proj.id, res.type || "");
+  renderSide(); renderTop();
+  if (S.meeting === "new") renderFeed();
+}
+function recFolderClick() {
+  const proj = curProject();
+  if (!proj) return;
+  if (!recFolderOf(proj.id)) { guarded(chooseRecFolder); return; }
+  showMenu($("rec-folder"), () => [
+    { header: `Recording into ${S.recFolder.name}` },
+    { label: "Choose another folder...", icon: "folderOpen", onclick: () => guarded(chooseRecFolder) },
+    { label: "Use a new folder instead", sub: "YYYY-MM-DD title, made by Steno", icon: "folderPlus", onclick: () => { S.recFolder = null; renderTop(); } }]);
+}
+
 // Subfolder of the next meeting: a button in the dock that opens a menu (a native <select> drops a
 // white list on Windows that ignores the theme).
 function renderTypeSelect(proj, active) {
@@ -1128,7 +1209,11 @@ function typeMenuItems() {
   const proj = curProject();
   if (!proj) return [];
   const cur = recType(proj.id);
-  const pick = (name) => () => { setRecType(proj.id, name); renderSide(); renderTop(); if (S.meeting === "new") renderFeed(); };
+  const pick = (name) => () => {
+    setRecType(proj.id, name);
+    if (S.recFolder && S.recFolder.type !== name) S.recFolder = null;  // the folder decides the subfolder
+    renderSide(); renderTop(); if (S.meeting === "new") renderFeed();
+  };
   return [{ header: "Save the next meeting in" },
     ...(proj.types || []).map((t) => ({ label: t.name, sub: t.folder || null, icon: t.name === cur ? "check" : "folder", onclick: pick(t.name) })),
     "-",
@@ -1184,7 +1269,7 @@ function typesModal(p) {
 }
 
 /* Subfolders (meeting types) straight from the sidebar: create, rename, remove. */
-const typeList = (pid) => projTypes(pid).map((t) => ({ name: t.name, folder: t.folder }));
+const typeList = (pid) => projTypes(pid).map((t) => ({ name: t.name, folder: t.folder }));  // what saveTypes takes
 async function saveTypes(pid, types) {
   await api("POST", `/api/projects/${encodeURIComponent(pid)}/types`, { types });
   if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
@@ -1212,18 +1297,27 @@ async function renameSubfolder(pid, name) {
   if (!v || !v.name || v.name === name) return;
   await saveTypes(pid, typeList(pid).map((t) => (t.name === name ? { ...t, name: v.name } : t)));
 }
-async function removeSubfolder(pid, name, count) {
-  if (count) { toast(`${name} has meetings: move or delete them first.`, "error"); return; }
-  const ok = await formModal({ title: "Remove subfolder", text: `Remove ${name} from Steno? Nothing on disk is deleted.`, ok: "Remove", danger: true });
+async function removeSubfolder(pid, name, shown) {
+  // the server's count includes archived meetings, which the sidebar does not list
+  const count = Math.max(shown || 0, (projTypes(pid).find((t) => t.name === name) || {}).meetings || 0);
+  const ok = await formModal(count
+    ? { title: "Delete subfolder", text: `Delete ${name} and its ${count} meeting${count === 1 ? "" : "s"} (and any archived ones) for good? Recordings, transcripts, summaries and to-dos are deleted. Your own files in the meeting folders stay. This cannot be undone.`, ok: `Delete ${count} meeting${count === 1 ? "" : "s"}`, danger: true }
+    : { title: "Remove subfolder", text: `Remove ${name} from Steno? Its folder on disk goes only if it is empty; your own files stay.`, ok: "Remove", danger: true });
   if (!ok) return;
-  await saveTypes(pid, typeList(pid).filter((t) => t.name !== name));
+  const res = await api("POST", `/api/projects/${encodeURIComponent(pid)}/types/delete`, { name });
+  if (S.newType.get(pid) === name) setRecType(pid, "");
+  if (S.recFolder && S.recFolder.pid === pid && S.recFolder.type === name) S.recFolder = null;
+  S.feed.clear();
+  await loadProjects();
+  renderTop(); renderSide(); renderFeed();
+  if (res && res.deleted) toast(`${name} deleted with ${res.deleted} meeting${res.deleted === 1 ? "" : "s"}`);
 }
 function subfolderMore(pid, name, count) {
   const more = h("button", { class: "padd tmore", type: "button", title: `${name}: rename or remove`, "aria-label": `${name} actions`, "aria-haspopup": "menu" }, icon("more"));
   more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => [
     ...(pickerAvailable() ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("type", pid, name)) }] : []),
     { label: "Rename...", icon: "pencil", onclick: () => guarded(() => renameSubfolder(pid, name)) },
-    { label: "Remove", sub: count ? "Move its meetings out first" : "Files on disk stay", icon: "trash", danger: true, disabled: !!count, onclick: () => guarded(() => removeSubfolder(pid, name, count)) }]); });
+    { label: count ? "Delete..." : "Remove...", sub: count ? `With its ${count} meeting${count === 1 ? "" : "s"}; your own files stay` : "Your own files stay", icon: "trash", danger: true, onclick: () => guarded(() => removeSubfolder(pid, name, count)) }]); });
   return more;
 }
 
@@ -1324,6 +1418,8 @@ async function startRecording() {
   if (type) body.type = type;
   const title = $("rec-title").value.trim();
   if (title) body.title = title;
+  const folder = S.sel !== "inbox" ? recFolderOf(S.sel) : null;
+  if (folder) { body.folder = folder.folder; delete body.type; }
   S.stick = true;
   S.meeting = "new"; S.pendingRec = true;
   S.pendingFrom = (S.status.recorder || {}).session || null;  // never "find" the previous recording
@@ -1332,6 +1428,7 @@ async function startRecording() {
   if (res) {
     if (res.recorder) S.status.recorder = res.recorder;
     $("rec-title").value = "";
+    S.recFolder = null;  // per meeting, like the title
     S.autoTitle = S.autoTitleDefault;  // the switch is per meeting
     renderTop(); renderSide();
     scheduleFeed();
@@ -2515,12 +2612,14 @@ function init() {
     { label: "Add existing folder", icon: "folder", onclick: () => guarded(addProject) }]));
   $("empty-new").addEventListener("click", () => guarded(newProject));
   $("empty-add").addEventListener("click", () => guarded(addProject));
-  $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => [
-    ...(pickerAvailable() && S.sel && S.sel !== "inbox"
-      ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("project", S.sel)) }] : []),
-    { label: "Subfolders...", sub: "Board, 1-1, ... each in its own folder", icon: "folderPlus", onclick: () => guarded(editTypes) },
-    "-",
-    { label: "Forget project", sub: "Files stay on disk", icon: "forget", danger: true, onclick: () => guarded(forgetProject) }]));
+  $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => (S.sel === "inbox"
+    ? [{ label: "Delete all meetings...", sub: `The ${S.inbox} in ${INBOX_NAME}`, icon: "trash", danger: true, disabled: !S.inbox, onclick: () => guarded(deleteInbox) }]
+    : [
+      ...(pickerAvailable() && S.sel
+        ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("project", S.sel)) }] : []),
+      { label: "Subfolders...", sub: "Board, 1-1, ... each in its own folder", icon: "folderPlus", onclick: () => guarded(editTypes) },
+      "-",
+      { label: "Remove project...", sub: "Optionally with its meetings; your files stay", icon: "trash", danger: true, onclick: () => guarded(removeProject) }])));
   initDrag();
   watchDay();
   $("nav-people").addEventListener("click", showPeople);
@@ -2543,6 +2642,7 @@ function init() {
   $("rec-title").addEventListener("input", renderAutoTitle);
   window.addEventListener("focus", () => fetchLlm(false));  // cheap: the server keeps the answer for a minute
   $("rec-type").addEventListener("click", () => { if (S.sel && S.sel !== "inbox") showMenu($("rec-type"), typeMenuItems); });
+  $("rec-folder").addEventListener("click", recFolderClick);
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });
   $("jump").addEventListener("click", () => { S.stick = true; scrollToEnd(); });

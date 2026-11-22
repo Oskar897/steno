@@ -307,9 +307,20 @@ class UiApp:
         title = body.get("title")
         title = clean_name(title, "title") if isinstance(title, str) and title.strip() else None
         mtype = self._type(project, body.get("type"))
+        folder = body.get("folder")
+        if folder is not None:  # record into an existing meeting folder of the project
+            if project is None or not isinstance(folder, str) or not folder.strip():
+                raise ApiError(400, "folder needs a project")
+            try:
+                kind, own_title, path = projects.check_existing_folder(project, folder)
+            except projects.ProjectError as exc:
+                raise ApiError(400, str(exc)) from exc
+            mtype, folder = (kind.name if kind else None), str(path)
+            title = title or own_title  # named after the folder: never auto-titled
         try:
             self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback, project=project,
-                                title=title, mtype=mtype, auto_title=auto_title)
+                                title=title, mtype=mtype, auto_title=auto_title,
+                                folder=folder)
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
@@ -454,6 +465,80 @@ class UiApp:
         projects.remove_project(pid)
         self.bus.publish("projects", {})
         return {"ok": True}
+
+    def inbox_delete(self) -> dict[str, Any]:
+        """Delete every meeting in the inbox that the app shows (not the archived ones)."""
+        sessions = [s for s in projects.inbox_sessions() if not projects.is_archived(s.dir)]
+        self._check_not_busy({s.dir.name for s in sessions})
+        count = 0
+        for s in sessions:
+            try:
+                projects.delete_meeting(s.dir)
+                count += 1
+            except OSError:
+                log.exception("Could not delete %s", s.dir.name)
+        self.bus.publish("projects", {})
+        self.bus.publish("sessions", {})
+        return {"ok": True, "deleted": count}
+
+    def project_check_folder(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Can the next recording go into this existing meeting folder? (dock button)"""
+        project = self._project(pid)
+        folder = body.get("folder")
+        if not isinstance(folder, str) or not folder.strip():
+            raise ApiError(400, "folder must be a path")
+        try:
+            kind, title, path = projects.check_existing_folder(project, folder)
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        return {"folder": str(path), "name": path.name, "type": kind.name if kind else "",
+                "title": title}
+
+    def _check_not_busy(self, sessions: set[str]) -> None:
+        if self.recorder.active_session() in sessions:
+            raise ApiError(409, "stop the recording first: it is one of these meetings")
+        job = self.jobs.running()
+        if job is not None and job.session in sessions:
+            raise ApiError(409, "wait for the running job on one of these meetings to finish")
+
+    def project_delete(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Remove a project; ``meetings``: also delete all its meetings (own files stay)."""
+        project = self._project(pid)
+        meetings = body.get("meetings", False)
+        if not isinstance(meetings, bool):
+            raise ApiError(400, "meetings must be true or false")
+        if meetings:
+            found = [*projects.type_meetings(project, None),
+                     *(m for t in project.types for m in projects.type_meetings(project, t))]
+            self._check_not_busy({m.session for m in found})
+        try:
+            count = projects.delete_project(pid, meetings=meetings)
+        except (projects.ProjectError, OSError) as exc:
+            raise ApiError(409, f"cannot delete the project: {exc}") from exc
+        self.bus.publish("projects", {})
+        self.bus.publish("sessions", {})
+        return {"ok": True, "deleted": count}
+
+    def type_delete(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Delete a subfolder and its meetings (own files and their folders stay)."""
+        project = self._project(pid)
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError(400, "name must be the subfolder's name")
+        try:
+            kind = project.find_type(name)
+        except projects.ProjectError as exc:
+            raise ApiError(404, str(exc)) from exc
+        if kind is None:
+            raise ApiError(404, "no such subfolder")
+        self._check_not_busy({m.session for m in projects.type_meetings(project, kind)})
+        try:
+            count = projects.delete_type(pid, kind.name)
+        except (projects.ProjectError, OSError) as exc:
+            raise ApiError(409, f"cannot delete the subfolder: {exc}") from exc
+        self.bus.publish("projects", {})
+        self.bus.publish("sessions", {})
+        return {"ok": True, "deleted": count}
 
     def project_meetings(self, pid: str) -> dict[str, Any]:
         live = self.recorder.active_session()
@@ -819,8 +904,10 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def _types(p: projects.Project) -> list[dict[str, str]]:
-    return [{"name": t.name, "folder": t.folder} for t in p.types]
+def _types(p: projects.Project) -> list[dict[str, Any]]:
+    """Subfolders with how many meetings their folder holds (archived ones included)."""
+    return [{"name": t.name, "folder": t.folder, "meetings": len(projects.type_meetings(p, t))}
+            for t in p.types]
 
 
 def _archived(session_id: str) -> bool:

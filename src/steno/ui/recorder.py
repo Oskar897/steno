@@ -190,7 +190,8 @@ class Recorder:
 
     def start(self, *, keep_audio: bool, mic: bool, loopback: bool,
               project: projects.Project | None = None, title: str | None = None,
-              mtype: str | None = None, auto_title: bool = False) -> None:
+              mtype: str | None = None, auto_title: bool = False,
+              folder: str | None = None) -> None:
         if not (mic or loopback):
             raise RecorderError("nothing to record: enable the microphone or system audio")
         with self._lock:
@@ -210,6 +211,7 @@ class Recorder:
             self.mtype = mtype
             self.auto_title = auto_title and not title  # a typed title is never replaced
             self._title = title
+            self._folder = folder  # an existing meeting folder to record into
             self.last_segment_at = None
             self._t0 = None
             self._levels = {n: _Level() for n in self.sources}
@@ -241,7 +243,16 @@ class Recorder:
             return
         if self.project is not None:
             try:
-                projects.create_meeting(self.project, session_dir, self._title, self.mtype)
+                try:
+                    projects.create_meeting(self.project, session_dir, self._title, self.mtype,
+                                            folder=self._folder)
+                except projects.ProjectError:
+                    if self._folder is None:
+                        raise
+                    # the chosen folder changed since it was checked: a folder of its own
+                    log.warning("Cannot record into %s; making a new meeting folder",
+                                self._folder, exc_info=True)
+                    projects.create_meeting(self.project, session_dir, self._title, self.mtype)
             except Exception:  # recording goes on; the session stays in the inbox
                 log.exception("Could not create the meeting folder")
         with self._lock:

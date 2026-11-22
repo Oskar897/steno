@@ -77,15 +77,27 @@ class Bridge:
 
         return bool(self._hwnd) and frame.is_maximized(self._hwnd)
 
-    def pick_folder(self) -> str | None:
+    def pick_folder(self, start: str | None = None, ref: str | None = None,
+                    mtype: str | None = None) -> str | None:
+        """Native folder picker. ``start``/``ref``/``mtype`` (as ``open_folder``) choose where
+        it opens, resolved from ids and names, never from a path sent by the page."""
         import webview
+
+        from steno import projects
 
         if self._window is None:
             return None
         kind = getattr(getattr(webview, "FileDialog", None), "FOLDER", None)
         if kind is None:
             kind = webview.FOLDER_DIALOG
-        result = self._window.create_file_dialog(kind)
+        directory = ""
+        if isinstance(start, str):
+            try:
+                found = projects.folder_to_open(start, ref, mtype)
+                directory = str(found) if found is not None and found.is_dir() else ""
+            except Exception:
+                log.debug("No start folder for the picker", exc_info=True)
+        result = self._window.create_file_dialog(kind, directory=directory)
         if not result:
             return None
         return str(result[0] if isinstance(result, list | tuple) else result)

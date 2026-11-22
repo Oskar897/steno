@@ -26,8 +26,12 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | GET | `/api/status` | recorder (`state`, `paused`, `project`, levels, elapsed, speaker, backlog), running job, config summary |
 | GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count and `types`) / add `{path, name?, create?}` / forget (files stay) |
 | POST | `/api/projects/<id>/types` `{types: [{name, folder?}]}` | replace the meeting types (folder defaults to `Meetings/<name>`) |
+| POST | `/api/projects/<id>/types/delete` `{name}` | delete a subfolder with its meetings (`delete_meeting` each; own files stay, the folder goes only when empty) |
+| POST | `/api/projects/<id>/delete` `{meetings}` | remove the project from Steno; `meetings: true` also deletes all its meetings, then Steno's files in `Steno/` and empty subfolder folders (the project folder and own files stay) |
+| POST | `/api/projects/<id>/folder` `{folder}` | can the next recording go into this existing folder? `{folder, name, type, title}` or 400 with the reason (`projects.check_existing_folder`) |
+| POST | `/api/inbox/delete` | delete every inbox meeting the app shows (not the archived ones) |
 | GET | `/api/projects/<id>/meetings` | oldest first; id `inbox` = sessions without a meeting folder |
-| POST | `/api/record/start` `{project?, type?, title?, mic, loopback, keep_audio, auto_title?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it |
+| POST | `/api/record/start` `{project?, type?, title?, folder?, mic, loopback, keep_audio, auto_title?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it. `folder`: record into that existing meeting folder (its subfolder decides the type; the title defaults to the folder name without its date, so it is never auto-titled) |
 | POST | `/api/record/auto_title` `{enabled}` | switch the automatic title of the meeting being recorded (409 when not recording) |
 | GET | `/api/llm/status` (`?refresh=1`) | `{llm: {state, method, plan, detail, login_running}}`, see "AI status" |
 | POST | `/api/llm/login`, `/api/llm/install` | open `claude auth login` in a visible console / open the Claude Code install page in the default browser (a fixed address) |
@@ -35,7 +39,7 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
 | POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type; `project: "inbox"` = back to the inbox, see below) |
 | POST | `/api/meetings/<id>/archive` `{archived}` | hide/show it in the app (`archived.json` in the session dir; files stay) |
-| DELETE | `/api/meetings/<id>` | deletes the session dir and its meeting folder for good (not while recording it or while a job runs on it) |
+| DELETE | `/api/meetings/<id>` | deletes the session dir and Steno's files in its meeting folder for good; the folder goes only when nothing else is left in it (not while recording it or while a job runs on it) |
 | POST | `/api/sessions/<id>/jobs` `{kind}` | `finalize`, `clean`, `summary`, `todo` |
 | POST | `/api/sessions/<id>/name` `{speaker, name, save_profile?, view?}` | name a speaker (optionally into a voice profile); `view: "final"` names a final speaker (`ops.name_final_speaker`: the name goes to the live cluster overlapping its turns, the voice is learned from the window embeddings inside its turns) and queues finalize again. `GET /api/sessions/<id>` says which labels the lines carry in `speaker_space` (`final` / `live`) |
 | GET/POST | `/api/settings` | read / update (partial) |
@@ -134,10 +138,20 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
 - Subfolders = meeting types. Created only from the folder-plus button on a project row (hover,
   next to `+`; there is no "New subfolder" row in the tree); each subfolder row has `+` and
-  a hover ⋯ (Rename, Remove when empty). Project ⋯ → Subfolders... edits them all at once.
+  a hover ⋯ (Rename, Remove... / Delete... with its meetings, after a confirm dialog). Project ⋯ →
+  Subfolders... edits them all at once; Project ⋯ → Remove project... asks, with a checkbox to
+  also delete all its meetings. The Inbox's ⋯ has "Delete all meetings...".
   `projects.set_types` creates the (empty) folder on disk right away, so Explorer can show it;
   after "New subfolder" the confirmation toast has an "Open in File Explorer" button (desktop app
-  only). Removing a type never deletes its folder.
+  only). Deleting never removes a file Steno did not write: meeting folders and subfolder folders
+  go only when they are empty afterwards, the project folder never.
+- Existing folder (dock button next to the subfolder, desktop app only): pick a meeting folder made
+  by hand before the meeting (agenda, notes). The picker opens in the chosen subfolder. The folder
+  must lie directly in `Steno/` or a subfolder's folder, must not be a meeting already and must
+  not have its own `transcript.md`/`summary.md`/`todo.md`. Steno's files go next to the user's;
+  the button then shows the folder name (click: choose another or use a new folder), the title
+  field shows the folder's title, and the choice is per meeting. Without the button, a folder that
+  already has the name `YYYY-MM-DD title` (and is no meeting yet) is used instead of a `(2)` copy.
 - Meeting dates in the sidebar are relative (`relDate` in app.js): Today, Yesterday, weekday
   (2-6 days), Last week, 2/3 weeks ago, Last month, month name, "March 2025" for older years. The
   row's tooltip has the exact date and time. The labels are repainted when the day changes (timer
@@ -169,11 +183,12 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
   (`POST /api/meetings/<id>/move`, same as Move...). Escape or a release elsewhere cancels: the copy
   flies back to the hole. `prefers-reduced-motion`: no animation, same result. A recording meeting
   cannot be picked up.
-- Moving to the inbox (`projects.move_to_inbox`): sessions always live in the data dir, so only the
-  meeting folder goes. It is deleted when it holds nothing but Steno's own copies (marker,
-  `.gitignore`, `transcript.md`, `summary.md`/`todo.md` identical to the session's); if it has
-  other files (own notes, a hand-edited summary) the folder stays where it is, just without its
-  marker. The session link is rewritten last to `{"title"}` only, so the id stays resolvable.
+- Moving to the inbox (`projects.move_to_inbox`): sessions always live in the data dir, so only
+  Steno's files leave the meeting folder (marker, Steno's `.gitignore`, `transcript.md`,
+  `summary.md`/`todo.md` identical to the session's); the folder goes when nothing else is left,
+  otherwise (own notes, a hand-edited summary) it stays where it is. A meeting recorded into the
+  user's own folder (`"own_folder": true` in the marker) keeps that folder's name on rename and
+  move. The session link is rewritten last to `{"title"}` only, so the id stays resolvable.
   Moving back creates a fresh folder (`2026-11-20 Title (2)` on a name clash).
 - Layout: sidebar tree: each project (and the Inbox) folds open to its meetings, newest
   first (6, then "Show all"); `+` on a project opens a "New meeting" screen in it. The main
@@ -219,6 +234,9 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
 - Design pass from the owner's feedback.
 - Swedish UI language; Mac/Linux; installer and first-run setup; global hotkey.
 - Noticing a project folder moved outside the app.
+- Moving a meeting recorded into an existing folder moves the whole folder, the user's files too.
+- `summary.md`/`todo.md` the user writes into a meeting folder after the recording are replaced by
+  the next summary/to-do run.
 
 ## Testing
 

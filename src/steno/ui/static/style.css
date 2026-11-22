@@ -467,6 +467,8 @@ html.light .badge-live { color: #a33a3a; }
 .dock-type .ic { width: 14px; height: 14px; color: var(--faint); }
 .dock-type .dt-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dock-type .ic:last-child { width: 12px; height: 12px; }
+.dock-folder.on { color: var(--text); background: var(--fill); }
+.dock-folder.on .ic { color: var(--dim); }
 .btn.stop { background: var(--text); color: var(--main-solid); border-color: transparent; font-weight: 600; }
 .btn.stop:hover:not(:disabled) { background: var(--body); border-color: transparent; }
 .btn.stop [data-icon] svg { fill: currentColor; stroke: none; }
@@ -536,6 +538,8 @@ dialog::backdrop { background: rgba(5, 12, 20, 0.6); animation: fade-in 0.2s eas
 .mform h3 { margin: 0; font-family: var(--display); font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
 .mform p { margin: -8px 0 0; color: var(--dim); font-size: 13px; line-height: 1.55; }
 .mform label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 550; color: var(--dim); }
+.mform label.mcheck { flex-direction: row; align-items: flex-start; gap: 10px; font-size: 13px; font-weight: 400; line-height: 1.5; color: var(--body); cursor: pointer; }
+.mform label.mcheck input { width: 15px; height: 15px; margin: 2px 0 0; flex: none; accent-color: var(--rec); }
 .mform .inrow { display: flex; gap: 8px; }
 .mform .inrow .text, .mform .text { flex: 1; width: 100%; color: var(--text); }
 .mform .btns { display: flex; justify-content: flex-end; gap: 8px; margin: 6px -20px -20px; padding: 12px 20px; border-top: 1px solid var(--line); }

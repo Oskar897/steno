@@ -247,6 +247,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.project_add(body)
             if n == 3 and segs[0] == "projects" and segs[2] == "types":
                 return app.project_types(segs[1], body)
+            if n == 4 and segs[0] == "projects" and segs[2:] == ["types", "delete"]:
+                return app.type_delete(segs[1], body)
+            if n == 3 and segs[0] == "projects" and segs[2] == "folder":
+                return app.project_check_folder(segs[1], body)
+            if n == 3 and segs[0] == "projects" and segs[2] == "delete":
+                return app.project_delete(segs[1], body)
+            if segs == ["inbox", "delete"]:
+                return app.inbox_delete()
             if segs == ["settings"]:
                 return app.settings_set(body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "rename":

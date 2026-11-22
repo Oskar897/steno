@@ -19,6 +19,7 @@ __all__ = ["make_ui"]  # fixture re-export
 
 
 def test_create_project_sets_up_a_private_steno_folder(tmp_path):
+    (tmp_path / ".git").mkdir()  # inside a git repo: meeting text is kept out of it
     p = projects.add_project(tmp_path, name="Course: AI/ML", create=True)
     assert p.path == (tmp_path / "Course AI ML").resolve() and p.name == "Course AI ML"
     steno = p.path / "Steno"
@@ -170,7 +171,8 @@ def test_meeting_types_put_meetings_in_their_own_folders(tmp_path):
     w1 = make_session("2026-11-20T10:00:00", LINES)
     m1 = projects.create_meeting(p, w1.dir, "Lobby days", "board")
     assert m1.folder == p.path / "Meetings" / "Board" / "2026-11-20 Lobby days"
-    assert (m1.folder / ".gitignore").is_file()
+    assert not (m1.folder / ".gitignore").exists()  # not in a git repo: no clutter
+    assert (m1.folder / projects.MEETING_FILE).is_file()
     assert projects.type_of(w1.dir) == "Board" and projects.project_of(w1.dir).id == p.id
     w2 = make_session("2026-11-21T10:00:00", LINES)
     projects.create_meeting(p, w2.dir, "Plain")  # no type: Steno/ as before
@@ -204,7 +206,7 @@ def test_meeting_types_api(make_ui, tmp_path):
     assert c.post(f"/api/projects/{pid}/types", {"types": [{"name": "B", "folder": ".."}]})[0] \
         == 400
     res = c.post(f"/api/projects/{pid}/types", {"types": [{"name": "Board"}]})[1]
-    assert res["types"] == [{"name": "Board", "folder": "Meetings/Board"}]
+    assert res["types"] == [{"name": "Board", "folder": "Meetings/Board", "meetings": 0}]
     assert c.get("/api/projects")[1]["projects"][0]["types"] == res["types"]
     assert c.post("/api/record/start", {"mic": True, "loopback": False, "project": pid,
                                         "type": "Nope"})[0] == 400
