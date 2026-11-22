@@ -873,6 +873,9 @@ html.custom-frame .wbtn { height: 47px; }
 /* Default: the Mono greys, with green for status (--ok) and red for recording / offline. */
 html[data-palette="default"] { --ok: #5fcf86; }
 html.light[data-palette="default"] { --ok: #1f8a4c; }
+html[data-palette="default"] .keep-btn.on .ic, html[data-palette="default"] .src-btn .ic:not(.off) { color: var(--ok); }
+html[data-palette="default"] .keep-btn.on .tog { background: #2f9d5f; }
+html.light[data-palette="default"] .keep-btn.on .tog { background: #1f8a4c; }
 html[data-palette="default"] .side-foot.off .state { background: var(--rec); }
 html.light[data-palette="default"] .side-foot.off .state { background: #a33a3a; }
 html[data-palette="teal"] {
