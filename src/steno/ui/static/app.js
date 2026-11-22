@@ -2906,6 +2906,7 @@ async function connect() {
 
 const PALETTES = [
   // [id, label, dark swatches, light swatches]: the accent colours of each palette
+  ["default", "Default", ["#bdbdbd", "#5fcf86"], ["#3a3a3a", "#1f8a4c"]],
   ["mono", "Mono", ["#bdbdbd", "#4a4a4a"], ["#3a3a3a", "#1c1c1c"]],
   ["teal", "Teal", ["#aec3b0", "#356a7e"], ["#124559", "#598392"]],
   ["wine", "Wine", ["#c4474d", "#a01820"], ["#800e13", "#640d14"]],

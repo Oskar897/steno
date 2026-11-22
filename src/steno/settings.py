@@ -20,7 +20,7 @@ MAX_TERM_LEN = 60
 THEMES = ("system", "dark", "light")
 UI_SCALES = (90, 100, 110, 125, 140)  # interface size in percent
 INTENSITIES = ("subtle", "medium", "strong")
-PALETTES = ("mono", "teal", "wine", "vintage", "deepsea")
+PALETTES = ("default", "mono", "teal", "wine", "vintage", "deepsea")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
