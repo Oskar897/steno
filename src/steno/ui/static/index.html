@@ -22,10 +22,11 @@
 
     <div class="side-head">
       <span class="side-label">Projects</span>
-      <button class="icon-btn small" id="btn-addmenu" type="button" aria-label="Add project" title="Add project" data-icon="plus"></button>
+      <button class="icon-btn small" id="btn-addmenu" type="button" aria-label="New project" title="New project" data-icon="plus"></button>
     </div>
     <nav class="plist" id="plist"></nav>
     <nav class="plist" id="inbox-slot"></nav>
+    <nav class="plist" id="arch-slot"></nav>
 
     <div class="grow"></div>
     <nav class="plist">
@@ -57,10 +58,9 @@
         <div class="card">
           <svg class="logo big" viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="7" width="2.4" height="6" rx="1.2"/><rect x="6.4" y="4" width="2.4" height="12" rx="1.2"/><rect x="10.8" y="2" width="2.4" height="16" rx="1.2"/><rect x="15.2" y="6" width="2.4" height="8" rx="1.2"/></svg>
           <h2>Create a project</h2>
-          <p>A project is a folder on disk. Meetings are saved in <code>&lt;folder&gt;/Steno/</code>, next to the rest of your work.</p>
+          <p>A project groups your meetings. Add subfolders to it: each one is a folder on your computer where its meetings are saved.</p>
           <div class="card-actions">
-            <button class="btn primary" id="empty-new" type="button">New project</button>
-            <button class="btn" id="empty-add" type="button">Add existing folder</button>
+            <button class="btn primary big" id="empty-new" type="button">New project</button>
           </div>
         </div>
       </div>

@@ -11,7 +11,7 @@ A map for working on the app (`steno app`). User-facing docs: [README](../README
 | API | `src/steno/ui/api.py` | `UiApp`: plain methods returning JSON dicts or raising `ApiError`. |
 | Recorder | `src/steno/ui/recorder.py` | Drives one `Engine` (same wiring as `steno record`, including refine models). Start into a project, pause/resume (samples replaced by silence, so the clock and kept audio stay aligned), mirrors `transcript.md` into the meeting folder every 2 s while recording. |
 | Jobs | `src/steno/ui/jobs.py` | One background job at a time (finalize, clean, summary, todo, and `auto`: the after-meeting chain from Settings). |
-| Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`) and meeting folders (`<project>/Steno/<YYYY-MM-DD title>/`; with meeting types `<project>/<type folder>/<YYYY-MM-DD title>/`, e.g. `Meetings/Board/2026-11-20 Lobby days/`). See [formats](formats.md). |
+| Projects | `src/steno/projects.py` | Registry (`<data dir>/projects.json`): projects are labels (optional linked folder, archived flag); subfolders are any folder on disk, meetings get `<subfolder folder>/<YYYY-MM-DD title>/`; meetings without a subfolder stay in Steno only. See [formats](formats.md). |
 | Mini strip | `src/steno/ui/window.py` (`MiniBridge`, `watch_mini`, `prepare_mini`, `save/restore_mini_place`), `src/steno/ui/static/mini.*` | Second pywebview window (196x34, frameless, always on top, no focus steal) made hidden at start. `watch_mini` polls the recorder: shown while `starting`/`recording`, except when the main window is the foreground window, after x (`MiniBridge.dismiss`, until the recording ends) or with `settings.mini_strip` off; hidden from `stopping` on. Page `/mini?token=` (own SSE stream): grip, dot (opens Steno), timer, level bars, Pause/Resume, Stop (also brings the main window forward), x. Dragging anywhere but a button moves it through `MiniBridge.drag_start/drag_to/drag_end` (Win32 `SetWindowPos`; pywebview's own drag region calls `SetWindowPos` with `None` and fails); the place is kept in `<data dir>/mini-strip.json` and used again if still on a screen. Excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`), rounded corners. |
 | Settings | `src/steno/settings.py` | `<data dir>/settings.json`: `auto_finalize` (on: finalize after every recording; the default `[post]` modes need no kept audio), `auto_title` (on: name untitled meetings, see "Automatic title"), `auto_clean`, `auto_summary`, `auto_todo` (off by default), `glossary`, `theme`, `transparent`, `mini_strip` (on). |
 | Shortcuts | `src/steno/shortcuts.py` | `steno install-shortcuts`: Start menu and desktop `.lnk` running `pythonw -m steno.cli app`. The icon (`steno.ico`, 16-256 px: dark rounded tile, orange four-bar wave) is drawn in code with numpy, bars snapped to whole pixels at small sizes. The app rewrites it on each start and sets it as window/taskbar icon with its own AppUserModelID (`Steno.Desktop`), so it does not show as Python. |
@@ -24,20 +24,24 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | Method | Path | |
 |---|---|---|
 | GET | `/api/status` | recorder (`state`, `paused`, `project`, levels, elapsed, speaker, backlog), running job, config summary |
-| GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count and `types`) / add `{path, name?, create?}` / forget (files stay) |
-| POST | `/api/projects/<id>/types` `{types: [{name, folder?}]}` | replace the meeting types (folder defaults to `Meetings/<name>`) |
-| POST | `/api/projects/<id>/types/delete` `{name}` | delete a subfolder with its meetings (`delete_meeting` each; own files stay, the folder goes only when empty) |
-| POST | `/api/projects/<id>/delete` `{meetings}` | remove the project from Steno; `meetings: true` also deletes all its meetings, then Steno's files in `Steno/` and empty subfolder folders (the project folder and own files stay) |
+| GET/POST/DELETE | `/api/projects`, `/api/projects/<id>` | list (with `inbox` count, `types` with `folder`/`missing`, `archived`, `all_meetings`) / new project `{name, folder?}` (older form `{path, name?, create?}` still works) / forget (files stay) |
+| POST | `/api/projects/<id>/update` `{name?, folder?, archived?}` | rename, link (`folder` path) or unlink (`folder: null`) a folder, archive or restore |
+| POST | `/api/projects/<id>/subfolders` `{folder, name?, create?}` | add a subfolder: an existing folder anywhere, or `create` a new folder `name` inside `folder`; one folder per subfolder |
+| POST | `/api/projects/<id>/subfolders/rename` `{name, new_name}`, `/subfolders/folder` `{name, folder}` | rename (folder stays) / Change folder… (refused while the old folder holds meetings; meetings already moved along are relinked) |
+| POST | `/api/projects/<id>/types` `{types: [{name, folder?}]}` | older form: replace all subfolders (relative folders inside a linked project folder) |
+| POST | `/api/projects/<id>/types/delete` `{name, meetings?}` | remove a subfolder from Steno; `meetings: true` (default) also deletes its meetings (Steno's files only), else they stay in the project, kept in Steno; folders always stay |
+| POST | `/api/projects/<id>/delete` `{meetings}` | remove the project from Steno; its meetings go to the inbox, or with `meetings: true` are deleted; an older project's `Steno/` loses Steno's own files once empty of meetings; folders and own files stay |
 | POST | `/api/projects/<id>/folder` `{folder}` | can the next recording go into this existing folder? `{folder, name, type, title}` or 400 with the reason (`projects.check_existing_folder`) |
 | POST | `/api/inbox/delete` | delete every inbox meeting the app shows (not the archived ones) |
-| GET | `/api/projects/<id>/meetings` | oldest first; id `inbox` = sessions without a meeting folder |
+| GET | `/api/projects/<id>/meetings` | oldest first (`folder` empty = kept in Steno); id `inbox` = sessions that belong to no project |
 | POST | `/api/record/start` `{project?, type?, title?, folder?, mic, loopback, keep_audio, auto_title?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it. `folder`: record into that existing meeting folder (its subfolder decides the type; the title defaults to the folder name without its date, so it is never auto-titled) |
 | POST | `/api/record/auto_title` `{enabled}` | switch the automatic title of the meeting being recorded (409 when not recording) |
 | GET | `/api/llm/status` (`?refresh=1`) | `{llm: {state, method, plan, detail, login_running}}`, see "AI status" |
 | POST | `/api/llm/login`, `/api/llm/install` | open `claude auth login` in a visible console / open the Claude Code install page in the default browser (a fixed address) |
 | GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
-| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (`type: null` = no type; `project: "inbox"` = back to the inbox, see below) |
+| POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (no `type` = in the project without a folder, Steno's files leave the old folder; `project: "inbox"` = back to the inbox, see below) |
+| POST | `/api/meetings/<id>/save` `{folder}` | Save to… an existing meeting folder that lies in a subfolder of any project (an untitled meeting takes the folder's name) |
 | POST | `/api/meetings/<id>/archive` `{archived}` | hide/show it in the app (`archived.json` in the session dir; files stay) |
 | DELETE | `/api/meetings/<id>` | deletes the session dir and Steno's files in its meeting folder for good; the folder goes only when nothing else is left in it (not while recording it or while a job runs on it) |
 | POST | `/api/sessions/<id>/jobs` `{kind}` | `finalize`, `clean`, `summary`, `todo` |
@@ -136,15 +140,35 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
   top of `style.css`: four text levels (`--text`, `--body`, `--dim`, `--faint`, plus `--ghost` for
   times/counts), radii 6/8, a 4px spacing grid.
   The header is a quiet breadcrumb (project name); the meeting title (22px) is the page's hero. Icons are stroked 24x24 paths in `ICONS` (app.js), built as SVG nodes.
-- Subfolders = meeting types. Created only from the folder-plus button on a project row (hover,
-  next to `+`; there is no "New subfolder" row in the tree); each subfolder row has `+` and
-  a hover ⋯ (Rename, Remove... / Delete... with its meetings, after a confirm dialog). Project ⋯ →
-  Subfolders... edits them all at once; Project ⋯ → Remove project... asks, with a checkbox to
-  also delete all its meetings. The Inbox's ⋯ has "Delete all meetings...".
-  `projects.set_types` creates the (empty) folder on disk right away, so Explorer can show it;
-  after "New subfolder" the confirmation toast has an "Open in File Explorer" button (desktop app
-  only). Deleting never removes a file Steno did not write: meeting folders and subfolder folders
-  go only when they are empty afterwards, the project folder never.
+- Projects are labels, subfolders are folders. A project groups meetings and may be linked to a folder
+  (a shortcut, optional); a subfolder points at any folder on disk, and meetings saved in it are written
+  there. A meeting in a project without a subfolder is kept in Steno (no folder on disk) until it is
+  saved somewhere.
+  - New project (`+` in the Projects header, or the empty screen): one dialog, Name plus an optional
+    "Link a folder". `modal()` (app.js) is the dialog shell: `submit(values)` may throw and the message
+    shows inline while the dialog stays open and keeps what was typed (`formModal` takes the same
+    `submit`); `folderField()` is the picker field (a text field in a plain browser). A new project is
+    selected and its ready screen offers a big "Add subfolder".
+  - Add subfolder (folder-plus on a project row, the menu, the ready screen): "Choose existing folder"
+    (default; the name is prefilled from the folder, editable) or "Create new folder" (name plus a
+    location); the chosen path is shown. A subfolder whose folder is gone shows a warning icon (tooltip:
+    the path and "use Change folder..."); recording into it falls back to Steno's storage and the
+    recorder `notice` is shown once as a toast.
+  - Menus (`projectItems`, `subfolderItems`, `inboxItems`, `meetingItems`): right-click on a row, the
+    hover `...` button on the row (always shown on the open project), and the `...` in the header (the
+    open project) all show the same items. Project: New subfolder, Rename, Link folder / Change linked
+    folder / Unlink folder, Open in File Explorer (when linked), Archive, Delete. Subfolder: Record
+    here, Open in File Explorer, Rename, Change folder, Remove. `+` (new meeting) and the folder-plus
+    (new subfolder) stay as visible row buttons. Menus close on Escape or an outside click, stay inside
+    the window, and move with the arrow keys.
+  - Delete (project) and Remove (subfolder): by default only Steno forgets it (files stay; a project's
+    meetings go to the Inbox, a subfolder's meetings stay in the project); the checkbox "Also delete all
+    N meetings" turns the dialog red and deletes them for good.
+  - Archive: an archived project leaves the list and sits under a collapsed "Archived (n)" row at the
+    bottom of the sidebar (Restore, Delete). Nothing can be recorded or dropped into it.
+  - Save to... (button next to Summary/To-do on a meeting without a folder, not while recording): a
+    list of the subfolders of all non-archived projects (missing ones disabled), or an existing meeting
+    folder (`POST /api/meetings/<id>/save`).
 - Existing folder (dock button next to the subfolder, desktop app only): pick a meeting folder made
   by hand before the meeting (agenda, notes). The picker opens in the chosen subfolder. The folder
   must lie directly in `Steno/` or a subfolder's folder, must not be a meeting already and must
@@ -156,25 +180,22 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
   (2-6 days), Last week, 2/3 weeks ago, Last month, month name, "March 2025" for older years. The
   row's tooltip has the exact date and time. The labels are repainted when the day changes (timer
   at midnight, window focus, `visibilitychange`: `watchDay`). Headers and dialogs keep the full date.
-- Sidebar tree (subfolders = meeting types): under a project its subfolders come first (folder icon,
-  chevron, name, `+`, hover buttons; folded state in `steno-folded`), their meetings one level
-  deeper (16 px per level); meetings without a subfolder sit on the subfolders' level, after them,
-  with no icon. There is no "No type" group. A draft "New meeting" row appears where the meeting
-  will go. The dock gets a type menu ("Project root" = no subfolder; chosen with `+` or the menu,
-  else the open meeting's type, else the last used, `steno-type-<project>`); the header reads
-  "Project > Type". Move... lists every project, subfolder and the Inbox / TBD. Without types
-  everything looks as before.
+- Sidebar tree: under a project its subfolders come first (folder icon, chevron, name, `+`, `...`;
+  tooltip = its folder; folded state in `steno-folded`), their meetings one level deeper (16 px per
+  level); meetings in the project itself sit on the subfolders' level, after them, with no icon. There
+  is no "No type" group. A draft "New meeting" row appears where the meeting will go. The dock gets a
+  subfolder menu ("No subfolder" = kept in Steno; chosen with `+` or the menu, else the open meeting's
+  subfolder, else the last used, `steno-type-<project>`); the header reads "Project > Subfolder".
+  Move... lists every non-archived project, subfolder and the Inbox / TBD.
 - Inbox / TBD: always the last node of the sidebar, also when empty (label `INBOX_NAME`), with `+`
   to start a meeting there (`record/start` without a project). It holds the sessions that have no
   meeting folder.
-- Open in File Explorer (desktop app only, via `Bridge.open_folder`): hover button on project,
-  subfolder and Inbox / TBD rows (small, revealed on hover like `+`), and an item in the project
-  header menu, the subfolder menu and the meeting menu (an inbox meeting opens its session
-  folder in the data dir).
+- Open in File Explorer (desktop app only, via `Bridge.open_folder`): an item in the project,
+  subfolder, Inbox / TBD and meeting menus (an inbox meeting opens its session folder in the data dir).
 - Drag to move: press and hold a meeting row ~350 ms (pointer events; a click still opens it, moving
   more than 6 px before the hold ends cancels it). The row stays behind as a grey hole and a grey
   translucent copy of it (a clone of the row) follows the pointer. The place under it (nearest
-  `[data-drop]` ancestor: project node = project root, subfolder node, Inbox / TBD) lights up when
+  `[data-drop]` ancestor: project node = in the project without a subfolder, subfolder node, Inbox / TBD) lights up when
   the meeting is not already there, and its meetings slide apart (a `.drop-gap` spacer, 150 ms
   height transition) to open a gap where the meeting's date puts it (`gapPlace`: newest first, rows
   carry `data-ts`); leaving the place closes the gap. Hovering a closed project or subfolder for

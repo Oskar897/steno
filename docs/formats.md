@@ -36,43 +36,48 @@ Voice profiles live next to the sessions, also encrypted:
 
 `<data_dir>` is `%USERPROFILE%\.steno` on Windows (override: `STENO_DATA_DIR`).
 
-A session recorded into a project (desktop app) also has `meeting.json` (`{"folder", "title"}`)
-pointing to its meeting folder; a session without one is in the Inbox.
+A session filed under a project (desktop app) also has `meeting.json`: `{"folder", "title"}`
+when it has a meeting folder on disk, or `{"title", "project": "<project id>"}` when it is kept
+in Steno only. A session that belongs to no (registered) project is in the Inbox.
 An archived meeting has `archived.json` (`{"archived_at"}`) in its session dir: the app hides
 it from lists and counts; nothing else changes.
 
 ## Projects and meeting folders (desktop app)
 
 ```
-<data_dir>/projects.json              # {"projects": [{"path": "...", "types": [{"name", "folder"}]}]}
+<data_dir>/projects.json              # {"projects": [{"id", "name", "path"?, "archived"?, "types": [{"name", "folder"}]}]}
 <data_dir>/settings.json              # app settings: auto_finalize, auto_title, auto_clean, auto_summary, auto_todo, glossary, theme, transparent, mini_strip
-<project folder>/Steno/
-  .gitignore                          # "*", only inside a git repo: meeting text is never committed
-  CLAUDE.md                           # how Claude Code should read the meetings (summaries first)
-  index.md                            # one line per meeting, newest first, path from the project folder; "recording" mark
-  <YYYY-MM-DD title>/                 # a meeting without a type
-    .gitignore                        # "*" (every meeting folder inside a git repo has one)
-    .steno-meeting.json               # {"session": "<session_id>", "title": "..."}; hidden on Windows
+<subfolder folder>/                   # any folder on disk, e.g. .../Meetings/One-on-One
+  <YYYY-MM-DD title>/                 # one folder per meeting (or the user's own meeting folder)
+    .gitignore                        # "*", only inside a git repo: meeting text is never committed
+    .steno-meeting.json               # {"session": "<session_id>", "title": "...", "own_folder"?}; hidden on Windows
     transcript.md                     # best text (clean > final > refined live), rewritten while recording
     summary.md, todo.md               # copies, when made
-<project folder>/<type folder>/       # e.g. Meetings/Board: one folder per meeting type
-  <YYYY-MM-DD title>/                 # same files as above
 ```
 
-Meeting types are optional (`types` missing or empty: every meeting goes into `Steno/`). A
-type's `folder` is relative to the project, `/`-separated, at most 4 levels, never `..`, an
-absolute path or `Steno` itself. Which project and type a meeting belongs to follows from the
-folder it lies in. A type whose folder holds meetings cannot be removed or re-pointed (the
-app refuses); renaming it is fine. Folders made before types existed are named
-`YYYY-MM-DD HH.MM title` and keep that name until they are renamed or moved.
+A project is a label: `id` (12 hex characters), `name`, optionally a linked folder (`path`)
+and `archived`. It writes no files. A **subfolder** (`types`) is a name plus an absolute folder
+anywhere on disk; one folder belongs to one subfolder of one project only. Meetings without a
+subfolder are kept in Steno only (no files on disk); "Save to…" later files them into a
+subfolder or into an existing meeting folder inside one. Which project and subfolder a meeting
+with a folder belongs to follows from the folder it lies in. A subfolder whose folder holds
+meetings cannot get another folder while they are still there; renaming it is fine. A
+subfolder whose folder is missing (drive offline, moved) stays listed with a warning; a
+recording into it falls back to Steno's storage.
+
+Older registries are still read: entries with only `path` (id from the path, name from the
+folder), subfolder folders relative to the project folder, and an old `<project>/Steno/` folder
+with meetings, `index.md` and a generated `CLAUDE.md`. Removing such a project takes Steno's own
+files out of `Steno/` once it holds no meetings.
 
 A meeting can also be recorded into a folder that already exists (the user's own meeting folder
 with an agenda): Steno's files are then written next to the user's files, which Steno never
-changes or deletes. Deleting a meeting removes Steno's files only and the folder when it is empty.
+changes or deletes. Deleting a meeting removes Steno's files only and the folder when it is
+empty. Removing a subfolder or project from Steno never deletes folders; with "also delete the
+meetings" it deletes their sessions and Steno's files in their folders.
 
 The meeting folder holds only readable text. The session directory above stays the source of
-truth (JSONL, revisions, embeddings, kept audio) and lives in the data dir. A `CLAUDE.md` in
-`Steno/` that does not start with Steno's marker comment is never overwritten.
+truth (JSONL, revisions, embeddings, kept audio) and lives in the data dir.
 
 ## transcript.jsonl (v1)
 
@@ -459,8 +464,8 @@ session: <session id>
 note: ...            (optional: new meeting since the token; summary.md / todo.md exist)
 ```
 
-The target meeting is `--session ID`, else the latest meeting of the project that contains the
-current folder (or `--project PATH`), else the latest meeting overall. If it differs from the
+The target meeting is `--session ID`, else the latest meeting of the project whose linked folder or
+subfolder folder contains the current folder (or `--project PATH`), else the latest meeting overall. If it differs from the
 session in the token, a `note:` line says so and it is delivered from its start. With no meeting
 at all the output is `(no meeting found ...)` and `next: start`. `--since` cannot be combined with
 `--consumer` or `--peek`.

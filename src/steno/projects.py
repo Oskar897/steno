@@ -1,26 +1,30 @@
-"""Projects: folders you pick on disk; every meeting gets a readable folder inside them.
+"""Projects: labels for your meetings, with subfolders that are folders anywhere on disk.
 
-Layout::
+A project is a name ("Chess Club", "Thesis"), optionally linked to a folder. It writes no
+files by itself. A meeting of a project without a subfolder lives only in Steno's own
+storage (the data dir); its ``meeting.json`` names the project. A **subfolder** is a name
+plus any folder on disk (absolute path, e.g. a meetings folder in Google Drive); every
+meeting recorded there gets a readable folder inside it::
 
-    <project folder>/
-      Steno/
+    <subfolder folder>/
+      2026-11-22 One-on-One/
         .gitignore            # "*", only inside a git repo: meeting text is never committed
-        CLAUDE.md             # how Claude Code should read the meetings (cheap first)
-        index.md              # one line per meeting, newest first
-        2026-11-19 Sprint planning/
-          .gitignore          # "*", also in meeting folders outside Steno/ (git repos only)
-          .steno-meeting.json # {"session": "<id>", "title": "..."}, hidden on Windows
-          transcript.md       # best text so far; rewritten while recording
-          summary.md, todo.md # only after you asked for them
-      Meetings/Board/         # optional meeting types: each has its own folder
-        2026-11-20 Lobby days and build night/
+        .steno-meeting.json   # {"session": "<id>", "title": "..."}, hidden on Windows
+        agenda.md             # the user's own files are never touched
+        transcript.md         # best text so far; rewritten while recording
+        summary.md, todo.md   # only after you asked for them
 
-A project can have meeting types (``Board`` -> ``Meetings/Board``). Without types every
-meeting goes into ``Steno/``; meetings without a type stay there when types exist.
+A folder belongs to one subfolder of one project only. A subfolder whose folder is missing
+(drive offline, moved) is kept: recordings then fall back to Steno's storage, and "Save
+to..." writes them out later.
+
+Older registries are still read: projects that are a folder (id from the path) with a
+``Steno/`` folder for meetings without a subfolder, and subfolder folders relative to the
+project folder.
 
 The session itself (JSONL, revisions, voice windows, kept audio) stays in the global data
-dir (``steno.paths``); its ``meeting.json`` points to the meeting folder. Voice profiles
-are global too. The registry of projects is ``<data dir>/projects.json``.
+dir (``steno.paths``); its ``meeting.json`` points to the meeting folder (or names the
+project). Voice profiles are global too. The registry is ``<data dir>/projects.json``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,8 @@ import re
 import shutil
 import threading
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,12 +57,14 @@ DEFAULT_TITLE = "Meeting"
 MAX_TITLE = 80
 COPIED = ("summary.md", "todo.md")
 _CLAUDE_MARK = "<!-- steno:generated -->"
+_INDEX_HEAD = "# Meetings in "
 _BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _lock = threading.RLock()
 
 
 MAX_TYPES = 30
 MAX_TYPE_DEPTH = 4
+MAX_PROJECTS = 200
 
 
 class ProjectError(ValueError):
@@ -65,22 +73,29 @@ class ProjectError(ValueError):
 
 @dataclass(frozen=True)
 class MeetingType:
+    """A subfolder: a name and its folder (absolute; older ones relative to the project)."""
+
     name: str
-    folder: str  # relative to the project folder, "/"-separated
+    folder: str
 
 
 @dataclass(frozen=True)
 class Project:
     id: str
     name: str
-    path: Path
+    path: Path | None = None  # the linked folder, if any
     types: tuple[MeetingType, ...] = ()
+    archived: bool = False
 
     @property
-    def steno_dir(self) -> Path:
-        return self.path / STENO_DIRNAME
+    def steno_dir(self) -> Path | None:
+        """``<folder>/Steno`` of an older project (meetings without a subfolder were there)."""
+        return self.path / STENO_DIRNAME if self.path is not None else None
 
     def type_dir(self, mtype: MeetingType) -> Path:
+        folder = Path(mtype.folder)
+        if folder.is_absolute() or self.path is None:
+            return folder
         return self.path.joinpath(*mtype.folder.split("/"))
 
     def find_type(self, name: str | None) -> MeetingType | None:
@@ -89,20 +104,25 @@ class Project:
         for t in self.types:
             if t.name.casefold() == name.casefold():
                 return t
-        raise ProjectError(f"no meeting type {name!r} in {self.name}")
+        raise ProjectError(f"no subfolder {name!r} in {self.name}")
 
 
 @dataclass(frozen=True)
 class Meeting:
     session: str
     title: str
-    folder: Path
+    folder: Path | None  # None: kept in Steno's storage only (no files written)
 
 
 # --------------------------------------------------------------------------- registry
 
 
+_PROJECT_REF = re.compile(r"[0-9a-f]{12}")
+_SESSION_REF = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
 def project_id(path: Path) -> str:
+    """The id of an older project: derived from its folder."""
     key = os.path.normcase(str(Path(path).resolve()))
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
@@ -111,42 +131,207 @@ def _registry() -> Path:
     return paths.data_dir() / REGISTRY_NAME
 
 
+def _entry_id(entry: dict) -> str:
+    pid = str(entry.get("id") or "")
+    return pid if _PROJECT_REF.fullmatch(pid) else project_id(Path(entry["path"]))
+
+
 def _load_entries() -> list[dict]:
     try:
         data = json.loads(_registry().read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return []
-    return [p for p in data.get("projects", []) if isinstance(p, dict) and p.get("path")]
+    out = []
+    for p in data.get("projects", []) if isinstance(data, dict) else []:
+        if isinstance(p, dict) and (
+                p.get("path") or _PROJECT_REF.fullmatch(str(p.get("id") or ""))):
+            out.append(p)
+    return out
 
 
 def _save_entries(entries: list[dict]) -> None:
+    for entry in entries:  # older entries get their id and name written down: they no
+        entry["id"] = _entry_id(entry)  # longer follow the folder once it can change
+        if not entry.get("name") and entry.get("path"):
+            entry["name"] = Path(entry["path"]).name
     atomic_write_text(_registry(), json.dumps(
         {"projects": entries}, indent=2, ensure_ascii=False) + "\n")
 
 
-def _types_of(entry: dict) -> tuple[MeetingType, ...]:
+def _types_of(entry: dict, path: Path | None) -> tuple[MeetingType, ...]:
     out = []
     for t in entry.get("types") or []:
-        if isinstance(t, dict) and t.get("name") and t.get("folder"):
-            try:
-                out.append(MeetingType(str(t["name"]), clean_type_folder(str(t["folder"]))))
-            except ProjectError:
-                log.warning("ignoring a meeting type with a bad folder: %r", t.get("folder"))
+        if not (isinstance(t, dict) and t.get("name") and t.get("folder")):
+            continue
+        folder = str(t["folder"])
+        if Path(folder).is_absolute():
+            out.append(MeetingType(str(t["name"]), folder))
+            continue
+        try:
+            if path is None:
+                raise ProjectError("a relative subfolder needs a project folder")
+            out.append(MeetingType(str(t["name"]), clean_type_folder(folder)))
+        except ProjectError:
+            log.warning("ignoring a subfolder with a bad folder: %r", folder)
     return tuple(out)
 
 
+def _project(entry: dict) -> Project:
+    path = Path(entry["path"]) if entry.get("path") else None
+    name = clean_title(str(entry.get("name") or ""), "") or (path.name if path else "Project")
+    return Project(_entry_id(entry), name, path, _types_of(entry, path),
+                   bool(entry.get("archived")))
+
+
 def list_projects() -> list[Project]:
-    """Registered projects whose folder still exists, in the order they were added."""
-    out = []
-    for entry in _load_entries():
-        path = Path(entry["path"])
-        if path.is_dir():
-            out.append(Project(project_id(path), path.name, path, _types_of(entry)))
-    return out
+    """Registered projects (archived ones included), in the order they were added."""
+    return [_project(e) for e in _load_entries()]
+
+
+def get_project(pid: str) -> Project:
+    for p in list_projects():
+        if p.id == pid:
+            return p
+    raise ProjectError("no such project")
+
+
+def _update_entry(pid: str, change: Callable[[dict], None]) -> Project:
+    """Apply ``change(entry)`` to one project's registry entry and save."""
+    with _lock:
+        entries = _load_entries()
+        for entry in entries:
+            if _entry_id(entry) == pid:
+                entry["id"] = pid
+                change(entry)
+                break
+        else:
+            raise ProjectError("no such project")
+        _save_entries(entries)
+    return get_project(pid)
+
+
+def clean_title(title: str | None, default: str = DEFAULT_TITLE) -> str:
+    """A title that is also a valid folder name on Windows."""
+    text = _BAD_CHARS.sub(" ", title or "").strip().strip(".")
+    text = re.sub(r"\s+", " ", text)[:MAX_TITLE].strip()
+    return text or default
+
+
+def _check_name_free(name: str, skip: str | None = None) -> None:
+    for p in list_projects():
+        if p.id != skip and p.name.casefold() == name.casefold():
+            raise ProjectError(f"there is already a project called {p.name}")
+
+
+def _existing_folder(folder: str | Path) -> Path:
+    """A folder the user picked: absolute, existing, not inside Steno's own storage."""
+    f = Path(str(folder).strip()).expanduser()
+    if not f.is_absolute():
+        raise ProjectError("pick a folder (a full path)")
+    if not f.is_dir():
+        raise ProjectError(f"folder not found: {f}")
+    f = f.resolve()
+    data = Path(os.path.abspath(paths.data_dir()))
+    if f == data or data in f.parents:
+        raise ProjectError("that folder is Steno's own storage; pick another one")
+    return f
+
+
+def create_project(name: str, folder: str | Path | None = None) -> Project:
+    """A new project: a name, optionally linked to an existing folder. Writes no files."""
+    name = clean_title(name, "")
+    if not name:
+        raise ProjectError("give the project a name")
+    path = _existing_folder(folder) if folder else None
+    with _lock:
+        entries = _load_entries()
+        if len(entries) >= MAX_PROJECTS:
+            raise ProjectError(f"at most {MAX_PROJECTS} projects")
+        _check_name_free(name)
+        pid = uuid.uuid4().hex[:12]
+        entry: dict = {"id": pid, "name": name}
+        if path is not None:
+            entry["path"] = str(path)
+        _save_entries([*entries, entry])
+    return get_project(pid)
+
+
+def add_project(path: str | Path, *, name: str | None = None, create: bool = False) -> Project:
+    """Register a folder as a project named after it (``create``: make ``path/name`` first).
+    Adding the same folder twice returns the existing project. Writes no files."""
+    base = Path(path).expanduser()
+    if create:
+        if not base.is_dir():
+            raise ProjectError(f"folder not found: {base}")
+        folder_name = clean_title(name, "")
+        if not folder_name:
+            raise ProjectError("give the new project a name")
+        base = base / folder_name
+        base.mkdir(exist_ok=True)
+    if not base.is_dir():
+        raise ProjectError(f"folder not found: {base}")
+    base = base.resolve()
+    key = _key(base)
+    with _lock:
+        entries = _load_entries()
+        for entry in entries:
+            if entry.get("path") and _key(Path(entry["path"])) == key:
+                return get_project(_entry_id(entry))
+        entries.append({"id": project_id(base), "name": base.name, "path": str(base)})
+        _save_entries(entries)
+    return get_project(project_id(base))
+
+
+def rename_project(pid: str, name: str) -> Project:
+    """Only the label changes; no folder is renamed."""
+    name = clean_title(name, "")
+    if not name:
+        raise ProjectError("give the project a name")
+    get_project(pid)
+    _check_name_free(name, skip=pid)
+    return _update_entry(pid, lambda e: e.__setitem__("name", name))
+
+
+def set_project_folder(pid: str, folder: str | Path | None) -> Project:
+    """Link the project to a folder (``None``: unlink). Subfolders keep their own folders
+    (older ones relative to the project folder are written down as full paths first)."""
+    project = get_project(pid)
+    path = _existing_folder(folder) if folder else None
+
+    def change(entry: dict) -> None:
+        entry["name"] = project.name
+        entry["types"] = [{"name": t.name, "folder": str(project.type_dir(t))}
+                          for t in project.types]
+        if path is None:
+            entry.pop("path", None)
+        else:
+            entry["path"] = str(path)
+
+    return _update_entry(pid, change)
+
+
+def set_project_archived(pid: str, archived: bool) -> Project:
+    """Archived projects are hidden in the sidebar (under "Archived"); nothing is deleted."""
+    def change(entry: dict) -> None:
+        if archived:
+            entry["archived"] = True
+        else:
+            entry.pop("archived", None)
+    return _update_entry(pid, change)
+
+
+def remove_project(pid: str) -> None:
+    """Forget a project. Its files stay where they are."""
+    with _lock:
+        entries = [p for p in _load_entries() if _entry_id(p) != pid]
+        _save_entries(entries)
+
+
+# --------------------------------------------------------------------------- subfolders
 
 
 def clean_type_folder(folder: str) -> str:
-    """A safe folder path inside the project: ``Meetings/Board``; no ``..``, not ``Steno``."""
+    """A safe folder path inside an older project: ``Meetings/Board``; no ``..``."""
     raw = (folder or "").strip()
     if raw.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", raw):
         raise ProjectError("give a folder inside the project, not a full path")
@@ -162,93 +347,157 @@ def clean_type_folder(folder: str) -> str:
             raise ProjectError(f"not a valid folder name: {part!r}")
         out.append(name)
     if len(out) == 1 and out[0].casefold() == STENO_DIRNAME.casefold():
-        raise ProjectError("Steno/ holds the meetings without a type; pick another folder")
+        raise ProjectError("Steno/ is taken; pick another folder")
     return "/".join(out)
 
 
+def _check_folder_free(folder: Path, skip: tuple[str, str] | None = None,
+                       skip_project: str | None = None) -> None:
+    """One folder belongs to one subfolder of one project only."""
+    key = _key(folder)
+    for p in list_projects():
+        if p.id == skip_project:
+            continue
+        for t in p.types:
+            if skip is not None and (p.id, t.name.casefold()) == skip:
+                continue
+            if _key(p.type_dir(t)) == key:
+                raise ProjectError(f"{folder.name} is already the subfolder {t.name} "
+                                   f"in {p.name}")
+
+
+def _types_entry(project: Project, types: list[MeetingType]) -> Callable[[dict], None]:
+    def change(entry: dict) -> None:
+        entry["name"] = project.name
+        entry["types"] = [{"name": t.name, "folder": t.folder} for t in types]
+    return change
+
+
 def set_types(pid: str, types: list[dict]) -> Project:
-    """Replace a project's meeting types. Folders of types that hold meetings cannot be
-    removed or moved (the meetings would fall out of the app)."""
+    """Replace a project's subfolders (``{name, folder}``; a relative folder lies inside the
+    project folder and is created). Subfolders that hold meetings cannot be removed or get
+    another folder this way (the meetings would fall out of the app)."""
     project = get_project(pid)
     if len(types) > MAX_TYPES:
-        raise ProjectError(f"at most {MAX_TYPES} meeting types")
+        raise ProjectError(f"at most {MAX_TYPES} subfolders")
     new: list[MeetingType] = []
     for t in types:
         if not isinstance(t, dict):
-            raise ProjectError("a meeting type is {name, folder}")
+            raise ProjectError("a subfolder is {name, folder}")
         name = clean_title(str(t.get("name") or ""), "")
         if not name:
-            raise ProjectError("every meeting type needs a name")
-        folder = clean_type_folder(str(t.get("folder") or f"Meetings/{name}"))
+            raise ProjectError("every subfolder needs a name")
+        raw = str(t.get("folder") or f"Meetings/{name}")
+        if Path(raw).is_absolute():
+            folder = str(Path(raw).resolve())
+        elif project.path is None:
+            raise ProjectError("pick a folder for the subfolder (the project has no folder)")
+        else:
+            folder = clean_type_folder(raw)
         if any(x.name.casefold() == name.casefold() for x in new):
-            raise ProjectError(f"two meeting types are called {name!r}")
-        if any(x.folder.casefold() == folder.casefold() for x in new):
-            raise ProjectError(f"two meeting types use the folder {folder!r}")
-        new.append(MeetingType(name, folder))
-    kept = {t.folder.casefold() for t in new}
+            raise ProjectError(f"two subfolders are called {name!r}")
+        mt = MeetingType(name, folder)
+        if any(_key(project.type_dir(x)) == _key(project.type_dir(mt)) for x in new):
+            raise ProjectError(f"two subfolders use the folder {folder!r}")
+        new.append(mt)
+    kept = {_key(project.type_dir(t)) for t in new}
     for old in project.types:
-        if old.folder.casefold() not in kept and _meeting_dirs(project.type_dir(old)):
+        if _key(project.type_dir(old)) not in kept and _meeting_dirs(project.type_dir(old)):
             raise ProjectError(f"{old.name} has meetings: move or delete them before "
-                               "removing the type or changing its folder")
-    with _lock:
-        entries = _load_entries()
-        for entry in entries:
-            if project_id(Path(entry["path"])) == pid:
-                entry["types"] = [{"name": t.name, "folder": t.folder} for t in new]
-        _save_entries(entries)
-    project = get_project(pid)
-    for t in project.types:  # the folder exists from the start: visible in Explorer, ready to use
-        try:
-            project.type_dir(t).mkdir(parents=True, exist_ok=True)
-        except OSError:
-            log.debug("Could not create the folder of %s", t.name, exc_info=True)
+                               "removing the subfolder or changing its folder")
+    for t in new:
+        _check_folder_free(project.type_dir(t), skip_project=pid)
+    project = _update_entry(pid, _types_entry(project, new))
+    for t in project.types:  # an older relative folder exists from the start
+        if not Path(t.folder).is_absolute():
+            try:
+                project.type_dir(t).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                log.debug("Could not create the folder of %s", t.name, exc_info=True)
     write_index(project)
     return project
 
 
-def get_project(pid: str) -> Project:
-    for p in list_projects():
-        if p.id == pid:
-            return p
-    raise ProjectError("no such project")
+def _clean_type_name(project: Project, name: str, skip: str | None = None) -> str:
+    name = clean_title(name, "")
+    if not name:
+        raise ProjectError("give the subfolder a name")
+    for t in project.types:
+        if t.name.casefold() == name.casefold() and t.name.casefold() != (skip or "").casefold():
+            raise ProjectError(f"{project.name} already has a subfolder called {t.name}")
+    return name
 
 
-def clean_title(title: str | None, default: str = DEFAULT_TITLE) -> str:
-    """A title that is also a valid folder name on Windows."""
-    text = _BAD_CHARS.sub(" ", title or "").strip().strip(".")
-    text = re.sub(r"\s+", " ", text)[:MAX_TITLE].strip()
-    return text or default
-
-
-def add_project(path: str | Path, *, name: str | None = None, create: bool = False) -> Project:
-    """Register a folder (``create``: make ``path/name`` first) and set up its Steno dir."""
-    base = Path(path).expanduser()
+def add_type(pid: str, name: str | None, folder: str | Path, *, create: bool = False
+             ) -> Project:
+    """Add a subfolder. ``folder``: an existing folder anywhere (name defaults to the folder's
+    name), or with ``create`` the place where a new folder ``name`` is made."""
+    project = get_project(pid)
+    if len(project.types) >= MAX_TYPES:
+        raise ProjectError(f"at most {MAX_TYPES} subfolders")
+    base = _existing_folder(folder)
     if create:
-        if not base.is_dir():
-            raise ProjectError(f"folder not found: {base}")
-        folder_name = clean_title(name, "")
-        if not folder_name:
-            raise ProjectError("give the new project a name")
-        base = base / folder_name
-        base.mkdir(exist_ok=True)
-    if not base.is_dir():
-        raise ProjectError(f"folder not found: {base}")
-    base = base.resolve()
-    with _lock:
-        entries = _load_entries()
-        if not any(project_id(Path(p["path"])) == project_id(base) for p in entries):
-            entries.append({"path": str(base)})
-            _save_entries(entries)
-    project = get_project(project_id(base))
-    ensure_steno_dir(project)
+        name = _clean_type_name(project, name or "")
+        target = base / name
+        _check_folder_free(target)
+        target.mkdir(exist_ok=True)
+        base = target.resolve()
+    else:
+        name = _clean_type_name(project, name or base.name)
+        _check_folder_free(base)
+    types = [*project.types, MeetingType(name, str(base))]
+    return _update_entry(pid, _types_entry(project, types))
+
+
+def rename_type(pid: str, old: str, new: str) -> Project:
+    """Only the name in Steno changes; the folder stays as it is."""
+    project = get_project(pid)
+    kind = project.find_type(old)
+    if kind is None:
+        raise ProjectError("no such subfolder")
+    name = _clean_type_name(project, new, skip=kind.name)
+    types = [MeetingType(name, t.folder) if t == kind else t for t in project.types]
+    return _update_entry(pid, _types_entry(project, types))
+
+
+def set_type_folder(pid: str, name: str, folder: str | Path) -> Project:
+    """Point a subfolder at another folder (it was moved, or the drive letter changed). The
+    old folder must not hold meetings any more (they would fall out of the app)."""
+    project = get_project(pid)
+    kind = project.find_type(name)
+    if kind is None:
+        raise ProjectError("no such subfolder")
+    base = _existing_folder(folder)
+    _check_folder_free(base, skip=(pid, kind.name.casefold()))
+    old = project.type_dir(kind)
+    if _key(old) != _key(base) and _meeting_dirs(old):
+        raise ProjectError(f"{kind.name}'s current folder still holds meetings; move the "
+                           "folder itself in File Explorer first, then pick it here")
+    types = [MeetingType(t.name, str(base)) if t == kind else t for t in project.types]
+    project = _update_entry(pid, _types_entry(project, types))
+    _relink(base)
     return project
 
 
-def remove_project(pid: str) -> None:
-    """Forget a project. Its files stay where they are."""
+def _relink(parent: Path) -> None:
+    """Meeting folders that were moved along with their subfolder (File Explorer, a new drive
+    letter): point their sessions at where they are now."""
     with _lock:
-        entries = [p for p in _load_entries() if project_id(Path(p["path"])) != pid]
-        _save_entries(entries)
+        for f in _meeting_dirs(parent):
+            meta = _read_json(f / MEETING_FILE)
+            d = _session_dir_of(str(meta.get("session") or ""))
+            if d is None or meeting_folder(d) is not None:
+                continue  # gone, or still linked to a folder that exists
+            atomic_write_text(d / LINK_NAME, json.dumps(
+                {"folder": str(f), "title": str(meta.get("title") or DEFAULT_TITLE)},
+                ensure_ascii=False) + "\n")
+
+
+def type_available(project: Project, mtype: MeetingType) -> bool:
+    return project.type_dir(mtype).is_dir()
+
+
+# --------------------------------------------------------------------------- files on disk
 
 
 _STENO_GITIGNORE = "# Meeting transcripts are private: keep them out of git.\n*\n"
@@ -273,6 +522,15 @@ def _remove_if_ours(path: Path, text: str) -> None:
         log.debug("Could not remove %s", path, exc_info=True)
 
 
+def _remove_if_starts(path: Path, head: str) -> None:
+    """Delete a generated file (it starts with Steno's own marker or heading)."""
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8").startswith(head):
+            path.unlink()
+    except OSError:
+        log.debug("Could not remove %s", path, exc_info=True)
+
+
 def _set_hidden(path: Path, hidden: bool) -> None:
     """Windows: show or hide a file in Explorer (the meeting marker is not for reading)."""
     if os.name != "nt":
@@ -291,40 +549,19 @@ def _set_hidden(path: Path, hidden: bool) -> None:
         log.debug("Could not change the hidden flag of %s", path, exc_info=True)
 
 
-def ensure_steno_dir(project: Project) -> Path:
+def _clean_steno_dir(project: Project) -> None:
+    """An older project's ``Steno/`` folder: once it holds no meetings, take Steno's own
+    files out (index.md, a generated CLAUDE.md, its .gitignore) and the folder if empty."""
     d = project.steno_dir
-    d.mkdir(exist_ok=True)
-    gi = d / ".gitignore"
-    if not gi.exists() and _in_git(d):
-        gi.write_text(_STENO_GITIGNORE, encoding="utf-8")
-    claude = d / "CLAUDE.md"
-    if not claude.exists() or _CLAUDE_MARK in claude.read_text(encoding="utf-8"):
-        atomic_write_text(claude, CLAUDE_MD)
-    return d
-
-
-CLAUDE_MD = f"""{_CLAUDE_MARK}
-# Meetings (written by Steno)
-
-Each meeting is one folder named `YYYY-MM-DD <title>`. Meetings without a type are
-here; meetings with a type (Board, 1-1, ...) are in that type's folder in the project.
-`index.md` lists them all, newest first, with their path from the project folder.
-
-How to read them (save tokens):
-1. Start with `index.md`.
-2. Earlier meetings: read `summary.md` and `todo.md` first; open `transcript.md` only
-   when the question needs details that are not in them.
-3. The meeting marked **recording** in `index.md` is live; for it, or the latest one, do
-   not re-read `transcript.md`. Run `steno new --since start` the first time (from this
-   project folder it picks this project's latest meeting). The output ends with a line
-   `next: <token>`; on every later question run `steno new --since <that token>` and you
-   get only what was said since. Lines under "Corrections" replace their earlier wording.
-   If the header says it is a different meeting, the older text no longer applies.
-4. If the `steno` command is missing, read `transcript.md` (rewritten every few seconds).
-
-Transcript lines look like `[MM:SS] Speaker: text`. Speech recognition errors happen,
-mostly with names and English terms inside Swedish sentences.
-"""
+    if d is None or not d.is_dir() or _meeting_dirs(d):
+        return
+    _remove_if_starts(d / "index.md", _INDEX_HEAD)
+    _remove_if_starts(d / "CLAUDE.md", _CLAUDE_MARK)
+    _remove_if_ours(d / ".gitignore", _STENO_GITIGNORE)
+    try:
+        d.rmdir()
+    except OSError:
+        log.info("%s keeps files that Steno did not write", d)
 
 
 # --------------------------------------------------------------------------- meetings
@@ -334,12 +571,12 @@ def _read_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, ValueError, OSError):
         return {}
 
 
 def meeting_folder(session_dir: Path) -> Path | None:
-    """The meeting folder of a session, or None (no project, or the folder is gone)."""
+    """The meeting folder of a session, or None (kept in Steno only, or the folder is gone)."""
     folder = _read_json(Path(session_dir) / LINK_NAME).get("folder")
     if not folder:
         return None
@@ -359,11 +596,12 @@ def _key(path: Path) -> str:
     return os.path.normcase(str(Path(path).resolve()))
 
 
-def _place(folder: Path) -> tuple[Project, MeetingType | None] | None:
-    """Which project (and meeting type) a meeting folder belongs to, from where it lies."""
+def _place(folder: Path, plist: list[Project] | None = None
+           ) -> tuple[Project, MeetingType | None] | None:
+    """Which project (and subfolder) a meeting folder belongs to, from where it lies."""
     parent = _key(folder.parent)
-    for p in list_projects():
-        if parent == _key(p.steno_dir):
+    for p in list_projects() if plist is None else plist:
+        if p.steno_dir is not None and parent == _key(p.steno_dir):
             return p, None
         for t in p.types:
             if parent == _key(p.type_dir(t)):
@@ -371,14 +609,24 @@ def _place(folder: Path) -> tuple[Project, MeetingType | None] | None:
     return None
 
 
-def project_of(session_dir: Path) -> Project | None:
+def _label_project(session_dir: Path) -> str | None:
+    """The project id a meeting without a folder is filed under (its ``meeting.json``)."""
+    pid = _read_json(Path(session_dir) / LINK_NAME).get("project")
+    return pid if isinstance(pid, str) and _PROJECT_REF.fullmatch(pid) else None
+
+
+def project_of(session_dir: Path, plist: list[Project] | None = None) -> Project | None:
+    plist = list_projects() if plist is None else plist
     folder = meeting_folder(session_dir)
-    place = _place(folder) if folder is not None else None
-    return place[0] if place else None
+    if folder is not None:
+        place = _place(folder, plist)
+        return place[0] if place else None
+    pid = _label_project(session_dir)
+    return next((p for p in plist if p.id == pid), None) if pid else None
 
 
 def type_of(session_dir: Path) -> str | None:
-    """The meeting type's name, or None (no project, or no type)."""
+    """The subfolder's name, or None (no project, or no subfolder)."""
     folder = meeting_folder(session_dir)
     place = _place(folder) if folder is not None else None
     return place[1].name if place and place[1] else None
@@ -396,19 +644,25 @@ def _when(session_id: str) -> str:
     return f"{m[1]}-{m[2]}-{m[3]} {m[4]}.{m[5]}" if m else session_id
 
 
-def _parent_dir(project: Project, mtype: MeetingType | None) -> Path:
-    ensure_steno_dir(project)
-    if mtype is None:
-        return project.steno_dir
+def _type_parent(project: Project, mtype: MeetingType) -> Path:
+    """The folder new meetings of a subfolder go into. An older relative folder is created;
+    a picked folder that is missing (drive offline, moved) is an error: never recreate it."""
     d = project.type_dir(mtype)
-    d.mkdir(parents=True, exist_ok=True)
+    if not Path(mtype.folder).is_absolute() and project.path is not None \
+            and project.path.is_dir():
+        d.mkdir(parents=True, exist_ok=True)
+    if not d.is_dir():
+        raise ProjectError(f"the folder of {mtype.name} is missing ({d}); use Change folder…")
     return d
 
 
-def _meeting_dirs(parent: Path) -> list[Path]:
-    if not parent.is_dir():
+def _meeting_dirs(parent: Path | None) -> list[Path]:
+    if parent is None or not parent.is_dir():
         return []
-    return [f for f in parent.iterdir() if f.is_dir() and (f / MEETING_FILE).is_file()]
+    try:
+        return [f for f in parent.iterdir() if f.is_dir() and (f / MEETING_FILE).is_file()]
+    except OSError:
+        return []
 
 
 def _free_folder(parent: Path, name: str, keep: Path | None = None) -> Path:
@@ -441,6 +695,15 @@ def _link(session_dir: Path, folder: Path, title: str, own_folder: bool | None =
         {"folder": str(folder), "title": title}, ensure_ascii=False) + "\n")
 
 
+def _label(session_dir: Path, title: str, pid: str | None) -> None:
+    """A meeting without a folder: its title and (if any) its project, in Steno only."""
+    data: dict = {"title": title}
+    if pid:
+        data["project"] = pid
+    atomic_write_text(Path(session_dir) / LINK_NAME,
+                      json.dumps(data, ensure_ascii=False) + "\n")
+
+
 #: Files Steno writes into a meeting folder; a folder that already has its own cannot be used.
 STENO_FILES = ("transcript.md", *COPIED)
 _DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}(?: \d{2}\.\d{2})?\s+")
@@ -464,12 +727,20 @@ def _blocking_files(folder: Path) -> list[str]:
     return [n for n in STENO_FILES if (folder / n).exists()]
 
 
+def _places(project: Project) -> list[tuple[str, MeetingType | None]]:
+    out: list[tuple[str, MeetingType | None]] = []
+    if project.steno_dir is not None and project.steno_dir.is_dir():
+        out.append((_key(project.steno_dir), None))
+    out += [(_key(project.type_dir(t)), t) for t in project.types]
+    return out
+
+
 def check_existing_folder(project: Project, folder: str | Path
                           ) -> tuple[MeetingType | None, str, Path]:
-    """Can a new meeting of ``project`` be recorded into this existing folder (the user's own
-    meeting folder with agenda and notes)? Returns ``(type, title, folder)``.
+    """Can a meeting of ``project`` go into this existing folder (the user's own meeting
+    folder with agenda and notes)? Returns ``(subfolder, title, folder)``.
 
-    The folder must lie directly in ``Steno/`` or in one of the project's subfolders (that is
+    The folder must lie directly in the folder of one of the project's subfolders (that is
     where the app finds meetings), must not be a meeting already and must not have its own
     ``transcript.md``/``summary.md``/``todo.md`` (Steno would overwrite them). The title is the
     folder name without its leading date."""
@@ -478,13 +749,12 @@ def check_existing_folder(project: Project, folder: str | Path
         raise ProjectError(f"folder not found: {f}")
     f = f.resolve()
     parent = _key(f.parent)
-    places: list[tuple[str, MeetingType | None]] = [(_key(project.steno_dir), None)]
-    places += [(_key(project.type_dir(t)), t) for t in project.types]
+    places = _places(project)
     if any(key == _key(f) for key, _t in places):
         raise ProjectError(f"{f.name} is a subfolder itself; pick a meeting folder inside it")
     kind = next((t for key, t in places if key == parent), "none")
     if kind == "none":
-        where = ", ".join(f"{t.name} ({t.folder})" for t in project.types) or "none yet"
+        where = ", ".join(t.name for t in project.types) or "none yet"
         raise ProjectError(
             f"Pick a meeting folder that lies directly in one of {project.name}'s subfolders "
             f"(subfolders: {where}). Add the subfolder first if it is missing.")
@@ -498,21 +768,46 @@ def check_existing_folder(project: Project, folder: str | Path
     return (kind if isinstance(kind, MeetingType) else None), title, f
 
 
+def locate_existing_folder(folder: str | Path
+                           ) -> tuple[Project, MeetingType | None, str, Path]:
+    """``check_existing_folder`` for whichever project has a subfolder the folder lies in."""
+    f = Path(folder)
+    if not f.is_dir():
+        raise ProjectError(f"folder not found: {f}")
+    parent = _key(f.resolve().parent)
+    for p in list_projects():
+        if any(key in (parent, _key(f)) for key, _t in _places(p)):
+            return (p, *check_existing_folder(p, f))
+    raise ProjectError("Pick a meeting folder that lies directly in one of your subfolders' "
+                       "folders. Add the subfolder first if it is missing.")
+
+
 def create_meeting(project: Project, session_dir: Path, title: str | None = None,
                    mtype: str | None = None, folder: str | Path | None = None) -> Meeting:
-    """Give a session its meeting folder. ``folder``: record into that existing folder (see
-    ``check_existing_folder``; its type follows from where it lies). Otherwise a folder
-    ``YYYY-MM-DD title`` in the type's folder is used: an existing one of that name that is
-    not a meeting yet (made by hand for the agenda) is taken as it is, else a new one."""
+    """File a new session under a project.
+
+    ``folder``: record into that existing folder (see ``check_existing_folder``). ``mtype``: a
+    folder ``YYYY-MM-DD title`` in the subfolder's folder (an existing one of that name that is
+    not a meeting yet, made by hand for the agenda, is taken as it is). Neither: the meeting
+    stays in Steno's storage, no files are written. A subfolder whose folder is missing falls
+    back to Steno's storage too (the folder field of the result is None then)."""
+    title = clean_title(title) if title else None
     with _lock:
         if folder is not None:
             _kind, own_title, target = check_existing_folder(project, folder)
-            title = clean_title(title) if title else own_title
-            ensure_steno_dir(project)
+            title = title or own_title
             own = True
         else:
-            title = clean_title(title)
-            parent = _parent_dir(project, project.find_type(mtype))
+            title = title or DEFAULT_TITLE
+            kind = project.find_type(mtype)
+            try:
+                parent = _type_parent(project, kind) if kind is not None else None
+            except ProjectError:
+                log.warning("Subfolder %s of %s is missing: kept in Steno", mtype, project.name)
+                parent = None
+            if parent is None:
+                _label(session_dir, title, project.id)
+                return Meeting(session_dir.name, title, None)
             name = f"{_prefix(session_dir.name)} {title}"
             target = parent / name
             own = target.is_dir() and not _claimed(target) and not _blocking_files(target)
@@ -525,32 +820,44 @@ def create_meeting(project: Project, session_dir: Path, title: str | None = None
     return Meeting(session_dir.name, title, target)
 
 
+def _label_meetings(pid: str) -> list[Meeting]:
+    """Meetings of a project that have no folder (kept in Steno's storage)."""
+    root = paths.sessions_dir()
+    out = []
+    for d in sorted(root.iterdir()) if root.is_dir() else []:
+        if d.is_dir() and _label_project(d) == pid and meeting_folder(d) is None:
+            out.append(Meeting(d.name, meeting_title(d), None))
+    return out
+
+
 def list_meetings(project: Project) -> list[Meeting]:
-    """Meetings of a project (``Steno/`` and every type folder), oldest first."""
+    """Meetings of a project (every subfolder, and those without a folder), oldest first."""
     out = []
     seen: set[str] = set()
-    for parent in [project.steno_dir, *(project.type_dir(t) for t in project.types)]:
+    parents = [project.steno_dir, *(project.type_dir(t) for t in project.types)]
+    for parent in parents:
         for f in _meeting_dirs(parent):
             meta = _read_json(f / MEETING_FILE)
             sid = str(meta.get("session") or "")
             if sid and sid not in seen:
                 seen.add(sid)
                 out.append(Meeting(sid, str(meta.get("title") or ""), f))
+    out += [m for m in _label_meetings(project.id) if m.session not in seen]
     return sorted(out, key=lambda m: m.session)
 
 
 def inbox_sessions() -> list[transcript.SessionInfo]:
-    """Sessions without a (still existing) meeting folder, oldest first."""
-    return [s for s in transcript.list_sessions() if meeting_folder(s.dir) is None]
+    """Sessions that belong to no (still registered) project, oldest first."""
+    plist = list_projects()
+    return [s for s in transcript.list_sessions() if project_of(s.dir, plist) is None]
 
 
 def rename_meeting(session_dir: Path, title: str) -> Meeting:
     title = clean_title(title)
     folder = meeting_folder(session_dir)
-    if folder is None:  # inbox: only the name is kept
-        atomic_write_text(Path(session_dir) / LINK_NAME,
-                          json.dumps({"title": title}, ensure_ascii=False) + "\n")
-        return Meeting(Path(session_dir).name, title, Path(session_dir))
+    if folder is None:  # kept in Steno: only the name changes
+        _label(Path(session_dir), title, _label_project(session_dir))
+        return Meeting(Path(session_dir).name, title, None)
     with _lock:
         if _own_folder(folder):  # the user's folder: only the title in Steno changes
             target = folder
@@ -567,14 +874,39 @@ def rename_meeting(session_dir: Path, title: str) -> Meeting:
     return Meeting(Path(session_dir).name, title, target)
 
 
+def _detach(session_dir: Path) -> Project | None:
+    """Take a meeting out of its folder (Steno's files go, the user's stay). Returns the
+    project whose folder it was in. The session link is rewritten by the caller."""
+    folder = meeting_folder(session_dir)
+    if folder is None:
+        return None
+    place = _place(folder)
+    if place is not None:
+        _remove_steno_files(session_dir, folder)  # the folder goes only when empty then
+    else:
+        log.warning("Meeting folder %s is outside its project: kept without its marker",
+                    folder)
+        _set_hidden(folder / MEETING_FILE, False)
+        (folder / MEETING_FILE).unlink(missing_ok=True)
+    return place[0] if place else None
+
+
 def move_meeting(session_dir: Path, project: Project, mtype: str | None = None) -> Meeting:
+    """File a meeting under ``project``: into a subfolder's folder (``mtype``), or without
+    one (it is then kept in Steno only; Steno's files leave its old folder)."""
     session_dir = Path(session_dir)
     old_project = project_of(session_dir)
     folder = meeting_folder(session_dir)
     title = meeting_title(session_dir)
     kind = project.find_type(mtype)
     with _lock:
-        parent = _parent_dir(project, kind)
+        if kind is None:
+            old = _detach(session_dir)
+            _label(session_dir, title, project.id)
+            if old is not None:
+                write_index(old)
+            return Meeting(session_dir.name, title, None)
+        parent = _type_parent(project, kind)
         if folder is not None and _key(folder.parent) == _key(parent):
             return Meeting(session_dir.name, title, folder)  # already there
         own = folder is not None and _own_folder(folder)
@@ -592,6 +924,26 @@ def move_meeting(session_dir: Path, project: Project, mtype: str | None = None) 
     return Meeting(session_dir.name, title, target)
 
 
+def save_to_folder(session_dir: Path, folder: str | Path) -> tuple[Project, Meeting]:
+    """"Save to…" an existing folder: the user's own meeting folder inside one of the
+    subfolders of any project. The meeting joins that project; its files are written there
+    (the folder keeps its name)."""
+    session_dir = Path(session_dir)
+    project, _kind, own_title, target = locate_existing_folder(folder)
+    title = meeting_title(session_dir)
+    if title == DEFAULT_TITLE:  # an untitled meeting is named after the user's folder
+        title = own_title
+    old_project = project_of(session_dir)
+    with _lock:
+        _detach(session_dir)
+        _link(session_dir, target, title, own_folder=True)
+    sync(session_dir)
+    write_index(project)
+    if old_project is not None and old_project.id != project.id:
+        write_index(old_project)
+    return project, Meeting(session_dir.name, title, target)
+
+
 def move_to_inbox(session_dir: Path) -> Meeting:
     """Take a meeting out of its project: it becomes an inbox session again.
 
@@ -601,39 +953,24 @@ def move_to_inbox(session_dir: Path) -> Meeting:
     hand-edited summary, the user's own notes) keep the folder: it then just stops being a
     meeting (its marker goes) and stays where it is."""
     session_dir = Path(session_dir)
-    folder = meeting_folder(session_dir)
     title = meeting_title(session_dir)
-    if folder is None:
-        return Meeting(session_dir.name, title, session_dir)  # already in the inbox
-    place = _place(folder)
     with _lock:
-        if place is not None:
-            _remove_steno_files(session_dir, folder)  # the folder goes only when empty then
-        else:
-            log.warning("Meeting folder %s is outside its project: kept without its marker",
-                        folder)
-            _set_hidden(folder / MEETING_FILE, False)
-            (folder / MEETING_FILE).unlink(missing_ok=True)
+        old = _detach(session_dir)
         # last: until now the session still pointed at the folder (a failure above keeps it a
-        # meeting); a link to a folder that is gone already reads as inbox
-        atomic_write_text(session_dir / LINK_NAME,
-                          json.dumps({"title": title}, ensure_ascii=False) + "\n")
-    if place is not None:
-        write_index(place[0])
-    return Meeting(session_dir.name, title, session_dir)
-
-
-_SESSION_REF = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_PROJECT_REF = re.compile(r"[0-9a-f]{12}")
+        # meeting); a link to a folder that is gone already reads as Steno-only
+        _label(session_dir, title, None)
+    if old is not None:
+        write_index(old)
+    return Meeting(session_dir.name, title, None)
 
 
 def folder_to_open(kind: str, ref: str | None = None, mtype: str | None = None) -> Path | None:
     """The folder "Open in File Explorer" shows, found from ids and names only (never a path
-    from the page). ``kind``: ``meeting`` (``ref`` = session id: its meeting folder, or for an
-    inbox session its session folder), ``project`` (``ref`` = project id), ``type`` (a project's
-    subfolder: ``ref`` = project id, ``mtype`` = its name; if the folder is not there yet the
-    nearest existing parent inside the project), ``inbox`` (where inbox sessions live).
-    None when nothing suitable exists."""
+    from the page). ``kind``: ``meeting`` (``ref`` = session id: its meeting folder, or for a
+    meeting kept in Steno its session folder), ``project`` (``ref`` = project id: its linked
+    folder), ``type`` (a subfolder: ``ref`` = project id, ``mtype`` = its name; an older one
+    that is not there yet gives the nearest existing parent inside the project), ``inbox``
+    (where Steno's sessions live). None when nothing suitable exists."""
     if kind == "inbox":
         return paths.sessions_dir()
     if not isinstance(ref, str):
@@ -653,7 +990,12 @@ def folder_to_open(kind: str, ref: str | None = None, mtype: str | None = None) 
     except ProjectError:
         return None
     if kind_ is None:
-        return project.path
+        return project.path if project.path is not None and project.path.is_dir() else None
+    if Path(kind_.folder).is_absolute():
+        folder = Path(kind_.folder)
+        return folder if folder.is_dir() else None
+    if project.path is None:
+        return None
     root = Path(os.path.abspath(project.path))
     folder = Path(os.path.abspath(project.type_dir(kind_)))
     if root not in folder.parents:  # a folder that does not stay inside the project
@@ -717,13 +1059,23 @@ def delete_meeting(session_dir: Path) -> None:
 
 
 def type_meetings(project: Project, mtype: MeetingType | None) -> list[Meeting]:
-    """The meetings in one subfolder (``None``: the meetings without a type, in ``Steno/``)."""
-    parent = project.steno_dir if mtype is None else project.type_dir(mtype)
-    out = []
-    for f in _meeting_dirs(parent):
-        sid = str(_read_json(f / MEETING_FILE).get("session") or "")
-        out.append(Meeting(sid, meeting_title_of(f), f))
+    """The meetings in one subfolder (``None``: those without a subfolder: kept in Steno, or
+    in an older project's ``Steno/`` folder)."""
+    if mtype is None:
+        out = [Meeting(str(_read_json(f / MEETING_FILE).get("session") or ""),
+                       meeting_title_of(f), f) for f in _meeting_dirs(project.steno_dir)]
+        out += _label_meetings(project.id)
+    else:
+        out = [Meeting(str(_read_json(f / MEETING_FILE).get("session") or ""),
+                       meeting_title_of(f), f) for f in _meeting_dirs(project.type_dir(mtype))]
     return sorted(out, key=lambda m: m.session)
+
+
+def all_meetings(project: Project) -> list[Meeting]:
+    """``type_meetings`` of every subfolder and of none, oldest first."""
+    found = [*type_meetings(project, None),
+             *(m for t in project.types for m in type_meetings(project, t))]
+    return sorted(found, key=lambda m: m.session)
 
 
 def meeting_title_of(folder: Path) -> str:
@@ -733,6 +1085,10 @@ def meeting_title_of(folder: Path) -> str:
 def _delete_folder_meeting(m: Meeting) -> None:
     """Delete a meeting found by its folder (its session may already be gone)."""
     d = _session_dir_of(m.session)
+    if m.folder is None:
+        if d is not None:
+            delete_meeting(d)
+        return
     linked = meeting_folder(d) if d is not None else None
     if linked is not None and _key(linked) == _key(m.folder):
         delete_meeting(d)
@@ -753,47 +1109,61 @@ def _prune_empty(folder: Path, root: Path) -> None:
         folder = folder.parent
 
 
-def delete_type(pid: str, name: str) -> int:
-    """Delete a subfolder: its meetings (as ``delete_meeting``), the subfolder in Steno, and
-    its folder on disk only while it is empty (the user's own files keep it). Returns how many
-    meetings were deleted."""
+def delete_type(pid: str, name: str, *, meetings: bool = True) -> int:
+    """Remove a subfolder from Steno. ``meetings``: also delete its meetings (as
+    ``delete_meeting``); otherwise they stay in the project, kept in Steno only, and their
+    files stay in the folder (only Steno's marker goes). The folder itself is never deleted
+    (an older one inside the project folder only while empty). Returns how many meetings were
+    deleted."""
     project = get_project(pid)
     kind = project.find_type(name)
     if kind is None:
         raise ProjectError("no such subfolder")
-    meetings = type_meetings(project, kind)
-    for m in meetings:
-        _delete_folder_meeting(m)
-    set_types(pid, [{"name": t.name, "folder": t.folder} for t in project.types if t != kind])
-    _prune_empty(project.type_dir(kind), project.path)
-    return len(meetings)
+    found = type_meetings(project, kind)
+    count = 0
+    for m in found:
+        if meetings:
+            _delete_folder_meeting(m)
+            count += 1
+            continue
+        d = _session_dir_of(m.session)
+        linked = meeting_folder(d) if d is not None else None
+        if d is not None and linked is not None and _key(linked) == _key(m.folder):
+            with _lock:
+                title = meeting_title(d)
+                _set_hidden(m.folder / MEETING_FILE, False)
+                (m.folder / MEETING_FILE).unlink(missing_ok=True)
+                _label(d, title, pid)
+    project = _update_entry(pid, _types_entry(
+        project, [t for t in project.types if t != kind]))
+    if meetings and not Path(kind.folder).is_absolute() and project.path is not None:
+        _prune_empty(project.type_dir(kind), project.path)
+    write_index(project)
+    return count
 
 
 def delete_project(pid: str, *, meetings: bool) -> int:
     """Remove a project from Steno. ``meetings``: also delete all its meetings (as
-    ``delete_meeting``), then Steno's own files in ``Steno/`` and the subfolder folders that
-    are left empty. The project folder and every file Steno did not write stay. Returns how
-    many meetings were deleted."""
+    ``delete_meeting``); otherwise they go to the inbox (files stay where they are). An older
+    project's ``Steno/`` folder loses Steno's own files once it holds no meetings. Folders and
+    every file Steno did not write stay. Returns how many meetings were deleted."""
     project = get_project(pid)
     count = 0
     if meetings:
-        found = [*type_meetings(project, None), *(m for t in project.types
-                                                  for m in type_meetings(project, t))]
+        found = all_meetings(project)
         for m in found:
             _delete_folder_meeting(m)
         count = len(found)
-        d = project.steno_dir
-        (d / "index.md").unlink(missing_ok=True)
-        _remove_if_ours(d / "CLAUDE.md", CLAUDE_MD)
-        _remove_if_ours(d / ".gitignore", _STENO_GITIGNORE)
-        _prune_empty(d, project.path)
-        for t in project.types:
-            _prune_empty(project.type_dir(t), project.path)
+        if project.path is not None:
+            for t in project.types:
+                if not Path(t.folder).is_absolute():
+                    _prune_empty(project.type_dir(t), project.path)
+    _clean_steno_dir(project)
     remove_project(pid)
     return count
 
 
-# --------------------------------------------------------------------------- files
+# --------------------------------------------------------------------------- readable files
 
 
 def render_transcript(session_dir: Path, title: str, *, recording: bool = False) -> str:
@@ -855,11 +1225,17 @@ def sync(session_dir: Path, *, recording: bool = False, docs: bool = True) -> Pa
 
 
 def write_index(project: Project, recording: str | None = None) -> None:
-    """``Steno/index.md``: newest first; ``recording`` is the session being recorded."""
-    lines = [f"# Meetings in {project.name}", "",
+    """``Steno/index.md`` of an older project that still has that folder: newest first;
+    ``recording`` is the session being recorded. New projects write no index."""
+    d = project.steno_dir
+    if d is None or not d.is_dir():
+        return
+    lines = [f"{_INDEX_HEAD}{project.name}", "",
              "Newest first; paths from the project folder. Files: transcript.md always; "
              "summary.md / todo.md when made.", ""]
     for m in reversed(list_meetings(project)):
+        if m.folder is None:
+            continue
         files = ["transcript.md"] + [n for n in COPIED if (m.folder / n).is_file()]
         mark = " — **recording**" if m.session == recording else ""
         place = _place(m.folder)
@@ -867,9 +1243,9 @@ def write_index(project: Project, recording: str | None = None) -> None:
         try:
             rel = m.folder.relative_to(project.path).as_posix()
         except ValueError:
-            rel = m.folder.name
+            rel = str(m.folder)
         lines.append(f"- `{rel}/`{kind}{mark}: {', '.join(files)}")
     try:
-        atomic_write_text(ensure_steno_dir(project) / "index.md", "\n".join(lines) + "\n")
+        atomic_write_text(d / "index.md", "\n".join(lines) + "\n")
     except OSError:
-        log.exception("Could not write %s", project.steno_dir / "index.md")
+        log.exception("Could not write %s", d / "index.md")

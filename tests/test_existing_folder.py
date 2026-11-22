@@ -17,8 +17,15 @@ __all__ = ["make_ui"]  # fixture re-export
 
 
 def _club(tmp_path):
-    p = projects.add_project(tmp_path, name="Club", create=True)
-    return projects.set_types(p.id, [{"name": "1-1"}, {"name": "Board"}])
+    """A project linked to a folder, with two subfolders that are existing folders."""
+    root = tmp_path / "Club"
+    root.mkdir()
+    p = projects.create_project("Club", root)
+    for name in ("1-1", "Board"):
+        folder = root / "Meetings" / name
+        folder.mkdir(parents=True)
+        p = projects.add_type(p.id, name, folder)
+    return p
 
 
 def _own_meeting_folder(p, name="2026-11-22 1-1 Alex"):
@@ -60,6 +67,7 @@ def test_an_existing_folder_must_be_a_meeting_folder_of_the_project(tmp_path):
         projects.check_existing_folder(p, tmp_path / "nope")
     with pytest.raises(projects.ProjectError, match="subfolder itself"):
         projects.check_existing_folder(p, p.path / "Meetings" / "1-1")
+    (p.path / "Steno").mkdir()  # an older project's Steno/ is a place for meetings too
     with pytest.raises(projects.ProjectError, match="subfolder itself"):
         projects.check_existing_folder(p, p.path / "Steno")
     elsewhere = p.path / "Notes" / "2026-11-22 Idea"
@@ -134,7 +142,8 @@ def test_delete_a_project_with_its_meetings_leaves_the_project_folder(tmp_path):
     assert p.path.is_dir() and (p.path / "README.md").is_file()
     assert sorted(f.name for f in own.iterdir()) == ["01 Agenda.md", "02 Notes.md"]
     assert not (p.path / "Steno").exists()  # only Steno's own files were in it
-    assert not (p.path / "Meetings" / "Board").exists()  # left empty: pruned
+    assert (p.path / "Meetings" / "Board").is_dir()  # a picked folder is never deleted
+    assert list((p.path / "Meetings" / "Board").iterdir()) == []  # only Steno's files went
 
 
 def test_forget_a_project_without_meetings_deletes_nothing(tmp_path):

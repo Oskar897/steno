@@ -514,9 +514,12 @@ def test_only_a_failing_title_is_not_an_error_either(make_ui):
 
 
 def project_meeting(tmp_path, title=None):
-    p = projects.add_project(tmp_path, name="Proj", create=True)
+    p = projects.create_project("Proj")
+    folder = tmp_path / "meetings"
+    folder.mkdir()
+    p = projects.add_type(p.id, "Weekly", folder)
     writer = make_ui_session("2026-01-01T10:00:00", LINES)
-    return writer.dir, projects.create_meeting(p, writer.dir, title)
+    return writer.dir, projects.create_meeting(p, writer.dir, title, "Weekly")
 
 
 def title_runner():

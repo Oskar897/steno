@@ -168,22 +168,24 @@ def test_explicit_session_and_finished_state(capsys):
 
 def test_project_scopes_latest_and_header_names_project_type_and_title(tmp_path, capsys,
                                                                        monkeypatch):
-    a = projects.add_project(tmp_path, name="Alpha", create=True)
-    b = projects.add_project(tmp_path, name="Beta", create=True)
-    a.path.joinpath("Boards").mkdir()
-    projects.set_types(a.id, [{"name": "Board", "folder": "Boards"}])
-    a = projects.get_project(a.id)
+    alpha_dir, beta_dir = tmp_path / "Alpha", tmp_path / "Beta"
+    boards = alpha_dir / "Boards"
+    boards.mkdir(parents=True)
+    beta_dir.mkdir()
+    a = projects.create_project("Alpha", alpha_dir)
+    a = projects.add_type(a.id, "Board", boards)
+    b = projects.create_project("Beta", beta_dir)
     wa = make(("alpha text",), at=datetime(2026, 1, 1, 10, 0, 0))
     projects.create_meeting(a, wa.dir, "Kickoff", mtype="Board")
     wb = make(("beta text",), at=datetime(2026, 1, 2, 10, 0, 0))  # globally the latest
-    projects.create_meeting(b, wb.dir, "Retro")
+    projects.create_meeting(b, wb.dir, "Retro")  # no subfolder: kept in Steno only
 
     monkeypatch.chdir(a.path)
     _, out, _ = run(capsys, "--since", "start")
     assert "alpha text" in out and "beta text" not in out
     assert "# Meeting: Kickoff" in out and "project: Alpha | type: Board" in out
 
-    monkeypatch.chdir(a.steno_dir)  # inside Steno/ counts as the project too
+    monkeypatch.chdir(boards)  # inside a subfolder's folder counts as the project too
     assert "alpha text" in run(capsys, "--since", "start")[1]
 
     monkeypatch.chdir(tmp_path)  # outside any project: globally latest
@@ -194,6 +196,23 @@ def test_project_scopes_latest_and_header_names_project_type_and_title(tmp_path,
     assert code == 1 and "not inside a Steno project" in err
     wa.close()
     wb.close()
+
+
+def test_a_subfolder_outside_the_project_folder_scopes_to_the_project(tmp_path, capsys,
+                                                                       monkeypatch):
+    drive = tmp_path / "drive"  # e.g. a Google Drive folder: not inside any project folder
+    drive.mkdir()
+    p = projects.create_project("Club")  # a label without a linked folder
+    p = projects.add_type(p.id, "Board", drive)
+    w = make(("drive text",), at=datetime(2026, 1, 1, 10, 0, 0))
+    projects.create_meeting(p, w.dir, "Lobby", mtype="Board")
+    other = make(("other text",), at=datetime(2026, 1, 2, 10, 0, 0))  # globally the latest
+
+    monkeypatch.chdir(drive)
+    _, out, _ = run(capsys, "--since", "start")
+    assert "drive text" in out and "other text" not in out and "project: Club" in out
+    w.close()
+    other.close()
 
 
 def test_project_without_meetings_does_not_fall_back_to_another_project(tmp_path, capsys,
@@ -207,20 +226,44 @@ def test_project_without_meetings_does_not_fall_back_to_another_project(tmp_path
 
 
 def test_finished_meeting_points_to_its_summary(tmp_path, capsys, monkeypatch):
-    p = projects.add_project(tmp_path, name="Proj", create=True)
+    root = tmp_path / "Proj"
+    meetings = root / "Meetings"
+    meetings.mkdir(parents=True)
+    p = projects.create_project("Proj", root)
+    p = projects.add_type(p.id, "Weekly", meetings)
     w = make()
     w.close()
-    m = projects.create_meeting(p, w.dir, "Planning")
+    m = projects.create_meeting(p, w.dir, "Planning", mtype="Weekly")
     (w.dir / "summary.md").write_text("# s\n", encoding="utf-8")
     projects.sync(w.dir)
     monkeypatch.chdir(p.path)
     _, out, _ = run(capsys, "--since", "start")
-    assert "has summary.md in Steno/" + m.folder.name in out
+    assert f"has summary.md in Meetings/{m.folder.name}/" in out
     _, out2, _ = run(capsys, "--since", token_of(out))
     assert "has summary.md" not in out2  # only on the first delivery
 
 
-def test_claude_md_tells_agents_about_the_token_flow():
-    text = projects.CLAUDE_MD
-    assert text.startswith(projects._CLAUDE_MARK)
-    assert "steno new --since start" in text and "next:" in text and "Corrections" in text
+def test_a_meeting_kept_in_steno_has_no_folder_to_point_to(tmp_path, capsys, monkeypatch):
+    p = projects.create_project("Proj", tmp_path)
+    w = make()
+    w.close()
+    projects.create_meeting(p, w.dir, "Planning")  # no subfolder: no files, no summary hint
+    (w.dir / "summary.md").write_text("# s\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _, out, _ = run(capsys, "--since", "start")
+    assert "project: Proj" in out and "has summary.md" not in out
+
+
+def test_a_folder_meeting_of_a_project_without_a_folder_gets_its_hint(tmp_path, capsys,
+                                                                       monkeypatch):
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    p = projects.create_project("Club")  # a label only: no linked folder
+    p = projects.add_type(p.id, "Board", drive)
+    w = make()
+    w.close()
+    m = projects.create_meeting(p, w.dir, "Lobby", mtype="Board")
+    (w.dir / "summary.md").write_text("# s\n", encoding="utf-8")
+    projects.sync(w.dir)
+    code, out, _ = run(capsys, "--since", "start", "--session", w.session_id)
+    assert code == 0 and f"has summary.md in {m.folder.name}/" in out

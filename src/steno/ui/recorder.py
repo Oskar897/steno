@@ -134,7 +134,8 @@ class Recorder:
         self.segments = 0
         self.paused = False
         self.project: projects.Project | None = None
-        self.mtype: str | None = None  # meeting type within the project
+        self.mtype: str | None = None  # subfolder within the project
+        self.notice: str | None = None  # e.g. the subfolder's folder was missing
         # Name the meeting from its transcript after Stop (only while the user typed no title).
         self.auto_title = False
         self._title: str | None = None
@@ -174,6 +175,7 @@ class Recorder:
                 "type": self.mtype,
                 "auto_title": self.auto_title,
                 "error": self.error,
+                "notice": self.notice,
                 "session": self.session_id,
                 "keep_audio": self.keep_audio,
                 "sources": list(self.sources),
@@ -209,6 +211,7 @@ class Recorder:
             self.paused = False
             self.project = project
             self.mtype = mtype
+            self.notice = None
             self.auto_title = auto_title and not title  # a typed title is never replaced
             self._title = title
             self._folder = folder  # an existing meeting folder to record into
@@ -253,6 +256,9 @@ class Recorder:
                     log.warning("Cannot record into %s; making a new meeting folder",
                                 self._folder, exc_info=True)
                     projects.create_meeting(self.project, session_dir, self._title, self.mtype)
+                if self.mtype and projects.meeting_folder(session_dir) is None:
+                    self.notice = (f"The folder of {self.mtype} is missing, so this meeting is "
+                                   "kept in Steno. Use Save to… once the folder is back.")
             except Exception:  # recording goes on; the session stays in the inbox
                 log.exception("Could not create the meeting folder")
         with self._lock:

@@ -419,31 +419,98 @@ class UiApp:
     # -- projects -----------------------------------------------------------------
 
     def projects_list(self) -> dict[str, Any]:
-        out = []
-        for p in projects.list_projects():
-            meetings = [m for m in projects.list_meetings(p) if not _archived(m.session)]
-            out.append({"id": p.id, "name": p.name, "path": str(p.path),
-                        "meetings": len(meetings), "types": _types(p),
-                        "last_at": _started_at(meetings[-1].session) if meetings else None})
+        out = [_project_info(p) for p in projects.list_projects()]
         inbox = [s for s in projects.inbox_sessions() if not projects.is_archived(s.dir)]
         return {"projects": out, "inbox": len(inbox)}
 
     def project_add(self, body: dict[str, Any]) -> dict[str, Any]:
+        """A new project: ``{"name", "folder"?}`` (a label, optionally linked to a folder).
+        Older form: ``{"path", "create"?, "name"?}`` registers a folder as a project."""
         path = body.get("path")
-        if not isinstance(path, str) or not path.strip() or len(path) > MAX_PATH_LEN:
-            raise ApiError(400, "path must be a folder path")
-        name = body.get("name")
-        if name is not None:
-            name = clean_name(name, "name")
         try:
-            p = projects.add_project(path.strip(), name=name, create=bool(body.get("create")))
+            if path is None:
+                name = clean_name(body.get("name"), "name")
+                folder = _opt_path(body.get("folder"))
+                p = projects.create_project(name, folder)
+            else:
+                if not isinstance(path, str) or not path.strip() or len(path) > MAX_PATH_LEN:
+                    raise ApiError(400, "path must be a folder path")
+                name = body.get("name")
+                if name is not None:
+                    name = clean_name(name, "name")
+                p = projects.add_project(path.strip(), name=name,
+                                         create=bool(body.get("create")))
         except projects.ProjectError as exc:
             raise ApiError(400, str(exc)) from exc
         except OSError as exc:
             raise ApiError(400, f"cannot use that folder: {exc}") from exc
         self.bus.publish("projects", {})
-        return {"project": {"id": p.id, "name": p.name, "path": str(p.path), "meetings": 0,
-                            "types": _types(p), "last_at": None}}
+        return {"project": _project_info(p)}
+
+    def project_update(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Rename, link or unlink a folder, archive or restore: ``{"name"?, "folder"?
+        (a path, or null to unlink), "archived"?}``."""
+        self._project(pid)
+        archived = body.get("archived")
+        if archived is not None and not isinstance(archived, bool):
+            raise ApiError(400, "archived must be true or false")
+        try:
+            if "name" in body:
+                projects.rename_project(pid, clean_name(body.get("name"), "name"))
+            if "folder" in body:
+                projects.set_project_folder(pid, _opt_path(body.get("folder")))
+            if archived is not None:
+                projects.set_project_archived(pid, archived)
+            p = projects.get_project(pid)
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(409, f"cannot write the project: {exc}") from exc
+        self.bus.publish("projects", {})
+        return {"project": _project_info(p)}
+
+    def _subfolder_call(self, fn: Callable[[], projects.Project]) -> dict[str, Any]:
+        try:
+            p = fn()
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(409, f"cannot use that folder: {exc}") from exc
+        self.bus.publish("projects", {})
+        return {"project": _project_info(p)}
+
+    def subfolder_add(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """``{"folder", "name"?, "create"?}``: an existing folder anywhere (named after it
+        unless ``name``), or with ``create`` a new folder ``name`` made inside ``folder``."""
+        self._project(pid)
+        folder = _opt_path(body.get("folder"))
+        if folder is None:
+            raise ApiError(400, "pick a folder")
+        create = body.get("create", False)
+        if not isinstance(create, bool):
+            raise ApiError(400, "create must be true or false")
+        name = body.get("name")
+        name = clean_name(name, "name") if isinstance(name, str) and name.strip() else None
+        if create and name is None:
+            raise ApiError(400, "give the new folder a name")
+        return self._subfolder_call(lambda: projects.add_type(pid, name, folder, create=create))
+
+    def subfolder_rename(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        project = self._project(pid)
+        old = self._type(project, body.get("name"))
+        if old is None:
+            raise ApiError(400, "name must be the subfolder's name")
+        new = clean_name(body.get("new_name"), "new_name")
+        return self._subfolder_call(lambda: projects.rename_type(pid, old, new))
+
+    def subfolder_folder(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Change folder: point a subfolder at another existing folder."""
+        project = self._project(pid)
+        name = self._type(project, body.get("name"))
+        folder = _opt_path(body.get("folder"))
+        if name is None or folder is None:
+            raise ApiError(400, "give the subfolder's name and a folder")
+        return self._subfolder_call(lambda: projects.set_type_folder(pid, name, folder))
 
     def project_types(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
         """Replace the meeting types: ``{"types": [{"name", "folder"}]}``."""
@@ -508,9 +575,7 @@ class UiApp:
         if not isinstance(meetings, bool):
             raise ApiError(400, "meetings must be true or false")
         if meetings:
-            found = [*projects.type_meetings(project, None),
-                     *(m for t in project.types for m in projects.type_meetings(project, t))]
-            self._check_not_busy({m.session for m in found})
+            self._check_not_busy({m.session for m in projects.all_meetings(project)})
         try:
             count = projects.delete_project(pid, meetings=meetings)
         except (projects.ProjectError, OSError) as exc:
@@ -520,11 +585,15 @@ class UiApp:
         return {"ok": True, "deleted": count}
 
     def type_delete(self, pid: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Delete a subfolder and its meetings (own files and their folders stay)."""
+        """Remove a subfolder from Steno; ``meetings`` (default true): also delete its
+        meetings, else they stay in the project (kept in Steno). Folders always stay."""
         project = self._project(pid)
         name = body.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ApiError(400, "name must be the subfolder's name")
+        meetings = body.get("meetings", True)
+        if not isinstance(meetings, bool):
+            raise ApiError(400, "meetings must be true or false")
         try:
             kind = project.find_type(name)
         except projects.ProjectError as exc:
@@ -533,7 +602,7 @@ class UiApp:
             raise ApiError(404, "no such subfolder")
         self._check_not_busy({m.session for m in projects.type_meetings(project, kind)})
         try:
-            count = projects.delete_type(pid, kind.name)
+            count = projects.delete_type(pid, kind.name, meetings=meetings)
         except (projects.ProjectError, OSError) as exc:
             raise ApiError(409, f"cannot delete the subfolder: {exc}") from exc
         self.bus.publish("projects", {})
@@ -547,12 +616,13 @@ class UiApp:
                      for s in projects.inbox_sessions()]
         else:
             project = self._project(pid)
-            dirs = {project.type_dir(t): t.name for t in project.types}
+            dirs = {projects._key(project.type_dir(t)): t.name for t in project.types}
             items = []
             for m in projects.list_meetings(project):
                 d = transcript.resolve_session(m.session)
                 if d is not None:
-                    items.append((d, m.title, str(m.folder), dirs.get(m.folder.parent)))
+                    mtype = dirs.get(projects._key(m.folder.parent)) if m.folder else None
+                    items.append((d, m.title, str(m.folder or ""), mtype))
         out = []
         for d, title, folder, mtype in items:
             info = transcript.load_session_info(d)
@@ -575,7 +645,7 @@ class UiApp:
         except OSError as exc:
             raise ApiError(409, f"cannot rename the meeting folder: {exc}") from exc
         self.bus.publish("projects", {"session": session_id})
-        return {"title": m.title, "folder": str(m.folder)}
+        return {"title": m.title, "folder": str(m.folder or "")}
 
     def meeting_move(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         d = self._session_dir(session_id)
@@ -594,11 +664,32 @@ class UiApp:
         mtype = self._type(project, body.get("type"))
         try:
             m = projects.move_meeting(d, project, mtype)
+        except projects.ProjectError as exc:
+            raise ApiError(409, str(exc)) from exc
         except OSError as exc:
             raise ApiError(409, f"cannot move the meeting folder: {exc}") from exc
         self.bus.publish("projects", {"session": session_id})
-        return {"title": m.title, "folder": str(m.folder), "project": project.id,
+        return {"title": m.title, "folder": str(m.folder or ""), "project": project.id,
                 "type": mtype}
+
+    def meeting_save(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Save to an existing folder (the user's meeting folder inside a subfolder of any
+        project): transcript, summary and to-do are written there."""
+        d = self._session_dir(session_id)
+        if session_id == self.recorder.active_session():
+            raise ApiError(409, "stop the recording first")
+        folder = _opt_path(body.get("folder"))
+        if folder is None:
+            raise ApiError(400, "pick a folder")
+        try:
+            project, m = projects.save_to_folder(d, folder)
+        except projects.ProjectError as exc:
+            raise ApiError(400, str(exc)) from exc
+        except OSError as exc:
+            raise ApiError(409, f"cannot write the meeting folder: {exc}") from exc
+        self.bus.publish("projects", {"session": session_id})
+        return {"title": m.title, "folder": str(m.folder), "project": project.id,
+                "type": projects.type_of(d)}
 
     def meeting_archive(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         d = self._session_dir(session_id)
@@ -692,6 +783,7 @@ class UiApp:
             "title": projects.meeting_title(d),
             "project": project.id if project is not None else None,
             "type": projects.type_of(d),
+            "folder": str(projects.meeting_folder(d) or ""),
             "started_at": info.started_at,
             "ended_at": info.ended_at,
             "model": info.model,
@@ -905,9 +997,29 @@ def _read_text(path: Path) -> str | None:
 
 
 def _types(p: projects.Project) -> list[dict[str, Any]]:
-    """Subfolders with how many meetings their folder holds (archived ones included)."""
-    return [{"name": t.name, "folder": t.folder, "meetings": len(projects.type_meetings(p, t))}
-            for t in p.types]
+    """Subfolders with their folder, whether it is there and how many meetings it holds
+    (archived ones included)."""
+    return [{"name": t.name, "folder": str(p.type_dir(t)),
+             "missing": not projects.type_available(p, t),
+             "meetings": len(projects.type_meetings(p, t))} for t in p.types]
+
+
+def _project_info(p: projects.Project) -> dict[str, Any]:
+    meetings = [m for m in projects.list_meetings(p) if not _archived(m.session)]
+    return {"id": p.id, "name": p.name, "path": str(p.path) if p.path is not None else "",
+            "path_missing": p.path is not None and not p.path.is_dir(),
+            "archived": p.archived, "meetings": len(meetings),
+            "all_meetings": len(projects.all_meetings(p)), "types": _types(p),
+            "last_at": _started_at(meetings[-1].session) if meetings else None}
+
+
+def _opt_path(value: Any) -> str | None:
+    """A folder path sent by the page (picked in the native dialog), or None."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str) or len(value) > MAX_PATH_LEN:
+        raise ApiError(400, "folder must be a folder path")
+    return value.strip()
 
 
 def _archived(session_id: str) -> bool:

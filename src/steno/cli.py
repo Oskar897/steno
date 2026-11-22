@@ -277,12 +277,14 @@ def _project_at(path: Path):
     from steno import projects
 
     here = os.path.normcase(str(path.resolve()))
-    best = None
+    best, best_len = None, -1
     for p in projects.list_projects():
-        root = os.path.normcase(str(p.path.resolve()))
-        if here == root or here.startswith(root.rstrip("\\/") + os.sep):
-            if best is None or len(str(p.path)) > len(str(best.path)):
-                best = p
+        roots = [p.type_dir(t) for t in p.types] + ([p.path] if p.path is not None else [])
+        for folder in roots:
+            root = os.path.normcase(str(folder.resolve()))
+            if (here == root or here.startswith(root.rstrip("\\/") + os.sep)) \
+                    and len(root) > best_len:
+                best, best_len = p, len(root)
     return best
 
 
@@ -365,7 +367,7 @@ def _summary_hint(session_dir: Path) -> str | None:
         return None
     project = projects.project_of(session_dir)
     where = folder.name
-    if project:
+    if project is not None and project.path is not None:
         try:
             where = folder.relative_to(project.path).as_posix()
         except ValueError:

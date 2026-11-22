@@ -161,17 +161,21 @@ function watchDay() {
 // ---------------------------------------------------------------- popover menu
 
 let openMenu = null;
-function closeMenu() {
+function closeMenu(refocus) {
   if (!openMenu) return;
-  const { el, anchor } = openMenu;
+  const { el, anchor, from } = openMenu;
   openMenu = null;
-  anchor.setAttribute("aria-expanded", "false");
+  if (anchor) anchor.setAttribute("aria-expanded", "false");
   el.classList.add("closing");
   setTimeout(() => el.remove(), 130);
+  const back = anchor || from;
+  if (refocus && back && back.isConnected) back.focus({ preventScroll: true });
 }
-/* items: [{label, sub, icon, onclick, disabled, danger, checked, keep}] | "-" | {header} */
-function showMenu(anchor, build) {
-  if (openMenu && openMenu.anchor === anchor) { closeMenu(); return; }
+/* items: [{label, sub, icon, onclick, disabled, danger, checked, keep}] | "-" | {header}
+   anchor: the button the menu hangs under; with `at` ({x, y} in window px, a right-click) the menu
+   opens at that point instead (anchor null) and `from` is the element to give the focus back to. */
+function showMenu(anchor, build, at, from) {
+  if (anchor && openMenu && openMenu.anchor === anchor) { closeMenu(); return; }
   closeMenu();
   const el = h("div", { class: "menu", role: "menu" });
   const fill = () => {
@@ -195,22 +199,39 @@ function showMenu(anchor, build) {
   };
   fill();
   document.body.append(el);
-  const r = anchor.getBoundingClientRect(), mw = el.offsetWidth, mh = el.offsetHeight;
-  const z = zoom(), rb = r.bottom / z, rt = r.top / z, rr = r.right / z;  // menu styles are in zoomed px
-  const up = rb + mh + 8 > window.innerHeight / z && rt - mh - 8 > 0;
-  el.classList.toggle("up", up);
-  el.style.left = Math.max(8, Math.min(window.innerWidth / z - mw - 8, rr - mw)) + "px";
-  el.style.top = (up ? rt - mh - 6 : rb + 6) + "px";
-  anchor.setAttribute("aria-expanded", "true");
-  openMenu = { el, anchor };
+  const z = zoom(), mw = el.offsetWidth, mh = el.offsetHeight;  // menu styles are in zoomed px
+  const W = window.innerWidth / z, H = window.innerHeight / z;
+  if (at) {
+    const x = at.x / z, y = at.y / z;
+    const up = y + mh + 8 > H && y - mh > 8;
+    el.classList.toggle("up", up);
+    el.style.left = Math.max(8, Math.min(W - mw - 8, x)) + "px";
+    el.style.top = Math.max(8, up ? y - mh : y) + "px";
+  } else {
+    const r = anchor.getBoundingClientRect(), rb = r.bottom / z, rt = r.top / z, rr = r.right / z;
+    const up = rb + mh + 8 > H && rt - mh - 8 > 0;
+    el.classList.toggle("up", up);
+    el.style.left = Math.max(8, Math.min(W - mw - 8, rr - mw)) + "px";
+    el.style.top = (up ? rt - mh - 6 : rb + 6) + "px";
+    anchor.setAttribute("aria-expanded", "true");
+  }
+  openMenu = { el, anchor: anchor || null, from: from || null };
   const first = el.querySelector(".mi:not(:disabled)");
   if (first) first.focus({ preventScroll: true });
 }
 document.addEventListener("pointerdown", (ev) => {
-  if (openMenu && !openMenu.el.contains(ev.target) && !openMenu.anchor.contains(ev.target)) closeMenu();
+  if (openMenu && !openMenu.el.contains(ev.target) && !(openMenu.anchor && openMenu.anchor.contains(ev.target))) closeMenu();
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") { if (openMenu) { closeMenu(); ev.preventDefault(); } else closeDrawer(); }
+  if (ev.key === "Escape") { if (openMenu) { closeMenu(true); ev.preventDefault(); } else closeDrawer(); return; }
+  if (!openMenu || !["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
+  const items = [...openMenu.el.querySelectorAll(".mi:not(:disabled)")];
+  if (!items.length) return;
+  const at = items.indexOf(document.activeElement);
+  const next = ev.key === "Home" ? 0 : ev.key === "End" ? items.length - 1
+    : ev.key === "ArrowDown" ? (at + 1) % items.length : (at <= 0 ? items.length - 1 : at - 1);
+  items[next].focus({ preventScroll: true });
+  ev.preventDefault();
 });
 window.addEventListener("resize", () => {
   closeMenu();
@@ -353,7 +374,7 @@ const S = {
   pendingRec: false,      // Record pressed: open the new meeting as soon as it is listed
   meetings: [],           // list for the selected project, oldest first
   lists: new Map(),       // project id -> meetings (oldest first), for the sidebar
-  expanded: loadExpanded(), showAll: new Set(), showArchived: new Set(),
+  expanded: loadExpanded(), showAll: new Set(), showArchived: new Set(), showArchivedProjects: false,
   folded: loadFolded(),   // "pid::type" groups closed in the sidebar
   newType: new Map(),     // project id -> meeting type for the next recording ("" = none)
   recFolder: null,        // {pid, folder, name, type, title}: record the next meeting into it
@@ -410,7 +431,7 @@ const missing = (e) => e && e.status === 404;  // endpoint or item not there (ye
 
 /* action: {label, run} adds a small button to the toast (kept up a little longer). */
 function toast(text, kind, action) {
-  const el = h("div", { class: "toast" + (kind ? " " + kind : "") }, icon(kind === "error" ? "alert" : "check"), h("span", { text: String(text) }));
+  const el = h("div", { class: "toast" + (kind ? " " + kind : "") }, icon(kind === "error" || kind === "warn" ? "alert" : "check"), h("span", { text: String(text) }));
   const dismiss = () => { if (el.classList.contains("out")) return; el.classList.add("out"); setTimeout(() => el.remove(), 230); };
   el.addEventListener("click", dismiss);
   if (action) {
@@ -419,7 +440,7 @@ function toast(text, kind, action) {
   }
   $("toasts").append(el);
   while ($("toasts").children.length > 4) $("toasts").firstChild.remove();
-  setTimeout(dismiss, kind === "error" ? 9000 : action ? 8000 : 4500);
+  setTimeout(dismiss, kind === "error" || kind === "warn" ? 9000 : action ? 8000 : 4500);
 }
 async function guarded(fn) {
   try { return await fn(); } catch (e) { toast(e instanceof Error ? e.message : e, "error"); return null; }
@@ -437,48 +458,132 @@ async function pickFolder(start = null, ref = null, type = null) {
   try { return (await window.pywebview.api.pick_folder(start, ref, type)) || null; } catch (e) { return null; }
 }
 
-/* fields: [{key, label, value, placeholder, browse, options:[{value,label}], checkbox}] -> values | null
-   (a checkbox field gives true/false) */
-function formModal({ title, text, fields = [], ok = "OK", danger = false }) {
+const baseName = (path) => String(path || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+const joinPath = (dir, name) => (dir ? dir.replace(/[\\/]+$/, "") + (dir.includes("\\") ? "\\" : "/") + name : name);
+
+/* The dialog shell. `content`: nodes, or (ctx) => nodes; ctx = {error(msg), setOk({label, danger, disabled})}.
+   `collect()` gives the values; `submit(values)` (async) may refuse by throwing: the message then shows
+   inside the dialog, which stays open with everything typed so far. Resolves with submit's result
+   (default: the values), or null when cancelled. */
+function modal({ title, text, content, ok = "OK", danger = false, collect = () => true, submit }) {
   return new Promise((resolve) => {
     const dlg = $("modal");
-    const inputs = {};
-    const finish = (v) => { resolve(v); if (dlg.open) dlg.close(); };
-    const rows = fields.map((f) => {
-      let input;
-      if (f.checkbox) {
-        input = h("input", { type: "checkbox" });
-        input.checked = !!f.value;
-        inputs[f.key] = input;
-        return h("label", { class: "mcheck" }, input, h("span", { text: f.label }));
-      }
-      if (f.options) {
-        input = h("select", null, f.options.map((o) => h("option", { value: o.value, text: o.label })));
-        input.value = f.value ?? f.options[0].value;
-      } else {
-        input = h("input", { class: "text", type: "text", value: f.value || "", placeholder: f.placeholder || "", autocomplete: "off" });
-      }
-      inputs[f.key] = input;
-      if (f.options) input.className = "text";
-      const browse = f.browse && pickerAvailable()
-        ? h("button", { class: "btn", type: "button", text: "Browse",
-          onclick: async () => { const p = await pickFolder(); if (p) input.value = p; } }) : null;
-      return h("label", null, f.label, h("div", { class: "inrow" }, input, browse));
-    });
-    const form = h("form", { class: "mform", onsubmit: (ev) => {
+    let busy = false, done = false;
+    const err = h("p", { class: "ferr", role: "alert", hidden: true });
+    const okBtn = h("button", { class: "btn primary", type: "submit" });
+    const cancel = h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) });
+    const ctx = {
+      error: (msg) => { err.textContent = msg || ""; err.hidden = !msg; },
+      setOk: (o) => {
+        if (o.label !== undefined) okBtn.textContent = o.label;
+        if (o.danger !== undefined) okBtn.className = "btn " + (o.danger ? "danger" : "primary");
+        if (o.disabled !== undefined) okBtn.disabled = !!o.disabled;
+      },
+    };
+    ctx.setOk({ label: ok, danger });
+    let form = null;
+    // Escape closes the dialog by itself. A "close" event that arrives after the next dialog was opened
+    // belongs to the old one: it must not close the new one.
+    const onClose = () => { if (dlg.open && dlg.firstChild === form) return; finish(null); };
+    const onCancel = (ev) => { if (busy) ev.preventDefault(); };
+    function finish(v) {
+      if (done) return;
+      done = true;
+      dlg.removeEventListener("close", onClose);
+      dlg.removeEventListener("cancel", onCancel);
+      resolve(v);
+      if (dlg.open && dlg.firstChild === form) dlg.close();
+    }
+    const nodes = typeof content === "function" ? content(ctx) : content || [];
+    form = h("form", { class: "mform", onsubmit: async (ev) => {
       ev.preventDefault();
-      finish(Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.type === "checkbox" ? i.checked : i.value.trim()])));
+      if (busy) return;
+      const values = collect();
+      if (!submit) { finish(values); return; }
+      busy = true; okBtn.disabled = true; cancel.disabled = true; ctx.error("");
+      try { finish(await submit(values)); }
+      catch (e) {  // toasts sit behind the dialog: show it here
+        busy = false; okBtn.disabled = false; cancel.disabled = false;
+        ctx.error(e instanceof Error ? e.message : String(e));
+      }
     } },
-    h("h3", { text: title }), text ? h("p", { text }) : null, rows,
-    h("div", { class: "btns" },
-      h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) }),
-      h("button", { class: "btn " + (danger ? "danger" : "primary"), type: "submit", text: ok })));
+    h("h3", { text: title }), text ? h("p", { text }) : null, nodes, err,
+    h("div", { class: "btns" }, cancel, okBtn));
     dlg.replaceChildren(form);
-    dlg.addEventListener("close", () => resolve(null), { once: true });  // Escape
+    dlg.addEventListener("close", onClose);
+    dlg.addEventListener("cancel", onCancel);
     dlg.showModal();
-    const first = form.querySelector("input, select");
+    const first = form.querySelector("input:not([type=checkbox]), select");
     if (first) first.focus();
   });
+}
+
+/* A folder in a dialog: "Choose folder..." (native picker) + the chosen path + clear. Without the
+   native picker (plain browser) it is a text field for the path. Returns {el, get, set}. */
+function folderField({ label, value = "", button = "Choose folder...", placeholder = "Folder path", clearable = true, start = null, ref = null, type = null, onChange }) {
+  let path = value || "", text = null;
+  const set = (p, quiet) => {
+    path = p || "";
+    paint();
+    if (!quiet && onChange) onChange(path);
+  };
+  const shown = h("span", { class: "ffield-path" });
+  const clear = h("button", { class: "icon-btn small", type: "button", title: "Clear", "aria-label": "Clear folder", onclick: () => set("") }, icon("x"));
+  function paint() {
+    if (text) { if (text.value.trim() !== path) text.value = path; return; }
+    shown.textContent = path || "No folder chosen";
+    shown.title = path;
+    shown.classList.toggle("none", !path);
+    clear.hidden = !path || !clearable;
+  }
+  let row;
+  if (pickerAvailable()) {
+    row = h("div", { class: "ffield" },
+      h("button", { class: "btn", type: "button", text: button, onclick: async () => { const p = await pickFolder(start, ref, type); if (p) set(p); } }),
+      shown, clear);
+  } else {
+    text = h("input", { class: "text", type: "text", placeholder, autocomplete: "off", "aria-label": label,
+      oninput: () => { path = text.value.trim(); if (onChange) onChange(path); } });
+    row = text;
+  }
+  paint();
+  return { el: h("div", { class: "mfield" }, h("span", { class: "flabel", text: label }), row), get: () => path, set };
+}
+
+/* fields: [{key, label, value, placeholder, browse, options:[{value,label,disabled}], checkbox}] -> values | null
+   (a checkbox field gives true/false). `submit(values)`: see modal(). */
+function formModal({ title, text, fields = [], ok = "OK", danger = false, submit }) {
+  const inputs = {};
+  const rows = fields.map((f) => {
+    let input;
+    if (f.checkbox) {
+      input = h("input", { type: "checkbox" });
+      input.checked = !!f.value;
+      inputs[f.key] = input;
+      return h("label", { class: "mcheck" }, input, h("span", { text: f.label }));
+    }
+    if (f.options) {
+      input = h("select", null, f.options.map((o) => h("option", { value: o.value, text: o.label, disabled: !!o.disabled })));
+      input.value = f.value ?? f.options[0].value;
+    } else {
+      input = h("input", { class: "text", type: "text", value: f.value || "", placeholder: f.placeholder || "", autocomplete: "off" });
+    }
+    inputs[f.key] = input;
+    if (f.options) input.className = "text";
+    const browse = f.browse && pickerAvailable()
+      ? h("button", { class: "btn", type: "button", text: "Browse",
+        onclick: async () => { const p = await pickFolder(); if (p) input.value = p; } }) : null;
+    return h("label", null, f.label, h("div", { class: "inrow" }, input, browse));
+  });
+  return modal({ title, text, content: rows, ok, danger, submit,
+    collect: () => Object.fromEntries(Object.entries(inputs).map(([k, i]) => [k, i.type === "checkbox" ? i.checked : i.value.trim()])) });
+}
+
+/* A folder path from the user: the native picker, or (plain browser) a small dialog. null = cancelled. */
+async function askFolder(title, start, ref, type) {
+  if (pickerAvailable()) return pickFolder(start, ref, type);
+  const v = await formModal({ title, fields: [{ key: "path", label: "Folder path", placeholder: "Path of an existing folder" }], ok: "OK" });
+  return v && v.path ? v.path : null;
 }
 
 // ---------------------------------------------------------------- projects and sidebar
@@ -559,8 +664,9 @@ function ensureSelection() {  // returns true when the selected project had to c
   const exists = (id) => id === "inbox" || S.projects.some((p) => p.id === id);
   if (exists(S.sel)) return false;
   const saved = remember("steno-project");
-  const pick = [recProjectId(), saved, (S.projects[0] || {}).id, S.inbox > 0 ? "inbox" : null]
-    .find((id) => id && exists(id));
+  const usable = (id) => id && exists(id) && !(projectById(id) || {}).archived;  // a pick is never an archived project
+  const pick = [recProjectId(), saved, (S.projects.find((p) => !p.archived) || {}).id,
+    S.inbox > 0 || S.projects.length ? "inbox" : null].find(usable);
   const next = pick || null;
   const changed = next !== S.sel;
   S.sel = next;
@@ -760,6 +866,8 @@ async function loadSettings() {
 function sideMeetings(id) {
   const r = S.status.recorder || {};
   const here = S.view === "project" && S.sel === id;
+  const proj = S.projects.find((p) => p.id === id);
+  const closed = !!(proj && proj.archived);  // an archived project: no recording into it
   const every = (S.lists.get(id) || []).slice().reverse();  // newest first
   const list = every.filter((i) => !i.archived);
   const archived = every.filter((i) => i.archived);
@@ -778,7 +886,7 @@ function sideMeetings(id) {
     armDrag(main, info, id);
     const dragged = DRAG.active && DRAG.active.info.session === info.session;
     return h("div", { class: "mrow" + (active ? " active" : "") + (info.archived ? " archived" : "") + (dragged ? " dragging" : ""),
-      "data-ts": String(Date.parse(info.started_at) || 0) }, main, more);
+      "data-ts": String(Date.parse(info.started_at) || 0), "data-ctx": "meeting", "data-pid": id, "data-sid": info.session }, main, more);
   };
   const rows = (key, part) => {  // newest first, "Show all" past SIDE_MEETINGS
     const all = S.showAll.has(key);
@@ -796,7 +904,7 @@ function sideMeetings(id) {
     items.push(...rows(id, list));
     if (!items.length && S.lists.has(id)) items.push(h("div", { class: "mitem none", text: "No meetings yet" }));
   } else {
-    // subfolders first (level 1, meetings inside at level 2), then the meetings without a type (level 1)
+    // subfolders first (level 1, meetings inside at level 2), then the meetings in the project itself (level 1)
     const chosen = drafting ? recType(id) : null;
     const untyped = list.filter((i) => !i.type || !types.some((t) => t.name === i.type));
     for (const t of types) {
@@ -808,14 +916,16 @@ function sideMeetings(id) {
       if (chosen === type) body.push(draft());
       body.push(...rows(key, part));
       if (!body.length && S.lists.has(id)) body.push(h("div", { class: "mitem none", text: "No meetings yet" }));
+      const tip = t.missing ? `${t.folder}\nThis folder is missing; use Change folder... in the menu.` : t.folder || type;
       items.push(h("div", { class: "tnode" + (open ? " open" : ""), "data-drop": id, "data-drop-type": type },
-        h("div", { class: "trow" },
-          h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: `${type}: ${t.folder || ""}`,
+        h("div", { class: "trow", "data-ctx": "type", "data-pid": id, "data-type": type },
+          h("button", { class: "tmain", type: "button", "aria-expanded": String(open), title: tip,
             onclick: () => { if (open) S.folded.add(key); else S.folded.delete(key); remember("steno-folded", JSON.stringify([...S.folded])); renderSide(); } },
-          icon("chevron"), h("i", { class: "ticon" }, icon("folder")), h("span", { class: "tname", text: type }), open ? null : h("span", { class: "tcount", text: String(part.length) })),
-          explorerButton(`${type} (${projectName(id)})`, "type", id, type),
-          subfolderMore(id, type, part.length),
-          h("button", { class: "padd", type: "button", title: `New ${type} meeting`, "aria-label": `New ${type} meeting`, onclick: () => newMeeting(id, type) }, icon("plus"))),
+          icon("chevron"), h("i", { class: "ticon" }, icon("folder")), h("span", { class: "tname", text: type }),
+          t.missing ? h("i", { class: "warn-ic", title: tip }, icon("alert")) : null,
+          open ? null : h("span", { class: "tcount", text: String(part.length) })),
+          closed ? null : h("button", { class: "padd", type: "button", title: `New ${type} meeting`, "aria-label": `New ${type} meeting`, onclick: () => newMeeting(id, type) }, icon("plus")),
+          moreButton(`${type} actions`, () => subfolderItems(id, t))),
         open ? h("div", { class: "tlist" }, body) : null));
     }
     if (chosen === "") items.push(draft());
@@ -831,31 +941,35 @@ function sideMeetings(id) {
   return h("div", { class: "mlist" }, items);
 }
 
-function projectNode(id, name, count, canRecord, live) {
+/* The ⋯ button on a sidebar row: same items as the right-click menu. */
+function moreButton(label, build) {
+  const more = h("button", { class: "padd pmore", type: "button", title: label, "aria-label": label, "aria-haspopup": "menu" }, icon("more"));
+  more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, build); });
+  return more;
+}
+
+/* One project row with its meetings. `p` is a project, or null for the Inbox / TBD. */
+function projectNode(p, live) {
+  const id = p ? p.id : "inbox", name = p ? p.name : INBOX_NAME, count = p ? p.meetings : S.inbox;
   const open = S.expanded.has(id);
   const here = S.view === "project" && S.sel === id;
+  const closed = !!(p && p.archived);
   const chev = h("button", { class: "pchev", type: "button", "aria-label": open ? "Collapse" : "Expand", "aria-expanded": String(open), onclick: () => toggleExpanded(id) }, icon("chevron"));
-  const main = h("button", { class: "pmain", type: "button", onclick: () => selectProject(id) },
+  let tip = p ? (p.path ? p.path : "No folder linked") : "Meetings that are not in a project yet";
+  if (p && p.path && p.path_missing) tip += "\nThis folder is missing; use Change linked folder... in the menu.";
+  const main = h("button", { class: "pmain", type: "button", title: tip, onclick: () => selectProject(id) },
     h("i", { class: "picon" }, icon(id === "inbox" ? "inbox" : "folder")),
     h("span", { class: "pname", text: name }),
+    p && p.path_missing ? h("i", { class: "warn-ic", title: tip }, icon("alert")) : null,
     live ? h("i", { class: "live-dot", title: "Recording" }) : open || (id === "inbox" && !count) ? null : h("span", { class: "pcount", text: String(count) }));
-  const add = canRecord ? h("button", { class: "padd", type: "button", title: `New meeting in ${name}`, "aria-label": `New meeting in ${name}`, onclick: () => newMeeting(id) }, icon("plus")) : null;
-  const sub = canRecord && id !== "inbox" ? h("button", { class: "padd", type: "button", title: `New subfolder in ${name} (e.g. Board, 1-1)`, "aria-label": `New subfolder in ${name}`, onclick: () => guarded(() => newSubfolder(id)) }, icon("folderPlus")) : null;
-  const show = id === "inbox" ? explorerButton(name, "inbox") : explorerButton(name, "project", id);
-  return h("div", { class: "pnode" + (open ? " open" : "") + (here ? " here" : ""), "data-drop": id, "data-drop-type": "" },
-    h("div", { class: "pitem prow" + (here && !open ? " active" : "") }, chev, main, show, sub, add),
+  const add = closed ? null : h("button", { class: "padd", type: "button", title: `New meeting in ${name}`, "aria-label": `New meeting in ${name}`, onclick: () => newMeeting(id) }, icon("plus"));
+  const sub = p && !closed ? h("button", { class: "padd", type: "button", title: `New subfolder in ${name}`, "aria-label": `New subfolder in ${name}`, onclick: () => addSubfolder(id) }, icon("folderPlus")) : null;
+  const more = moreButton(`${name} actions`, () => (p ? projectItems(p) : inboxItems()));
+  return h("div", { class: "pnode" + (open ? " open" : "") + (here ? " here" : "") + (closed ? " archived" : ""), "data-drop": id, "data-drop-type": "" },
+    h("div", { class: "pitem prow" + (here && !open ? " active" : ""), "data-ctx": p ? "project" : "inbox", "data-pid": id }, chev, main, sub, add, more),
     open ? sideMeetings(id) : null);
 }
 
-/* Hover button on a project / subfolder / Inbox row: show its folder in File Explorer. The page
-   only sends what the row stands for (kind, project id, subfolder name); the desktop app works
-   out the path. Not shown in a plain browser. */
-function explorerButton(label, kind, ref, type) {
-  if (!pickerAvailable()) return null;
-  const tip = `Show ${label} in File Explorer`;
-  return h("button", { class: "padd pexp", type: "button", title: tip, "aria-label": tip,
-    onclick: (ev) => { ev.stopPropagation(); guarded(() => openInExplorer(kind, ref, type)); } }, icon("folderOpen"));
-}
 async function openInExplorer(kind, ref, type) {
   const bridge = window.pywebview && window.pywebview.api;
   if (!bridge || !bridge.open_folder) { toast("Opening folders needs the desktop app.", "error"); return; }
@@ -865,8 +979,10 @@ async function openInExplorer(kind, ref, type) {
 
 function renderSide() {
   const live = recProjectId();
-  $("plist").replaceChildren(...S.projects.map((p) => projectNode(p.id, p.name, p.meetings, true, live === p.id)));
-  $("inbox-slot").replaceChildren(projectNode("inbox", INBOX_NAME, S.inbox, true, live === "inbox"));
+  const open = S.projects.filter((p) => !p.archived), archived = S.projects.filter((p) => p.archived);
+  $("plist").replaceChildren(...open.map((p) => projectNode(p, live === p.id)));
+  $("inbox-slot").replaceChildren(projectNode(null, live === "inbox"));
+  $("arch-slot").replaceChildren(...archivedProjects(archived, live));
   $("nav-people").classList.toggle("active", S.view === "people");
   $("nav-settings").classList.toggle("active", S.view === "settings");
   if (DRAG.active && !DRAG.active.settled) { paintDrop(); syncGap(false); }
@@ -874,6 +990,16 @@ function renderSide() {
   const elsewhere = live && (S.view !== "project" || live !== S.sel);
   document.querySelectorAll(".menu-btn").forEach((b) => b.classList.toggle("badge", !!elsewhere));
   renderSideFoot();
+}
+
+/* "Archived (n)" at the bottom of the project list: closed until clicked (open while one of them is shown). */
+function archivedProjects(archived, live) {
+  if (!archived.length) return [];
+  const open = S.showArchivedProjects || archived.some((p) => p.id === S.sel && S.view === "project");
+  const head = h("button", { class: "pitem arch-head", type: "button", "aria-expanded": String(open),
+    onclick: () => { S.showArchivedProjects = !open; renderSide(); } },
+  h("i", { class: "picon" }, icon("archive")), h("span", { class: "pname", text: `Archived (${archived.length})` }), icon("chevron", open ? "up" : ""));
+  return [head, ...(open ? archived.map((p) => projectNode(p, live === p.id)) : [])];
 }
 
 function renderSideFoot() {  // only shown while the connection to the local server is lost
@@ -1027,59 +1153,105 @@ function renderAutoTitle() {
   }
 }
 
-async function newProject() {
-  const picked = await pickFolder();
-  if (picked === null) return;
-  const v = await formModal({
-    title: "New project",
-    text: "A project is a folder on disk. Meetings are saved in <folder>/Steno/.",
-    fields: [
-      { key: "path", label: "Parent folder", value: picked || "", placeholder: "Path of the folder to create it in", browse: true },
-      { key: "name", label: "Project name", placeholder: "Name of the new folder" }],
-    ok: "Create",
-  });
-  if (!v) return;
-  if (!v.path || !v.name) { toast("Choose a parent folder and enter a name.", "error"); return; }
-  const res = await guarded(() => api("POST", "/api/projects", { path: v.path, name: v.name, create: true }));
-  if (res) await afterProjectAdded(res.project);
-}
+// ---------------------------------------------------------------- projects: create, rename, link, archive, delete
+//
+// A project is a label for meetings. It can be linked to a folder (a shortcut, nothing more); meetings
+// are saved in its subfolders, each of which points at a folder anywhere on disk.
 
-async function addProject() {
-  let path = await pickFolder();
-  if (path === null) return;
-  if (path === undefined) {
-    const v = await formModal({ title: "Add existing folder", fields: [{ key: "path", label: "Folder path", placeholder: "Path of an existing folder" }], ok: "Add" });
-    path = v && v.path;
-  }
-  if (!path) return;
-  const res = await guarded(() => api("POST", "/api/projects", { path }));
-  if (res) await afterProjectAdded(res.project);
+const projectById = (id) => S.projects.find((p) => p.id === id) || null;
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+async function newProject() {
+  let name, folder;
+  const created = await modal({
+    title: "New project",
+    text: "A project groups your meetings. Add subfolders to it next: each one is a folder where its meetings are saved.",
+    ok: "Create",
+    content: () => {
+      name = h("input", { class: "text", type: "text", placeholder: "Project name", maxlength: "80", autocomplete: "off", "aria-label": "Project name" });
+      folder = folderField({ label: "Link a folder (optional)", button: "Choose folder..." });
+      return [h("label", null, "Name", name), folder.el];
+    },
+    collect: () => ({ name: name.value.trim(), folder: folder.get() }),
+    submit: async (v) => {
+      if (!v.name) { name.focus(); throw new Error("Enter a name for the project."); }
+      const body = { name: v.name };
+      if (v.folder) body.folder = v.folder;
+      return (await api("POST", "/api/projects", body)).project;
+    },
+  });
+  if (created) await afterProjectAdded(created);
 }
 
 async function afterProjectAdded(project) {
   await guarded(loadProjects);
-  if (project && project.id) selectProject(project.id);
+  if (project && project.id) selectProject(project.id);  // no meetings yet: the ready screen offers "Add subfolder"
 }
 
-async function removeProject() {
-  const p = curProject();
-  if (!p) return;
-  const listed = await guarded(() => api("GET", `/api/projects/${encodeURIComponent(p.id)}/meetings`));
-  if (!listed) return;
-  const n = (listed.meetings || []).length + (listed.archived || 0);
-  const v = await formModal({
-    title: "Remove project",
-    text: `Remove "${p.name}" from Steno? The project folder and your own files in it are never deleted.`,
-    fields: n ? [{ key: "meetings", checkbox: true, value: false,
-      label: `Also delete its ${n} meeting${n === 1 ? "" : "s"} for good: recordings, transcripts, summaries and to-dos (Steno's files only)` }] : [],
-    ok: "Remove", danger: true });
-  if (!v) return;
-  const res = await guarded(() => api("POST", `/api/projects/${encodeURIComponent(p.id)}/delete`, { meetings: !!v.meetings }));
+async function renameProject(p) {
+  const v = await formModal({ title: "Rename project", fields: [{ key: "name", label: "Name", value: p.name }], ok: "Rename",
+    submit: async (vals) => {
+      if (!vals.name) throw new Error("Enter a name.");
+      if (vals.name !== p.name) await api("POST", `/api/projects/${encodeURIComponent(p.id)}/update`, { name: vals.name });
+      return vals;
+    } });
+  if (v) await loadProjects();
+}
+
+async function linkProjectFolder(p) {
+  const path = await askFolder(p.path ? "Change linked folder" : "Link a folder", "project", p.id);
+  if (!path) return;
+  await api("POST", `/api/projects/${encodeURIComponent(p.id)}/update`, { folder: path });
+  await loadProjects();
+  toast(`${p.name} is linked to ${baseName(path) || path}`);
+}
+
+async function unlinkProjectFolder(p) {
+  await api("POST", `/api/projects/${encodeURIComponent(p.id)}/update`, { folder: null });
+  await loadProjects();
+  toast(`${p.name} is no longer linked to a folder; the folder and its files stay`);
+}
+
+async function archiveProject(p, archived) {
+  await api("POST", `/api/projects/${encodeURIComponent(p.id)}/update`, { archived });
+  if (archived && S.sel === p.id) { S.sel = null; S.meeting = null; S.feed.clear(); S.meetings = []; }
+  else if (!archived) S.showArchivedProjects = false;
+  await loadProjects();
+  renderTop(); renderSide(); renderFeed();
+  toast(archived ? `${p.name} archived. Find it under Archived at the bottom of the sidebar.` : `${p.name} restored`);
+}
+
+/* Delete... on a project: by default only Steno forgets it (files stay, its meetings go to the Inbox);
+   the checkbox also deletes its meetings, and the dialog then turns red. */
+async function deleteProject(p) {
+  const n = p.all_meetings || 0;
+  const linked = p.path ? " Its folder and your files stay." : "";
+  const calm = `"${p.name}" is removed from Steno.${linked}${n ? (n === 1 ? ` Its meeting moves to the ${INBOX_NAME}.` : ` Its ${n} meetings move to the ${INBOX_NAME}.`) : ""}`;
+  const loud = `This deletes all ${plural(n, "meeting")} of "${p.name}" for good: recordings, transcripts, summaries and to-dos (Steno's files only; your own files stay). This cannot be undone.`;
+  let box;
+  const res = await modal({
+    title: "Delete project",
+    ok: "Remove from Steno",
+    content: (ctx) => {
+      const lead = h("p", { text: calm });
+      if (!n) return [lead];
+      box = h("input", { type: "checkbox" });
+      box.addEventListener("change", () => {
+        lead.textContent = box.checked ? loud : calm;
+        lead.classList.toggle("mwarn", box.checked);
+        ctx.setOk(box.checked ? { label: `Delete project and ${plural(n, "meeting")}`, danger: true } : { label: "Remove from Steno", danger: false });
+      });
+      return [lead, h("label", { class: "mcheck" }, box, h("span", { text: n === 1 ? "Also delete its meeting" : `Also delete all ${n} meetings` }))];
+    },
+    collect: () => ({ meetings: !!(box && box.checked) }),
+    submit: (v) => api("POST", `/api/projects/${encodeURIComponent(p.id)}/delete`, { meetings: v.meetings }),
+  });
   if (!res) return;
-  S.sel = null; S.feed.clear();
+  if (S.sel === p.id) { S.sel = null; S.meeting = null; S.feed.clear(); S.meetings = []; }
   await guarded(loadProjects);
   renderTop(); renderSide(); renderFeed();
-  toast(res.deleted ? `${p.name} removed, ${res.deleted} meeting${res.deleted === 1 ? "" : "s"} deleted` : `${p.name} removed from Steno`);
+  toast(res.deleted ? `${p.name} removed, ${plural(res.deleted, "meeting")} deleted`
+    : n ? `${p.name} removed from Steno; its meetings are in the ${INBOX_NAME}` : `${p.name} removed from Steno`);
 }
 
 async function deleteInbox() {
@@ -1098,6 +1270,197 @@ async function deleteInbox() {
   toast(`${res.deleted} meeting${res.deleted === 1 ? "" : "s"} deleted`);
 }
 
+// ---------------------------------------------------------------- subfolders: add, rename, change folder, remove
+
+/* Add subfolder: pick an existing folder anywhere (default), or create a new one inside a folder you pick. */
+async function addSubfolder(pid) {
+  const p = projectById(pid);
+  if (!p) return;
+  let mode = "existing", touched = false;
+  let name, preview, existing, where, seg, nameLabel;
+  const added = await modal({
+    title: `Add subfolder to ${p.name}`,
+    text: "Meetings saved in a subfolder are written into its folder, e.g. Board or 1-1.",
+    ok: "Add subfolder",
+    content: () => {
+      name = h("input", { class: "text", type: "text", maxlength: "80", autocomplete: "off", "aria-label": "Name",
+        oninput: () => { touched = true; paint(); } });
+      nameLabel = h("span", { text: "Name" });
+      preview = h("p", { class: "fpreview" });
+      existing = folderField({ label: "Folder", button: "Choose folder...", start: "project", ref: pid,
+        onChange: (path) => { if (path && !touched) name.value = baseName(path); paint(); } });
+      where = folderField({ label: "Create it in", button: "Choose location...", start: "project", ref: pid, onChange: () => paint() });
+      seg = h("div", { class: "seg-ctl", role: "radiogroup", "aria-label": "How" });
+      for (const [v, label] of [["existing", "Choose existing folder"], ["create", "Create new folder"]]) {
+        seg.append(h("button", { type: "button", role: "radio", "data-v": v, text: label, onclick: () => { mode = v; paint(); } }));
+      }
+      const paint = () => {
+        for (const b of seg.children) { const on = b.dataset.v === mode; b.classList.toggle("on", on); b.setAttribute("aria-checked", String(on)); }
+        existing.el.hidden = mode !== "existing";
+        where.el.hidden = mode !== "create";
+        nameLabel.textContent = mode === "create" ? "New folder name" : "Name in Steno";
+        name.placeholder = mode === "create" ? "e.g. Board" : "Defaults to the folder's name";
+        const nm = name.value.trim();
+        const path = mode === "existing" ? existing.get() : where.get() && nm ? joinPath(where.get(), nm) : "";
+        preview.hidden = !path;
+        preview.textContent = path ? (mode === "create" ? `Will create ${path}` : path) : "";
+      };
+      paint();
+      return [seg, existing.el, where.el, h("label", null, nameLabel, name), preview];
+    },
+    collect: () => ({ mode, name: name.value.trim(), folder: mode === "existing" ? existing.get() : where.get() }),
+    submit: async (v) => {
+      if (!v.folder) throw new Error(v.mode === "create" ? "Choose where to create the folder." : "Choose a folder.");
+      if (v.mode === "create" && !v.name) { name.focus(); throw new Error("Give the new folder a name."); }
+      const body = { folder: v.folder };
+      if (v.name) body.name = v.name;
+      if (v.mode === "create") body.create = true;
+      await api("POST", `/api/projects/${encodeURIComponent(pid)}/subfolders`, body);
+      return { name: v.name || baseName(v.folder) };
+    },
+  });
+  if (!added) return;
+  if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
+  await guarded(loadProjects);
+  toast(`Subfolder ${added.name} added`, null, pickerAvailable()
+    ? { label: "Open in File Explorer", run: () => guarded(() => openInExplorer("type", pid, added.name)) } : null);
+  if (S.meeting === "new" && S.sel === pid) renderFeed();
+}
+
+async function renameSubfolder(pid, name) {
+  const v = await formModal({ title: "Rename subfolder", text: "Only the name in Steno changes; the folder on disk stays.",
+    fields: [{ key: "name", label: "Name", value: name }], ok: "Rename",
+    submit: async (vals) => {
+      if (!vals.name) throw new Error("Enter a name.");
+      if (vals.name !== name) await api("POST", `/api/projects/${encodeURIComponent(pid)}/subfolders/rename`, { name, new_name: vals.name });
+      return vals;
+    } });
+  if (!v || v.name === name) return;
+  if (S.newType.get(pid) === name) setRecType(pid, v.name);
+  if (S.recFolder && S.recFolder.pid === pid && S.recFolder.type === name) S.recFolder.type = v.name;
+  await loadProjects();
+}
+
+async function changeSubfolderFolder(pid, t) {
+  const path = await askFolder(`Change folder of ${t.name}`, "type", pid, t.name);
+  if (!path) return;
+  await api("POST", `/api/projects/${encodeURIComponent(pid)}/subfolders/folder`, { name: t.name, folder: path });
+  await loadProjects();
+  toast(`${t.name} now points at ${baseName(path) || path}`);
+}
+
+/* Remove... on a subfolder: Steno forgets it (its folder and files stay, its meetings stay in the project);
+   the checkbox also deletes its meetings, and the dialog then turns red. */
+async function removeSubfolder(pid, t) {
+  const name = t.name, n = t.meetings || 0;  // the server's count includes archived meetings
+  const calm = `${name} is removed from Steno. Its folder and your files stay.${n ? ` Its ${plural(n, "meeting")} stay in the project.` : ""}`;
+  const loud = `This deletes the ${plural(n, "meeting")} of ${name} for good (archived ones too): recordings, transcripts, summaries and to-dos. Your own files in the meeting folders stay. This cannot be undone.`;
+  let box;
+  const res = await modal({
+    title: "Remove subfolder",
+    ok: "Remove",
+    content: (ctx) => {
+      const lead = h("p", { text: calm });
+      if (!n) return [lead];
+      box = h("input", { type: "checkbox" });
+      box.addEventListener("change", () => {
+        lead.textContent = box.checked ? loud : calm;
+        lead.classList.toggle("mwarn", box.checked);
+        ctx.setOk(box.checked ? { label: `Delete ${plural(n, "meeting")}`, danger: true } : { label: "Remove", danger: false });
+      });
+      return [lead, h("label", { class: "mcheck" }, box, h("span", { text: n === 1 ? "Also delete its meeting" : `Also delete its ${n} meetings` }))];
+    },
+    collect: () => ({ meetings: !!(box && box.checked) }),
+    submit: (v) => api("POST", `/api/projects/${encodeURIComponent(pid)}/types/delete`, { name, meetings: v.meetings }),
+  });
+  if (!res) return;
+  if (S.newType.get(pid) === name) setRecType(pid, "");
+  if (S.recFolder && S.recFolder.pid === pid && S.recFolder.type === name) S.recFolder = null;
+  S.feed.clear();
+  await guarded(loadProjects);
+  renderTop(); renderSide(); renderFeed();
+  toast(res.deleted ? `${name} removed, ${plural(res.deleted, "meeting")} deleted` : `${name} removed from Steno`);
+}
+
+// ---------------------------------------------------------------- menus on rows and in the header
+//
+// One list of items per kind of row. The same items come from right-click on the row, the ⋯ button
+// on the row (hover; always on the selected row) and the ⋯ in the header (for the open project).
+
+function projectItems(p) {
+  const act = (fn) => () => guarded(() => fn(p));
+  const folderOpen = pickerAvailable() && p.path && !p.path_missing
+    ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("project", p.id)) }] : [];
+  if (p.archived) {
+    return [
+      { label: "Restore", sub: "Show it in the project list again", icon: "unarchive", onclick: act((x) => archiveProject(x, false)) },
+      ...folderOpen,
+      "-",
+      { label: "Delete...", icon: "trash", danger: true, onclick: act(deleteProject) }];
+  }
+  return [
+    { label: "New subfolder...", icon: "folderPlus", onclick: () => guarded(() => addSubfolder(p.id)) },
+    "-",
+    { label: "Rename...", icon: "pencil", onclick: act(renameProject) },
+    { label: p.path ? "Change linked folder..." : "Link folder...", icon: "folder", onclick: act(linkProjectFolder) },
+    ...(p.path ? [{ label: "Unlink folder", sub: "The folder and its files stay", icon: "forget", onclick: act(unlinkProjectFolder) }] : []),
+    ...folderOpen,
+    "-",
+    { label: "Archive", sub: "Hide it from the list; meetings and files stay", icon: "archive", onclick: act((x) => archiveProject(x, true)) },
+    { label: "Delete...", icon: "trash", danger: true, onclick: act(deleteProject) }];
+}
+
+function subfolderItems(pid, t) {
+  const p = projectById(pid);
+  const closed = !!(p && p.archived);
+  return [
+    { label: "Record here", icon: "mic", disabled: closed, title: closed ? "Restore the project to record into it" : null, onclick: () => newMeeting(pid, t.name) },
+    ...(pickerAvailable() && !t.missing ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("type", pid, t.name)) }] : []),
+    "-",
+    { label: "Rename...", icon: "pencil", onclick: () => guarded(() => renameSubfolder(pid, t.name)) },
+    { label: "Change folder...", sub: t.missing ? "The folder is missing" : null, icon: "folder", onclick: () => guarded(() => changeSubfolderFolder(pid, t)) },
+    "-",
+    { label: "Remove...", sub: "The folder and your files stay", icon: "trash", danger: true, onclick: () => guarded(() => removeSubfolder(pid, t)) }];
+}
+
+function inboxItems() {
+  return [
+    ...(pickerAvailable() ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("inbox")) }, "-"] : []),
+    { label: "Delete all meetings...", sub: `The ${S.inbox} in ${INBOX_NAME}`, icon: "trash", danger: true, disabled: !S.inbox, onclick: () => guarded(deleteInbox) }];
+}
+
+/* The header's ⋯: the open project (or the Inbox). */
+function headerItems() {
+  if (S.sel === "inbox") return inboxItems();
+  const p = curProject();
+  return p ? projectItems(p) : [];
+}
+
+/* Right-click on a sidebar row (data-ctx on the row) opens the same menu as its ⋯. */
+function ctxBuilder(el) {
+  const { ctx, pid, sid, type } = el.dataset;
+  if (ctx === "project") { const p = projectById(pid); return p ? () => projectItems(projectById(pid) || p) : null; }
+  if (ctx === "inbox") return inboxItems;
+  if (ctx === "type") { const t = projTypes(pid).find((x) => x.name === type); return t ? () => subfolderItems(pid, projTypes(pid).find((x) => x.name === type) || t) : null; }
+  if (ctx === "meeting") { const found = findMeeting(sid); return found ? () => meetingItems(found.info, pid, null) : null; }
+  return null;
+}
+function initContextMenus() {
+  document.addEventListener("contextmenu", (ev) => {
+    if (DRAG.press || DRAG.active) return;  // initDrag() swallows it
+    const target = ev.target instanceof Element ? ev.target : null;
+    if (!target) return;
+    if (target.closest(".menu")) { ev.preventDefault(); return; }
+    const el = target.closest("[data-ctx]");
+    const build = el && ctxBuilder(el);
+    if (!build) return;  // anywhere else the normal menu (copy, paste in fields) stays
+    ev.preventDefault();
+    let x = ev.clientX, y = ev.clientY;
+    if (!x && !y) { const r = el.getBoundingClientRect(); x = r.left + 28; y = r.bottom - 4; }  // from the keyboard (menu key)
+    showMenu(null, build, { x, y }, el.querySelector("button"));
+  });
+}
+
 // ---------------------------------------------------------------- top bar: recording controls and status strip
 
 function renderTop() {
@@ -1109,13 +1472,15 @@ function renderTop() {
   renderTypeSelect(proj, active);
   renderFolderButton(proj, active);
   $("btn-projmenu").hidden = !proj && S.sel !== "inbox";
-  const noProject = !S.sel;
+  const archivedSel = !!(proj && proj.archived);
+  const noProject = !S.sel || archivedSel;
   const dock = $("dock");
   dock.dataset.state = st === "recording" ? (r.paused ? "paused" : "recording") : st;
   $("rec-title").disabled = noProject || active;
   const rec = $("btn-rec");
   rec.disabled = noProject || st === "starting" || st === "stopping";
   $("btn-rec-label").textContent = st === "starting" ? "Starting..." : "Record";
+  rec.title = archivedSel ? "This project is archived. Restore it to record into it." : "";
   const pause = $("btn-pause");
   if (pause.dataset.paused !== String(!!r.paused)) {
     pause.dataset.paused = String(!!r.paused);
@@ -1152,7 +1517,7 @@ function renderTop() {
 const recFolderOf = (pid) => (S.recFolder && S.recFolder.pid === pid ? S.recFolder : null);
 function renderFolderButton(proj, active) {
   const btn = $("rec-folder");
-  btn.hidden = !proj || !pickerAvailable();
+  btn.hidden = !proj || proj.archived || !pickerAvailable();
   btn.disabled = active;
   if (btn.hidden) return;
   const f = recFolderOf(proj.id);
@@ -1193,16 +1558,18 @@ function recFolderClick() {
 // white list on Windows that ignores the theme).
 function renderTypeSelect(proj, active) {
   const btn = $("rec-type");
-  const types = proj ? proj.types || [] : [];
+  const types = proj && !proj.archived ? proj.types || [] : [];
   btn.hidden = !types.length;
   btn.disabled = active;
   if (!types.length) return;
   const cur = recType(proj.id);
-  const key = [proj.id, proj.name, cur, ...types.map((t) => t.name)].join("|");
+  const key = [proj.id, proj.name, cur, ...types.map((t) => t.name + (t.missing ? "!" : ""))].join("|");
   if (btn.dataset.key === key) return;
   btn.dataset.key = key;
-  btn.replaceChildren(icon("folder"), h("span", { class: "dt-name", text: cur || "Project root" }), icon("chevron"));
-  btn.title = `Saved in: ${proj.name} › ${cur || "project root"}. Click to change.`;
+  const here = types.find((t) => t.name === cur);
+  btn.replaceChildren(icon(here && here.missing ? "alert" : "folder"), h("span", { class: "dt-name", text: cur || "No subfolder" }), icon("chevron"));
+  btn.title = cur ? `Saved in: ${proj.name} › ${cur}${here && here.missing ? " (its folder is missing: kept in Steno)" : ""}. Click to change.`
+    : `Saved in ${proj.name} without a subfolder (kept in Steno, no folder on disk). Click to change.`;
 }
 
 function typeMenuItems() {
@@ -1215,119 +1582,10 @@ function typeMenuItems() {
     renderSide(); renderTop(); if (S.meeting === "new") renderFeed();
   };
   return [{ header: "Save the next meeting in" },
-    ...(proj.types || []).map((t) => ({ label: t.name, sub: t.folder || null, icon: t.name === cur ? "check" : "folder", onclick: pick(t.name) })),
+    ...(proj.types || []).map((t) => ({ label: t.name, sub: t.missing ? "Folder missing: kept in Steno" : t.folder || null,
+      icon: t.name === cur ? "check" : t.missing ? "alert" : "folder", onclick: pick(t.name) })),
     "-",
-    { label: "Project root", sub: "Steno/", icon: cur ? "folder" : "check", onclick: pick("") }];
-}
-
-/* Edit a project's meeting types: name + folder (inside the project) per row. */
-function typesModal(p) {
-  return new Promise((resolve) => {
-    const dlg = $("modal");
-    const list = h("div", { class: "typerows" });
-    const addRow = (t) => {
-      const name = h("input", { class: "text tn", type: "text", value: t.name || "", placeholder: "e.g. Board", maxlength: "80", autocomplete: "off" });
-      const folder = h("input", { class: "text tf", type: "text", value: t.folder || "", placeholder: "Meetings/Board", autocomplete: "off" });
-      let auto = !t.folder;  // follow the name until the folder is edited by hand
-      name.addEventListener("input", () => { if (auto) folder.value = name.value.trim() ? "Meetings/" + name.value.trim() : ""; });
-      folder.addEventListener("input", () => { auto = false; });
-      const rm = h("button", { class: "icon-btn", type: "button", title: "Remove subfolder (only when it has no meetings)", "aria-label": "Remove subfolder" }, icon("x"));
-      const row = h("div", { class: "typerow" }, name, folder, rm);
-      rm.addEventListener("click", () => row.remove());
-      list.append(row);
-      return name;
-    };
-    for (const t of p.types || []) addRow(t);
-    const err = h("p", { class: "ferr", role: "alert", hidden: true });
-    const finish =(v) => { resolve(v); if (dlg.open) dlg.close(); };
-    const form = h("form", { class: "mform", onsubmit: async (ev) => {
-      ev.preventDefault();
-      const types = [...list.children].map((row) => {
-        const [n, f] = row.querySelectorAll("input");
-        return { name: n.value.trim(), folder: f.value.trim() };
-      }).filter((t) => t.name || t.folder);
-      err.hidden = true;
-      try {
-        const res = await api("POST", `/api/projects/${encodeURIComponent(p.id)}/types`, { types });
-        finish(res.types);
-      } catch (e) { err.textContent = e.message; err.hidden = false; }  // toasts sit behind the dialog
-    } },
-    h("h3", { text: `Subfolders in ${p.name}` }),
-    h("p", { text: "Each type saves its meetings in its own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Meetings without a type stay in Steno/. No types = one simple list." }),
-    h("div", { class: "typehead" }, h("span", { text: "Name" }), h("span", { text: "Folder in the project" })),
-    list,
-    h("button", { class: "btn", type: "button", onclick: () => addRow({}).focus() }, icon("plus"), h("span", { text: "Add subfolder" })),
-    err,
-    h("div", { class: "btns" },
-      h("button", { class: "btn", type: "button", text: "Cancel", onclick: () => finish(null) }),
-      h("button", { class: "btn primary", type: "submit", text: "Save" })));
-    dlg.replaceChildren(form);
-    dlg.addEventListener("close", () => resolve(null), { once: true });
-    dlg.showModal();
-    if (!(p.types || []).length) addRow({}).focus();
-  });
-}
-
-/* Subfolders (meeting types) straight from the sidebar: create, rename, remove. */
-const typeList = (pid) => projTypes(pid).map((t) => ({ name: t.name, folder: t.folder }));  // what saveTypes takes
-async function saveTypes(pid, types) {
-  await api("POST", `/api/projects/${encodeURIComponent(pid)}/types`, { types });
-  if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
-  await loadProjects();
-}
-async function newSubfolder(pid) {
-  const p = S.projects.find((x) => x.id === pid);
-  if (!p) return;
-  const v = await formModal({
-    title: `New subfolder in ${p.name}`,
-    text: "Meetings of one kind get their own folder inside the project, e.g. Meetings/Board/2026-11-20 Lobby days. Press + next to it to record one.",
-    fields: [
-      { key: "name", label: "Name", placeholder: "e.g. Board, Dev team, 1-1, External" },
-      { key: "folder", label: "Folder in the project (optional)", placeholder: "Meetings/<name>" }],
-    ok: "Create" });
-  if (!v || !v.name) return;
-  await saveTypes(pid, [...typeList(pid), { name: v.name, folder: v.folder }]);
-  // the folder is made on disk together with the subfolder, so Explorer can show it right away
-  toast(`Subfolder ${v.name} created`, null, pickerAvailable()
-    ? { label: "Open in File Explorer", run: () => guarded(() => openInExplorer("type", pid, v.name)) } : null);
-}
-async function renameSubfolder(pid, name) {
-  const v = await formModal({ title: "Rename subfolder", text: "Only the name in Steno changes; the folder on disk stays.",
-    fields: [{ key: "name", label: "Name", value: name }], ok: "Rename" });
-  if (!v || !v.name || v.name === name) return;
-  await saveTypes(pid, typeList(pid).map((t) => (t.name === name ? { ...t, name: v.name } : t)));
-}
-async function removeSubfolder(pid, name, shown) {
-  // the server's count includes archived meetings, which the sidebar does not list
-  const count = Math.max(shown || 0, (projTypes(pid).find((t) => t.name === name) || {}).meetings || 0);
-  const ok = await formModal(count
-    ? { title: "Delete subfolder", text: `Delete ${name} and its ${count} meeting${count === 1 ? "" : "s"} (and any archived ones) for good? Recordings, transcripts, summaries and to-dos are deleted. Your own files in the meeting folders stay. This cannot be undone.`, ok: `Delete ${count} meeting${count === 1 ? "" : "s"}`, danger: true }
-    : { title: "Remove subfolder", text: `Remove ${name} from Steno? Its folder on disk goes only if it is empty; your own files stay.`, ok: "Remove", danger: true });
-  if (!ok) return;
-  const res = await api("POST", `/api/projects/${encodeURIComponent(pid)}/types/delete`, { name });
-  if (S.newType.get(pid) === name) setRecType(pid, "");
-  if (S.recFolder && S.recFolder.pid === pid && S.recFolder.type === name) S.recFolder = null;
-  S.feed.clear();
-  await loadProjects();
-  renderTop(); renderSide(); renderFeed();
-  if (res && res.deleted) toast(`${name} deleted with ${res.deleted} meeting${res.deleted === 1 ? "" : "s"}`);
-}
-function subfolderMore(pid, name, count) {
-  const more = h("button", { class: "padd tmore", type: "button", title: `${name}: rename or remove`, "aria-label": `${name} actions`, "aria-haspopup": "menu" }, icon("more"));
-  more.addEventListener("click", (ev) => { ev.stopPropagation(); showMenu(more, () => [
-    ...(pickerAvailable() ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("type", pid, name)) }] : []),
-    { label: "Rename...", icon: "pencil", onclick: () => guarded(() => renameSubfolder(pid, name)) },
-    { label: count ? "Delete..." : "Remove...", sub: count ? `With its ${count} meeting${count === 1 ? "" : "s"}; your own files stay` : "Your own files stay", icon: "trash", danger: true, onclick: () => guarded(() => removeSubfolder(pid, name, count)) }]); });
-  return more;
-}
-
-async function editTypes() {
-  const p = curProject();
-  if (!p) return;
-  const types = await typesModal(p);
-  if (!types) return;
-  toast(types.length ? `Subfolders saved (${types.length})` : "All subfolders removed");
-  await loadProjects();
+    { label: "No subfolder", sub: "Kept in Steno, no folder on disk", icon: cur ? "folder" : "check", onclick: pick("") }];
 }
 
 function sourcesOn() {
@@ -1411,7 +1669,7 @@ function renderJobChip() {
 }
 
 async function startRecording() {
-  if (!S.sel) return;
+  if (!S.sel || (curProject() || {}).archived) return;
   remember("steno-opts", JSON.stringify(S.opts));
   const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep, auto_title: S.autoTitle };
   const type = S.sel !== "inbox" ? recType(S.sel) : "";
@@ -1525,13 +1783,27 @@ function renderFeed() {
 }
 
 function newCard() {
-  const type = S.sel !== "inbox" ? recType(S.sel) : "";
+  const proj = S.sel !== "inbox" ? curProject() : null;
+  const type = proj ? recType(S.sel) : "";
   const where = projectName(S.sel) + (type ? " · " + type : "");
+  if (proj && proj.archived && !S.pendingRec) {
+    return h("div", { class: "newcard" },
+      h("div", { class: "newicon" }, icon("archive")),
+      h("h2", { text: `${proj.name} is archived` }),
+      h("p", { text: "Restore the project to record new meetings into it." }),
+      h("div", { class: "newcard-add" }, h("button", { class: "btn primary big", type: "button", text: "Restore", onclick: () => guarded(() => archiveProject(proj, false)) })));
+  }
+  // a project without subfolders: the big first step is adding one (a folder where its meetings are saved)
+  const first = !S.pendingRec && proj && !(proj.types || []).length;
   return h("div", { class: "newcard" },
-    h("div", { class: "newicon" }, S.pendingRec ? h("span", { class: "spinner big" }) : icon("mic")),
+    h("div", { class: "newicon" }, S.pendingRec ? h("span", { class: "spinner big" }) : icon(first ? "folderPlus" : "mic")),
     h("h2", { text: S.pendingRec ? "Starting the recording" : `New meeting in ${where}` }),
     h("p", { text: S.pendingRec ? "Loading the speech models. This takes a few seconds the first time."
-      : "Add a title below if you like, then press Record. Transcription runs on this computer." }));
+      : first ? "Add a subfolder to save its meetings in a folder on your computer, e.g. Board or 1-1. Without one, a meeting stays in Steno."
+        : "Add a title below if you like, then press Record. Transcription runs on this computer." }),
+    first ? h("div", { class: "newcard-add" },
+      h("button", { class: "btn primary big", type: "button", onclick: () => guarded(() => addSubfolder(proj.id)) }, icon("folderPlus"), h("span", { text: "Add subfolder" })),
+      h("p", { class: "nc-or", text: "or press Record below to keep this meeting in Steno" })) : null);
 }
 
 function jobLabel(job) {
@@ -1664,6 +1936,18 @@ async function deleteMeeting(info, pid) {
   if (S.sel === pid || S.meeting === null) await loadFeed();
 }
 
+function saveVisible(info) {
+  const r = S.status.recorder || {};
+  const live = info.recording || (r.session === info.session && r.state && r.state !== "idle" && r.state !== "error");
+  return info.folder === "" && !live;
+}
+function saveButton(info) {
+  const tip = "Save this meeting into a folder on your computer: a subfolder of a project, or a folder you choose";
+  const b = h("button", { class: "act", type: "button", title: tip }, icon("move"), h("span", { text: "Save to..." }));
+  b.addEventListener("click", () => guarded(() => saveMeetingTo(info)));
+  return b;
+}
+
 function buildMeeting(m) {
   const info = m.info, sid = info.session;
   m.rows = new Map();
@@ -1682,7 +1966,9 @@ function buildMeeting(m) {
     act("todo", m.docs.todo ? "Redo to-do" : "To-do", "todo", m.docs.todo ? "Extract to-dos again with Claude" : "Extract explicit commitments with Claude"),
     act("clean", "Clean up", "wand", "Fix misheard words and punctuation with Claude"),
     // only for an untitled meeting: Claude names it from what was said (same as the automatic title)
-    titleOf(info) ? null : act("title", "Auto title", "heading", "Let Claude name this meeting from what was said (sends transcript text only)"));
+    titleOf(info) ? null : act("title", "Auto title", "heading", "Let Claude name this meeting from what was said (sends transcript text only)"),
+    // no folder on disk (kept in Steno, or in the Inbox): put it in a subfolder or an existing folder
+    saveVisible(info) ? saveButton(info) : null);
   m.jobEl = h("div", { class: "mjob", hidden: true });
   m.docsEl = h("div", { class: "docs" });
   m.linesEl = h("div", { class: "lines" });
@@ -1895,31 +2181,93 @@ function renameMeeting(m, btn) {
 async function moveMeeting(info, current) {
   const options = [];
   for (const p of S.projects) {
+    if (p.archived && p.id !== current) continue;  // nothing is moved into an archived project
     const types = p.types || [];
     options.push({ value: p.id, label: types.length ? `${p.name} (no subfolder)` : p.name });
-    for (const t of types) options.push({ value: `${p.id}|${t.name}`, label: `${p.name} › ${t.name}` });
+    for (const t of types) options.push({ value: `${p.id}|${t.name}`, label: `${p.name} › ${t.name}${t.missing ? " (folder missing)" : ""}`, disabled: !!t.missing });
   }
   options.push({ value: "inbox", label: INBOX_NAME });
   const here = current + (info.type ? "|" + info.type : "");
-  const v = await formModal({ title: "Move meeting", text: "The meeting folder is moved along: into the subfolder, into Steno/ at the project root, or out of the project into the Inbox / TBD.", fields: [{ key: "to", label: "Move to", options, value: here }], ok: "Move" });
-  if (!v || v.to === here) return;
-  const cut = v.to.indexOf("|");
-  const pid = cut < 0 ? v.to : v.to.slice(0, cut), type = cut < 0 ? null : v.to.slice(cut + 1);
-  await moveMeetingTo(info, current, pid, type);
+  const split = (to) => { const cut = to.indexOf("|"); return cut < 0 ? { pid: to, type: null } : { pid: to.slice(0, cut), type: to.slice(cut + 1) }; };
+  const v = await formModal({ title: "Move meeting",
+    text: "Into a subfolder, the meeting folder moves into that folder. Into a project without a subfolder, it is kept in Steno (no folder on disk). Into the Inbox / TBD, it leaves the project.",
+    fields: [{ key: "to", label: "Move to", options, value: here }], ok: "Move",
+    submit: async (vals) => {
+      if (vals.to === here) return null;
+      const { pid, type } = split(vals.to);
+      await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: pid, type: type || "" });
+      return { pid, type };
+    } });
+  if (!v) return;
+  await afterMeetingMoved(info, current, v.pid, v.type, `Moved to ${projectName(v.pid)}${v.type ? " › " + v.type : ""}`);
 }
 
-/* Move a meeting (dialog or drag): pid is a project id or "inbox", type a subfolder name or null.
-   Keeps the meeting open if it was open, and refreshes the lists. */
+/* Move a meeting by drag: pid is a project id or "inbox", type a subfolder name or null (null = in the
+   project itself, without a subfolder). */
 async function moveMeetingTo(info, current, pid, type) {
-  await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: pid, type });
-  toast(`Moved to ${projectName(pid)}${type ? " › " + type : ""}`);
-  if (S.feed.has(info.session)) S.feed.get(info.session).info.type = type;
+  await api("POST", `/api/meetings/${encodeURIComponent(info.session)}/move`, { project: pid, type: type || "" });
+  await afterMeetingMoved(info, current, pid, type, `Moved to ${projectName(pid)}${type ? " › " + type : ""}`);
+}
+
+/* After a move or a save: keeps the meeting open if it was open, and refreshes the lists. */
+async function afterMeetingMoved(info, current, pid, type, message) {
+  toast(message);
+  if (S.feed.has(info.session)) S.feed.get(info.session).info.type = type || null;
   const open = S.sel === current && S.meeting === info.session;
   if (!S.expanded.has(pid)) { S.expanded.add(pid); saveExpanded(); }
   await loadProjects();
   const list = await fetchList(pid);  // fresh, so the moved meeting is found when selecting it
   if (S.sel === pid) S.meetings = list;
   if (open) selectMeeting(pid, info.session); else if (S.sel === current) await loadFeed();
+}
+
+/* Save to...: for a meeting that has no folder on disk. Pick a subfolder of any project (its folder
+   is used), or an existing meeting folder inside one of them. */
+async function saveMeetingTo(info) {
+  const current = S.sel;
+  const groups = S.projects.filter((p) => !p.archived && (p.types || []).length);
+  let pick = null, folder = null;  // pick: {pid, name, label} (a subfolder) | {path} (an existing folder)
+  const rows = [];
+  const res = await modal({
+    title: "Save meeting to",
+    text: "Steno writes the transcript, summary and to-do into a meeting folder there.",
+    ok: "Save here",
+    content: (ctx) => {
+      ctx.setOk({ disabled: true });
+      const mark = () => {
+        for (const r of rows) { const on = !!pick && !pick.path && r.pid === pick.pid && r.name === pick.name; r.el.classList.toggle("on", on); r.el.setAttribute("aria-checked", String(on)); }
+        ctx.setOk({ disabled: !pick });
+      };
+      const list = h("div", { class: "pick-list", role: "radiogroup", "aria-label": "Save to" });
+      for (const p of groups) {
+        list.append(h("div", { class: "pick-h", text: p.name }));
+        for (const t of p.types) {
+          const el = h("button", { class: "pick-row", type: "button", role: "radio", "aria-checked": "false", disabled: !!t.missing,
+            title: t.missing ? t.folder + "\nThis folder is missing." : t.folder },
+          icon(t.missing ? "alert" : "folder"), h("span", { class: "pk-name", text: t.name }),
+          h("span", { class: "pk-sub", text: t.missing ? "folder missing" : baseName(t.folder) }), icon("check", "pk-check"));
+          el.addEventListener("click", () => { pick = { pid: p.id, name: t.name, label: `${p.name} › ${t.name}` }; if (folder) folder.set("", true); mark(); });
+          rows.push({ el, pid: p.id, name: t.name });
+          list.append(el);
+        }
+      }
+      if (!groups.length) list.append(h("p", { class: "pick-none", text: "No project has a subfolder yet. Add one first, or choose an existing folder below." }));
+      folder = folderField({ label: "Or an existing meeting folder", button: "Choose existing folder...", start: "project", ref: current && current !== "inbox" ? current : null,
+        onChange: (path) => { pick = path ? { path } : null; mark(); } });
+      return [list, folder.el];
+    },
+    submit: async () => {
+      if (!pick) throw new Error("Choose where to save it.");
+      const sid = encodeURIComponent(info.session);
+      if (pick.path) {
+        const r = await api("POST", `/api/meetings/${sid}/save`, { folder: pick.path });
+        return { pid: r.project, type: r.type || null, message: `Saved to ${baseName(r.folder) || baseName(pick.path)}` };
+      }
+      await api("POST", `/api/meetings/${sid}/move`, { project: pick.pid, type: pick.name });
+      return { pid: pick.pid, type: pick.name, message: `Saved to ${pick.label}` };
+    },
+  });
+  if (res) await afterMeetingMoved(info, current, res.pid, res.type, res.message);
 }
 
 // ---------------------------------------------------------------- drag to move
@@ -1992,6 +2340,7 @@ function dropTargetAt(x, y) {
 }
 
 function canDrop(d, t) {
+  if (t && (projectById(t.pid) || {}).archived) return false;  // nothing is moved into an archived project
   return !!t && !(t.pid === d.from && (t.type || null) === d.fromType);
 }
 
@@ -2477,11 +2826,15 @@ function handleEvent(name, data) {
   }
 }
 
-let lastState = null, lastSession = null, lastError = null;
+let lastState = null, lastSession = null, lastError = null, lastNotice = null;
 function onStatus() {
   const r = S.status.recorder || {};
   if (r.state === "error" && r.error && r.error !== lastError) toast(r.error, "error");
   lastError = r.state === "error" ? r.error : null;
+  // e.g. the subfolder's folder was missing: shown once per recording (and not again when Steno is opened later)
+  const noticeKey = r.notice && r.state && r.state !== "idle" && r.state !== "error" ? `${r.session || ""}|${r.notice}` : null;
+  if (noticeKey && noticeKey !== lastNotice) toast(r.notice, "warn");
+  lastNotice = noticeKey;
   if (r.session && r.session !== lastSession) { scheduleFeed(); scheduleProjects(); }
   if (r.state === "recording" && lastState !== "recording") S.stick = true;
   if (r.state === "idle" && lastState && lastState !== "idle") { scheduleFeed(); scheduleProjects(); }
@@ -2607,19 +2960,10 @@ function init() {
   window.addEventListener("pywebviewready", () => { markBrowserMode(); applyLook(); renderSide(); });
   fillIcons();
   initResizer();
-  $("btn-addmenu").addEventListener("click", () => showMenu($("btn-addmenu"), () => [
-    { label: "New project", sub: "Create a new folder", icon: "folderPlus", onclick: () => guarded(newProject) },
-    { label: "Add existing folder", icon: "folder", onclick: () => guarded(addProject) }]));
+  $("btn-addmenu").addEventListener("click", () => guarded(newProject));
   $("empty-new").addEventListener("click", () => guarded(newProject));
-  $("empty-add").addEventListener("click", () => guarded(addProject));
-  $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), () => (S.sel === "inbox"
-    ? [{ label: "Delete all meetings...", sub: `The ${S.inbox} in ${INBOX_NAME}`, icon: "trash", danger: true, disabled: !S.inbox, onclick: () => guarded(deleteInbox) }]
-    : [
-      ...(pickerAvailable() && S.sel
-        ? [{ label: "Open in File Explorer", icon: "folderOpen", onclick: () => guarded(() => openInExplorer("project", S.sel)) }] : []),
-      { label: "Subfolders...", sub: "Board, 1-1, ... each in its own folder", icon: "folderPlus", onclick: () => guarded(editTypes) },
-      "-",
-      { label: "Remove project...", sub: "Optionally with its meetings; your files stay", icon: "trash", danger: true, onclick: () => guarded(removeProject) }])));
+  $("btn-projmenu").addEventListener("click", () => showMenu($("btn-projmenu"), headerItems));
+  initContextMenus();
   initDrag();
   watchDay();
   $("nav-people").addEventListener("click", showPeople);

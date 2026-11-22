@@ -18,36 +18,31 @@ from .test_ui import LINES, burst_audio, fake_engine_factory, make_session, make
 __all__ = ["make_ui"]  # fixture re-export
 
 
-def test_create_project_sets_up_a_private_steno_folder(tmp_path):
-    (tmp_path / ".git").mkdir()  # inside a git repo: meeting text is kept out of it
+def test_add_project_registers_a_folder_and_writes_nothing(tmp_path):
+    (tmp_path / ".git").mkdir()
     p = projects.add_project(tmp_path, name="Course: AI/ML", create=True)
     assert p.path == (tmp_path / "Course AI ML").resolve() and p.name == "Course AI ML"
-    steno = p.path / "Steno"
-    assert (steno / ".gitignore").read_text(encoding="utf-8").strip().endswith("*")
-    assert "summary.md" in (steno / "CLAUDE.md").read_text(encoding="utf-8")
+    assert list(p.path.iterdir()) == []  # no Steno/ folder, no CLAUDE.md, no .gitignore
     assert [x.id for x in projects.list_projects()] == [p.id]
     assert projects.add_project(p.path).id == p.id  # adding again does not duplicate
     assert len(projects.list_projects()) == 1
     projects.remove_project(p.id)
-    assert projects.list_projects() == [] and steno.is_dir()  # files stay
-
-
-def test_own_claude_md_is_never_overwritten(tmp_path):
-    (tmp_path / "Steno").mkdir()
-    (tmp_path / "Steno" / "CLAUDE.md").write_text("my notes", encoding="utf-8")
-    projects.add_project(tmp_path)
-    assert (tmp_path / "Steno" / "CLAUDE.md").read_text(encoding="utf-8") == "my notes"
+    assert projects.list_projects() == [] and p.path.is_dir()  # files stay
 
 
 def test_meeting_folder_lifecycle(tmp_path):
-    a = projects.add_project(tmp_path / ".", name="A", create=True)
-    b = projects.add_project(tmp_path, name="B", create=True)
+    folders = {}
+    for name in ("a", "b"):
+        folders[name] = tmp_path / name
+        folders[name].mkdir()
+    a = projects.add_type(projects.create_project("A").id, "Board", folders["a"])
+    b = projects.add_type(projects.create_project("B").id, "Board", folders["b"])
     writer = make_session("2026-01-01T10:30:00", LINES)
-    m = projects.create_meeting(a, writer.dir, "Kickoff?")
-    assert m.folder.name == "2026-01-01 Kickoff" and m.folder.parent == a.steno_dir
+    m = projects.create_meeting(a, writer.dir, "Kickoff?", "Board")
+    assert m.folder.name == "2026-01-01 Kickoff" and m.folder.parent == folders["a"].resolve()
     text = (m.folder / "transcript.md").read_text(encoding="utf-8")
     assert text.startswith("# Kickoff") and "Hello there everyone" in text
-    assert "**recording**" in (a.steno_dir / "index.md").read_text(encoding="utf-8")
+    assert not (folders["a"] / "index.md").exists()  # no index is written any more
     assert projects.meeting_folder(writer.dir) == m.folder
     assert projects.project_of(writer.dir).id == a.id
 
@@ -59,10 +54,9 @@ def test_meeting_folder_lifecycle(tmp_path):
     assert r.folder.name == "2026-01-01 Planning" and not m.folder.exists()
     assert projects.meeting_title(writer.dir) == "Planning"
 
-    mv = projects.move_meeting(writer.dir, b)
-    assert mv.folder.parent == b.steno_dir and (mv.folder / "summary.md").is_file()
+    mv = projects.move_meeting(writer.dir, b, "Board")
+    assert mv.folder.parent == folders["b"].resolve() and (mv.folder / "summary.md").is_file()
     assert projects.list_meetings(a) == [] and len(projects.list_meetings(b)) == 1
-    assert "Planning" in (b.steno_dir / "index.md").read_text(encoding="utf-8")
     assert projects.inbox_sessions() == []
 
 
@@ -95,15 +89,20 @@ def test_paused_audio_reaches_the_engine_as_silence():
 
 def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
     _, c = make_ui(engine_factory=fake_engine_factory(burst_audio()))
-    assert c.post("/api/projects", {"path": str(tmp_path / "missing")})[0] == 400
-    status, res = c.post("/api/projects", {"path": str(tmp_path), "name": "Thesis",
-                                           "create": True})
-    assert status == 200
+    assert c.post("/api/projects", {"path": str(tmp_path / "missing")})[0] == 400  # older form
+    assert c.post("/api/projects", {"name": " "})[0] == 400
+    notes = tmp_path / "thesis-notes"
+    notes.mkdir()
+    status, res = c.post("/api/projects", {"name": "Thesis"})
+    assert status == 200 and res["project"]["path"] == "" and res["project"]["types"] == []
     pid = res["project"]["id"]
+    assert [f.name for f in tmp_path.iterdir() if f != notes] == ["data"]  # nothing written
+    status, _ = c.post(f"/api/projects/{pid}/subfolders", {"folder": str(notes), "name": "Notes"})
+    assert status == 200
     assert c.get("/api/projects")[1]["projects"][0]["name"] == "Thesis"
 
     c.post("/api/record/start", {"mic": True, "loopback": False, "project": pid,
-                                 "title": "Weekly"})
+                                 "type": "Notes", "title": "Weekly"})
     rec = wait_for(lambda: (r := c.get("/api/status")[1]["recorder"])["state"] == "recording"
                    and r)
     assert rec["project"] == pid
@@ -117,19 +116,20 @@ def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
     meetings = c.get(f"/api/projects/{pid}/meetings")[1]["meetings"]
     assert len(meetings) == 1 and meetings[0]["title"] == "Weekly"
     sid = meetings[0]["session"]
-    folder = tmp_path / "Thesis" / "Steno" / meetings[0]["folder"].split("\\")[-1].split("/")[-1]
-    assert (folder / "transcript.md").is_file()
+    folder = Path(meetings[0]["folder"])
+    assert folder.parent == notes.resolve() and (folder / "transcript.md").is_file()
     assert json.loads((folder / ".steno-meeting.json").read_text())["session"] == sid
     assert c.get(f"/api/sessions/{sid}")[1]["title"] == "Weekly"
     assert c.get(f"/api/sessions/{sid}/doc/summary")[0] == 404
 
     assert c.post(f"/api/meetings/{sid}/rename", {"title": "Weekly sync"})[1]["title"] == \
         "Weekly sync"
-    other = c.post("/api/projects", {"path": str(tmp_path), "name": "Other",
-                                     "create": True})[1]["project"]["id"]
+    other = c.post("/api/projects", {"name": "Other"})[1]["project"]["id"]  # a label only
     assert c.post(f"/api/meetings/{sid}/move", {"project": other})[0] == 200
+    assert not folder.exists()  # Steno's files left; the empty folder went with them
     assert c.get(f"/api/projects/{pid}/meetings")[1]["meetings"] == []
-    assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["title"] == "Weekly sync"
+    moved_to = c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]
+    assert moved_to["title"] == "Weekly sync" and moved_to["folder"] == ""
     assert c.get("/api/projects/inbox/meetings")[1]["meetings"] == []
 
     # archive hides it from the counts but keeps everything; unarchive brings it back
@@ -142,11 +142,9 @@ def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
     assert c.post(f"/api/meetings/{sid}/archive", {"archived": False})[1]["archived"] is False
     assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["archived"] is False
 
-    # delete removes the session and the meeting folder, nothing else
-    moved = Path(c.get(f"/api/projects/{other}/meetings")[1]["meetings"][0]["folder"])
-    assert moved.is_dir()
+    # delete removes the session (it has no folder here), nothing else
     assert c.raw("DELETE", f"/api/meetings/{sid}")[0] == 200
-    assert not moved.exists() and moved.parent.is_dir()
+    assert notes.is_dir()
     assert c.get(f"/api/sessions/{sid}")[0] == 404
     assert c.get(f"/api/projects/{other}/meetings")[1]["meetings"] == []
     assert c.raw("DELETE", f"/api/meetings/{sid}")[0] == 404
@@ -158,7 +156,7 @@ def test_project_api_and_recording_into_a_project(make_ui, tmp_path):
 
 def test_meeting_types_put_meetings_in_their_own_folders(tmp_path):
     p = projects.add_project(tmp_path, name="Club", create=True)
-    for bad in ("..", "../x", "C:/x", "/abs", "Steno", "a/b/c/d/e"):
+    for bad in ("..", "../x", "\\abs", "Steno", "a/b/c/d/e"):
         with pytest.raises(projects.ProjectError):
             projects.set_types(p.id, [{"name": "X", "folder": bad}])
     with pytest.raises(projects.ProjectError):
@@ -175,11 +173,11 @@ def test_meeting_types_put_meetings_in_their_own_folders(tmp_path):
     assert (m1.folder / projects.MEETING_FILE).is_file()
     assert projects.type_of(w1.dir) == "Board" and projects.project_of(w1.dir).id == p.id
     w2 = make_session("2026-11-21T10:00:00", LINES)
-    projects.create_meeting(p, w2.dir, "Plain")  # no type: Steno/ as before
-    assert projects.type_of(w2.dir) is None
+    plain = projects.create_meeting(p, w2.dir, "Plain")  # no type: kept in Steno, no folder
+    assert plain.folder is None and projects.type_of(w2.dir) is None
+    assert projects.project_of(w2.dir).id == p.id
     assert [m.session for m in projects.list_meetings(p)] == [w1.dir.name, w2.dir.name]
-    index = (p.steno_dir / "index.md").read_text(encoding="utf-8")
-    assert "`Meetings/Board/2026-11-20 Lobby days/` (Board)" in index
+    assert not (p.path / "Steno").exists()
     with pytest.raises(projects.ProjectError):
         projects.create_meeting(p, w2.dir, "x", "Nope")
 
@@ -191,8 +189,9 @@ def test_meeting_types_put_meetings_in_their_own_folders(tmp_path):
 
     mv = projects.move_meeting(w2.dir, p, "Styrelse")
     assert mv.folder.parent == p.path / "Meetings" / "Board"
-    mv = projects.move_meeting(w1.dir, p)  # back to no type
-    assert mv.folder.parent == p.steno_dir and projects.type_of(w1.dir) is None
+    mv = projects.move_meeting(w1.dir, p)  # back to no type: no folder any more
+    assert mv.folder is None and projects.type_of(w1.dir) is None
+    assert projects.project_of(w1.dir).id == p.id
     projects.delete_meeting(w2.dir)
     assert not (p.path / "Meetings" / "Board" / "2026-11-21 Plain").exists()
     assert (p.path / "Meetings" / "Board").is_dir()
@@ -206,7 +205,9 @@ def test_meeting_types_api(make_ui, tmp_path):
     assert c.post(f"/api/projects/{pid}/types", {"types": [{"name": "B", "folder": ".."}]})[0] \
         == 400
     res = c.post(f"/api/projects/{pid}/types", {"types": [{"name": "Board"}]})[1]
-    assert res["types"] == [{"name": "Board", "folder": "Meetings/Board", "meetings": 0}]
+    board = projects.get_project(pid).path / "Meetings" / "Board"
+    assert res["types"] == [{"name": "Board", "folder": str(board), "missing": False,
+                             "meetings": 0}]
     assert c.get("/api/projects")[1]["projects"][0]["types"] == res["types"]
     assert c.post("/api/record/start", {"mic": True, "loopback": False, "project": pid,
                                         "type": "Nope"})[0] == 400
@@ -251,8 +252,8 @@ def test_move_to_the_inbox_and_back(tmp_path):
     assert [s.id for s in projects.inbox_sessions()] == [w.dir.name]
     assert (w.dir / "summary.md").read_text(encoding="utf-8") == "# Summary\n"  # nothing lost
     assert projects.list_meetings(p) == []
-    assert "Lobby days" not in (p.steno_dir / "index.md").read_text(encoding="utf-8")
-    assert projects.move_to_inbox(w.dir).folder == w.dir  # already there: nothing happens
+    assert not (p.path / "Steno").exists()
+    assert projects.move_to_inbox(w.dir).folder is None  # already there: nothing happens
 
     back = projects.move_meeting(w.dir, p, "Dev team")
     assert back.folder == p.path / "Meetings" / "Dev team" / "2026-11-20 Lobby days"
@@ -264,7 +265,7 @@ def test_move_to_the_inbox_and_back(tmp_path):
 def test_move_to_the_inbox_keeps_a_folder_with_other_files(tmp_path):
     p = _club(tmp_path)
     w = make_session("2026-11-20T10:00:00", LINES)
-    m = projects.create_meeting(p, w.dir, "Notes")
+    m = projects.create_meeting(p, w.dir, "Notes", "Board")
     (w.dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
     projects.sync(w.dir)
     (m.folder / "mine.txt").write_text("my own notes", encoding="utf-8")
@@ -292,8 +293,9 @@ def test_move_between_subfolders_and_root_handles_name_clashes(tmp_path):
     assert not b.folder.exists()
     assert projects.move_meeting(two.dir, p, "Board").folder == moved.folder  # same place
 
-    root = projects.move_meeting(one.dir, p)
-    assert root.folder.parent == p.steno_dir and projects.type_of(one.dir) is None
+    root = projects.move_meeting(one.dir, p)  # no subfolder: Steno's files leave the folder
+    assert root.folder is None and projects.type_of(one.dir) is None
+    assert not a.folder.exists() and projects.project_of(one.dir).id == p.id
     sub = projects.move_meeting(one.dir, p, "Dev team")
     assert sub.folder.parent == p.path / "Meetings" / "Dev team"
     assert sorted(m.session for m in projects.list_meetings(p)) == sorted(
@@ -374,9 +376,9 @@ def test_sync_retries_when_another_program_holds_the_file(tmp_path, monkeypatch,
     import logging
     import os
 
-    p = projects.add_project(tmp_path, name="Club", create=True)
+    p = _club(tmp_path)
     w = make_session("2026-11-20T10:00:00", LINES)
-    m = projects.create_meeting(p, w.dir, "Lobby days")
+    m = projects.create_meeting(p, w.dir, "Lobby days", "Board")
     monkeypatch.setattr(projects, "_LOCK_BACKOFF", 0.0)
     real_replace = os.replace
     fails = {"n": 2}
@@ -400,9 +402,9 @@ def test_sync_skips_quietly_when_the_file_stays_locked(tmp_path, monkeypatch, ca
     import logging
     import os
 
-    p = projects.add_project(tmp_path, name="Club", create=True)
+    p = _club(tmp_path)
     w = make_session("2026-11-20T10:00:00", LINES)
-    m = projects.create_meeting(p, w.dir, "Lobby days")
+    m = projects.create_meeting(p, w.dir, "Lobby days", "Board")
     before = (m.folder / "transcript.md").read_text(encoding="utf-8")
     monkeypatch.setattr(projects, "_LOCK_BACKOFF", 0.0)
     calls = {"n": 0}

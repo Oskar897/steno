@@ -245,6 +245,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.llm_install_page()
             if segs == ["projects"]:
                 return app.project_add(body)
+            if n == 3 and segs[0] == "projects" and segs[2] == "update":
+                return app.project_update(segs[1], body)
+            if n == 3 and segs[0] == "projects" and segs[2] == "subfolders":
+                return app.subfolder_add(segs[1], body)
+            if n == 4 and segs[0] == "projects" and segs[2:] == ["subfolders", "rename"]:
+                return app.subfolder_rename(segs[1], body)
+            if n == 4 and segs[0] == "projects" and segs[2:] == ["subfolders", "folder"]:
+                return app.subfolder_folder(segs[1], body)
             if n == 3 and segs[0] == "projects" and segs[2] == "types":
                 return app.project_types(segs[1], body)
             if n == 4 and segs[0] == "projects" and segs[2:] == ["types", "delete"]:
@@ -259,6 +267,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.settings_set(body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "rename":
                 return app.meeting_rename(segs[1], body)
+            if n == 3 and segs[0] == "meetings" and segs[2] == "save":
+                return app.meeting_save(segs[1], body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "move":
                 return app.meeting_move(segs[1], body)
             if n == 3 and segs[0] == "meetings" and segs[2] == "archive":
