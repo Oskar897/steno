@@ -41,7 +41,7 @@ class AppSettings:
     # Look of the desktop app: "system" follows Windows' app mode, or "dark" / "light".
     theme: str = "system"
     # Accent colours (surfaces stay grey): one of PALETTES, each with a dark and a light variant.
-    palette: str = "mono"
+    palette: str = "default"
     # How far the surfaces lean toward the palette colour: subtle (grey), medium or strong.
     intensity: str = "subtle"
     # Interface size in percent: text, icons and controls scale together.

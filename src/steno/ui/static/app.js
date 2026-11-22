@@ -2914,7 +2914,7 @@ const PALETTES = [
   ["deepsea", "Deep sea", ["#1b98e0", "#006494"], ["#006494", "#247ba0"]],
 ];
 const zoom = () => LOOK.scale / 100;  // CSS zoom of the app: pointer and rect coordinates are in screen px
-const LOOK = { theme: "system", palette: "mono", intensity: "subtle", scale: 100, transparent: true };
+const LOOK = { theme: "system", palette: "default", intensity: "subtle", scale: 100, transparent: true };
 const systemLight = window.matchMedia("(prefers-color-scheme: light)");
 function applyLook(s) {
   if (s && typeof s === "object") {
