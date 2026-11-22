@@ -59,9 +59,10 @@ class FakeLongform:
     def load(self):
         self.loaded += 1
 
-    def transcribe_longform(self, audio, *, batch_size=4, beam_size=None, progress=None):
+    def transcribe_longform(self, audio, *, batch_size=4, beam_size=None, progress=None,
+                            detect_english=False):
         self.calls.append({"seconds": len(audio) / 16000, "batch_size": batch_size,
-                           "beam_size": beam_size})
+                           "beam_size": beam_size, "detect_english": detect_english})
         segments = self.script
         if isinstance(segments, dict):  # keyed by the order of the call
             segments = segments[len(self.calls) - 1]
@@ -166,6 +167,15 @@ def test_longform_lines_drops_mic_echo_but_keeps_real_mic_speech():
     assert mic.seq == 2  # label fallback = the overlapping live mic line
 
 
+def test_longform_lines_passes_detect_english_only_when_asked():
+    live = lines_of(("mic", 2.0, 4.0))
+    fake = FakeLongform([seg(2.0, 4.0, "hej")])
+    fz.longform_lines({"mic": silence(6)}, {}, live, fake, batch_size=4, beam_size=1,
+                      detect_english=True)
+    fz.longform_lines({"mic": silence(6)}, {}, live, fake, batch_size=4, beam_size=1)
+    assert [c["detect_english"] for c in fake.calls] == [True, False]
+
+
 def test_a_partly_echoed_segment_is_cut_around_the_echo():
     live = lines_of(("loopback", 4.0, 6.0), ("mic", 2.0, 3.0))
     audio = {"mic": silence(10), "loopback": silence(10)}
@@ -260,7 +270,7 @@ def lf_script():
 def test_refined_and_fast_are_the_defaults_and_a_longform_model_is_configured():
     cfg = Config()
     assert cfg.post.asr_mode == "refined" and cfg.post.diarization == "fast"
-    assert cfg.post.asr_model == "deepdml/faster-whisper-large-v3-turbo-ct2"
+    assert cfg.post.asr_model == "KBLab/kb-whisper-medium"
     assert cfg.post.longform_beam_size == 1 and cfg.post.longform_batch_size == 4
 
 

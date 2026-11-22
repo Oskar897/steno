@@ -44,11 +44,15 @@ sys.path.insert(0, str(HERE))
 SR = 16000
 MODELS = {
     "small": "KBLab/kb-whisper-small",
+    "medium": "KBLab/kb-whisper-medium",
     "turbo": "deepdml/faster-whisper-large-v3-turbo-ct2",
 }
 #: A model downloaded by scripts/benchmark_asr.py lives in a plain folder of the models dir; the
 #: HF id would make faster-whisper download its own copy (1.6 GB for turbo), so reuse the folder.
-LOCAL_COPY = {"turbo": "deepdml_faster-whisper-large-v3-turbo-ct2"}
+LOCAL_COPY = {
+    "medium": "KBLab_kb-whisper-medium",
+    "turbo": "deepdml_faster-whisper-large-v3-turbo-ct2",
+}
 
 
 def load_eval(name: str, gap_s: float, repeat: int) -> tuple[np.ndarray, str, float]:
@@ -121,7 +125,7 @@ def pct(values: list[float], q: float) -> float:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--refine", default="small",
-                    help="small, turbo, off, or a model id (default small)")
+                    help="small, medium, turbo, off, or a model id (default small)")
     ap.add_argument("--dataset", default="codeswitch")
     ap.add_argument("--repeat", type=int, default=1, help="loop the audio this many times")
     ap.add_argument("--gap", type=float, default=1.0, help="seconds of silence between clips")

@@ -529,10 +529,10 @@ def test_engine_stop_without_drain_aborts_the_refiner(tmp_path):
 
 def test_refine_config_defaults_and_validation():
     cfg = Config()
-    assert cfg.refine.enabled and cfg.refine.model == "deepdml/faster-whisper-large-v3-turbo-ct2"
+    assert cfg.refine.enabled and cfg.refine.model == "KBLab/kb-whisper-medium"
     assert cfg.refine.window_speech_s == 25.0
     assert cfg.refine.fallback_model == "KBLab/kb-whisper-small"
-    assert cfg.refine.stop_budget_s == 12.0 and cfg.refine.detect_english
+    assert cfg.refine.stop_budget_s == 25.0 and cfg.refine.detect_english
     with pytest.raises(ConfigError):
         config_from_dict({"refine": {"window_speech_s": 0}})
     with pytest.raises(ConfigError):
@@ -611,3 +611,13 @@ def test_a_diarizer_that_cannot_load_is_dropped_but_recording_goes_on(tmp_path):
     assert engine.wait(timeout=30)
     engine.stop()
     assert len(seen) == 1 and not (engine.session_dir / "diar.bin").exists()
+
+
+def test_default_rate_knows_the_usual_models():
+    from steno.refine import DEFAULT_RATE, default_rate
+
+    assert default_rate("KBLab/kb-whisper-medium") == 0.65
+    assert default_rate(r"C:\models\KBLab_kb-whisper-medium") == 0.65
+    assert default_rate("deepdml/faster-whisper-large-v3-turbo-ct2") == 1.1
+    assert default_rate("something/else") == DEFAULT_RATE
+    assert default_rate(None) == DEFAULT_RATE

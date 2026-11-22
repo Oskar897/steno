@@ -112,11 +112,11 @@ auto_update_dup = 0.93          # skip samples this similar (cosine) to one alre
 # and replaces the draft text of the covered lines (revisions.jsonl; speakers stay attached).
 # Stopping then only refines the last window, so the finished transcript is ready in seconds.
 enabled = true
-model = "deepdml/faster-whisper-large-v3-turbo-ct2"  # ~1.6 GB download on first use; much better
-                             # than kb-whisper-small on English terms, ~1 s per second of speech
+model = "KBLab/kb-whisper-medium"  # ~1.5 GB download on first use; ~0.65 s per second of speech;
+                             # keeps English sentences inside Swedish speech (turbo dropped them)
 fallback_model = "KBLab/kb-whisper-small"  # used while far behind (back when caught up) and
                              # for the stop tail below; "" = none
-stop_budget_s = 12.0         # at stop: the rest goes to fallback_model when `model` would take
+stop_budget_s = 25.0         # at stop: the rest goes to fallback_model when `model` would take
                              # longer than this (estimated from its measured speed); 0 = never
 detect_english = true        # [asr] language "sv": English 30 s chunks stay English instead of
                              # being translated (no extra cost); lone English sentences inside
@@ -159,7 +159,7 @@ asr_mode = "refined"
 #   "thorough"  pyannote segmentation-3.0 + CAM++ over the kept audio (AMI: DER ~18 %,
 #               ~0.1 x the audio length). `steno finalize --thorough`.
 diarization = "fast"
-asr_model = "deepdml/faster-whisper-large-v3-turbo-ct2"  # ~1.6 GB; on a 166 s Swedish+English test: WER 19 % vs 22 % (kb-whisper-small), English terms 77 % vs 49 %
+asr_model = "KBLab/kb-whisper-medium"  # ~1.5 GB; 172 s Swedish+English test, whole file: WER 6 % vs 21 % (large-v3-turbo) and 22 % (kb-whisper-small)
 asr_beam_size = 5            # selective mode
 longform_beam_size = 1
 longform_batch_size = 4      # 30 s windows decoded together

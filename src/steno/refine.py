@@ -70,8 +70,17 @@ class _Requeue(Exception):
 
 
 #: Seconds of decoding per second of speech assumed for ``[refine] model`` before the first
-#: window has been measured (turbo on a 4-core laptop CPU is about this).
+#: window has been measured (turbo on a 4-core laptop CPU is about this) ...
 DEFAULT_RATE = 1.1
+#: ... or, when the model id contains one of these, that rate (measured in live replays on an
+#: i5-1235U with the live draft running next to it).
+KNOWN_RATES = {"kb-whisper-small": 0.3, "kb-whisper-medium": 0.65, "turbo": 1.1}
+
+
+def default_rate(model_name: str | None) -> float:
+    """The assumed decode rate of ``model_name`` before its first window was measured."""
+    name = (model_name or "").lower()
+    return next((r for key, r in KNOWN_RATES.items() if key in name), DEFAULT_RATE)
 
 
 # --------------------------------------------------------------------------- audio ring
@@ -535,7 +544,9 @@ class Refiner:
 
     def estimate_tail_s(self) -> float:
         """Expected seconds for ``[refine] model`` to refine what is left (caller holds lock)."""
-        rate = self._rate if self._rate is not None else DEFAULT_RATE
+        rate = self._rate
+        if rate is None:
+            rate = default_rate(getattr(self._tr, "name", None))
         left = sum(speech_seconds(v) for v in self._pending.values()) * rate
         if self._current is not None and self._current[2]:
             job, started, _ = self._current

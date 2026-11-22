@@ -157,6 +157,7 @@ pace, with the live draft model and the rolling refine worker running together.
 
 ```
 uv run python scripts/simulate_live.py --refine small            # kb-whisper-small refines
+uv run python scripts/simulate_live.py --refine medium           # kb-whisper-medium (the default refine model)
 uv run python scripts/simulate_live.py --refine turbo --repeat 4 # large-v3-turbo, ~11 min meeting
 uv run python scripts/simulate_live.py --refine off              # baseline of the live draft
 ```

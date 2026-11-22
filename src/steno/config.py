@@ -154,14 +154,18 @@ class RefineConfig:
     context in the background and replace the live draft text (``revisions.jsonl``)."""
 
     enabled: bool = True
-    model: str = "deepdml/faster-whisper-large-v3-turbo-ct2"
+    # kb-whisper-medium: on a 172 s Swedish+English read test decoded as one file it kept the
+    # English sentences (WER 6 %) where large-v3-turbo dropped a whole English paragraph and
+    # kb-whisper-large translated it (~21 %); in live replay windows the two were close (3.6 %
+    # vs 2.6 %), medium decoding faster (0.62 vs 0.68 s per speech second, stop 21 s vs 26 s).
+    model: str = "KBLab/kb-whisper-medium"
     # Cheaper model used instead while the worker is far behind (switching back when it has
     # caught up) and for the tail at stop when `model` would exceed stop_budget_s ("" = none).
     fallback_model: str = "KBLab/kb-whisper-small"
     # At stop: refine the remaining speech with `model` only if that is expected to take at
     # most this many seconds (from the measured speed), else with fallback_model. 0 = always
     # `model`.
-    stop_budget_s: float = 12.0
+    stop_budget_s: float = 25.0
     # [asr] language "sv": 30 s chunks that are English are transcribed as English instead
     # of being translated into Swedish (free: uses the encoder output the decoder needs).
     detect_english: bool = True
@@ -196,7 +200,7 @@ class PostConfig:
     # Model of the re-transcription. Whole-recording decoding (longform) is where a large
     # model is affordable; per-line decoding ("selective") pads every clip to 30 s, so pick a
     # smaller model for it (e.g. KBLab/kb-whisper-medium).
-    asr_model: str = "deepdml/faster-whisper-large-v3-turbo-ct2"
+    asr_model: str = "KBLab/kb-whisper-medium"
     asr_beam_size: int = 5  # selective mode
     longform_beam_size: int = 1
     longform_batch_size: int = 4  # 30 s windows decoded together

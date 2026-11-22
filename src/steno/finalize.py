@@ -412,6 +412,7 @@ def longform_lines(
     beam_size: int,
     max_compression: float = 2.4,
     echo_enabled: bool = True,
+    detect_english: bool = False,
     progress: Progress | None = None,
 ) -> tuple[list[Line], LongformReport]:
     """Transcribe every kept stream once and return the lines that replace the live ones.
@@ -440,8 +441,9 @@ def longform_lines(
 
         _say(progress, label, 0, int(len(audio[name]) / SAMPLE_RATE))
         try:
+            extra = {"detect_english": True} if detect_english else {}
             segs, lang = fn(audio[name], batch_size=batch_size, beam_size=beam_size,
-                            progress=tick)
+                            progress=tick, **extra)
         except Exception:
             log.exception("Long-form transcription of %s failed; keeping its live lines", name)
             report.fallback.append(name)
@@ -781,7 +783,7 @@ def finalize_session(
             audio, origins, lines, transcriber,
             batch_size=cfg.post.longform_batch_size, beam_size=cfg.post.longform_beam_size,
             max_compression=cfg.post.asr_max_compression, echo_enabled=cfg.echo.enabled,
-            progress=progress,
+            detect_english=cfg.refine.detect_english, progress=progress,
         )
         redone = report.lines
     elif flagged:

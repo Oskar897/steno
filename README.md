@@ -96,8 +96,14 @@ The live draft transcribes one utterance at a time, so it lacks context (kb-whis
 166 s Swedish + English test: WER 30 %). A background worker (`[refine]`) keeps the last 15
 minutes of each stream in memory and, every ~25 s of accumulated speech, decodes that window
 again as long-form audio (whole sentences, 30 s chunks, its own VAD) with `[refine] model`
-(default `deepdml/faster-whisper-large-v3-turbo-ct2`, with `[refine] detect_english`: 30 s
-chunks that are English stay English instead of being translated into Swedish).
+(default `KBLab/kb-whisper-medium`, with `[refine] detect_english`: 30 s chunks that are
+English stay English instead of being translated into Swedish). Medium replaced
+large-v3-turbo as the default after a 172 s Swedish + English read test with several language
+switches per paragraph: decoded as one file, medium had WER 6 % (English sentences 97 %
+correct), while turbo dropped a whole English paragraph and kb-whisper-large translated it
+(both ~21 %). In real-time replay windows the two were close (refined WER 3.6 % vs 2.6 %), and
+medium decoded faster (0.62 vs 0.68 s per speech second; stop to finished transcript 21 s vs
+26 s for 2.9 min).
 The better text replaces the draft of the lines it covers: speakers stay attached, the live
 JSONL is never rewritten (revisions are appended to `revisions.jsonl`, see
 [docs/formats.md](docs/formats.md)), and `transcript.md` always shows the best text. Mic speech
@@ -122,7 +128,7 @@ uv run steno record                         # (--keep-audio only for --thorough 
 uv run steno finalize                       # seconds: refined text + speakers -> final.jsonl / final.md
 uv run steno finalize --speakers 3          # ... with a known number of speakers (see below)
 uv run steno finalize --thorough            # slow, kept audio: pyannote over the whole recording
-uv run steno finalize --asr-mode longform   # slow, kept audio: whole-file transcription with turbo
+uv run steno finalize --asr-mode longform   # slow, kept audio: whole-file transcription (kb-whisper-medium)
 uv run steno show --final                   # print it (`steno show` prints the live transcript)
 uv run steno clean                          # Claude fixes misheard words/punctuation -> clean.jsonl / clean.md
 uv run steno clean --dry-run                # ... only show the proposed edits, write nothing
@@ -133,10 +139,10 @@ uv run steno todo --person Alice            # explicit commitments only -> todo.
 `finalize` is ready in seconds because the heavy work already happened during the meeting.
 Text, `[post] asr_mode` (or `--asr-mode`): `refined` (default) is the best text of the live
 session (see above), no new ASR and no kept audio needed; `longform` runs each kept stream
-through `[post] asr_model` (large-v3-turbo, ~1.6 GB download) once as a whole, `selective`
-re-transcribes only low-confidence live lines one by one (`--full-asr`: every line; use a smaller
-model such as `KBLab/kb-whisper-medium`, per-clip decoding with turbo is slow), `off` keeps the
-draft. A session without refine revisions that has kept audio falls back to `longform`.
+through `[post] asr_model` (kb-whisper-medium, ~1.5 GB download) once as a whole (with
+`[refine] detect_english`), `selective` re-transcribes only low-confidence live lines one by one
+(`--full-asr`: every line; per-clip decoding pads every clip to 30 s, so keep the model small),
+`off` keeps the draft. A session without refine revisions that has kept audio falls back to `longform`.
 Speakers, `[post] diarization` (or `--thorough`): `fast` (default) resolves `diar.bin`, the
 incremental pyannote segmentation windows linked by CAM++ embeddings that were computed while
 recording (no audio needed; a session without it clusters the live window embeddings instead, as
@@ -182,7 +188,7 @@ two thirds speech, closer to a real meeting), turbo as refine model with the def
 
 Same 3.6 min run: without `detect_english` 17 % refined WER; without the stop budget 16 %
 but 22 s to stop. The stop time is the draft queue plus the remaining refine work plus
-`finalize` (0.1-0.4 s); it does not grow with the meeting. `[refine] stop_budget_s` (12 s)
+`finalize` (0.1-0.4 s); it does not grow with the meeting. `[refine] stop_budget_s` (25 s; the tables above were measured with 12 s and turbo)
 caps the refine part: when the measured speed of `model` says the rest would take longer, the
 rest (including a window that is being decoded) goes to `fallback_model`. Lone English
 sentences inside Swedish speech are still written as Swedish (language is chosen per 30 s chunk). Diarization error rate on
