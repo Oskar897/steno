@@ -225,6 +225,25 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
 - Sidebar width: drag its right edge (190-460 px); dragging past ~120 px hides it, the
   header's menu button, a drag from the left edge, double-click on the edge or Ctrl+B bring
   it back (`steno-side-w`, `steno-side-hidden` in `localStorage`).
+- Pinned meeting head: title/date row, the action buttons and the participant row form one block
+  (`.mstick`, `position: sticky` inside the meeting section; the feed (`#feed`) is the scroller and
+  shows one meeting at a time). It stays at the top while the transcript scrolls, with an opaque
+  fill (`--stick`: the solid surface colour, also with transparency on) and a hairline below it
+  while it covers lines (`.stuck`, set in `onScroll`). Its padding-top is the gap above the title:
+  a negative `top` leaves only 10 px of it visible when pinned. Job progress, summary/to-do cards
+  and the transcript heading scroll away; "jump to latest" and `scrollToEnd` need no offset.
+- Participants (`.mpeople`, `peopleOf` / `updatePeople` / `fitPeople` in app.js): one chip per
+  speaker, grouped by the name the lines show and ordered by first appearance, so the dot colour is
+  the same `speakerColor` as the transcript rows. Text "Name · lines" (unnamed: "Speaker 3 · 5").
+  Counts come from `m.detail.segments`, so they follow `appendSegment` live and every rebuild
+  (`refreshMeeting` after finalize or a rename). A chip opens the same namer as the name in the
+  transcript (`openNamer`, form shown under the chips); it is only a button when a line of that
+  speaker can be named (`canName`), else a plain label. Chips that do not fit are folded into a
+  "+N" chip (one line when the row is narrower than 520 px, else two) that expands to all and then
+  reads "Less"; measured by a `ResizeObserver` on the row.
+- Settings has an X (top right, `#settings-close`) and Esc closes it (in a text field the first
+  Esc only leaves the field); both go back to where it was opened from (`S.back`: the project and
+  meeting with the scroll position, or the People list).
 - Copy buttons (clipboard, text only): on the Summary and To-do cards and the Transcript
   heading; the transcript is copied as "Speaker (mm:ss)" turns.
 - Claude calls run without a console window (`llm.no_window()`: `CREATE_NO_WINDOW`).

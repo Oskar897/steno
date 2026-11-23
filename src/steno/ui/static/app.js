@@ -223,7 +223,16 @@ document.addEventListener("pointerdown", (ev) => {
   if (openMenu && !openMenu.el.contains(ev.target) && !(openMenu.anchor && openMenu.anchor.contains(ev.target))) closeMenu();
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") { if (openMenu) { closeMenu(true); ev.preventDefault(); } else closeDrawer(); return; }
+  if (ev.key === "Escape") {
+    if (openMenu) { closeMenu(true); ev.preventDefault(); return; }
+    if (!$("scrim").hidden) { closeDrawer(); return; }
+    if (S.view === "settings" && !$("modal").open && !ev.defaultPrevented) {
+      const t = ev.target;
+      // in a field the first Esc only leaves the field (the glossary has unsaved text), the next one closes
+      if (t && t.matches && t.matches("input, textarea, select")) t.blur(); else leaveSettings();
+    }
+    return;
+  }
   if (!openMenu || !["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) return;
   const items = [...openMenu.el.querySelectorAll(".mi:not(:disabled)")];
   if (!items.length) return;
@@ -369,6 +378,7 @@ const S = {
   status: { recorder: {}, job: null, jobs: [], config: {} },
   projects: [], inbox: 0,
   view: "project",        // "project" | "people" | "settings"
+  back: null,             // where Settings was opened from: {view, sel, meeting, scroll} (the X and Esc return there)
   sel: null,              // project id or "inbox"
   meeting: null,          // open meeting (session id), "new" (ready to record) or null (pick one)
   pendingRec: false,      // Record pressed: open the new meeting as soon as it is listed
@@ -721,9 +731,25 @@ function showView() {
 }
 
 function showSettings() {
+  if (S.view !== "settings") S.back = { view: S.view, sel: S.sel, meeting: S.meeting, scroll: $("feed").scrollTop };
   S.view = "settings";
   showView(); renderSide();
   guarded(loadSettings);
+}
+
+/* The X / Esc of Settings: back to the people list or to the project and meeting that was open. */
+function leaveSettings() {
+  if (S.view !== "settings") return;
+  const b = S.back || { view: "project", sel: S.sel, meeting: S.meeting, scroll: 0 };
+  S.back = null;
+  if (b.view === "people") { showPeople(); return; }
+  if (b.sel) {
+    selectProject(b.sel, b.meeting);
+    if (!S.stick && b.scroll) $("feed").scrollTop = b.scroll;  // the hidden list lost its place
+  } else {
+    S.view = "project";
+    showView(); renderSide(); renderTop(); renderFeed();
+  }
 }
 
 // ---------------------------------------------------------------- settings
@@ -1975,16 +2001,20 @@ function buildMeeting(m) {
   const linesHead = h("div", { class: "lines-head" },
     h("span", { text: "Transcript" }),
     copyButton("Copy transcript", () => meetingTranscript(m.info), "Transcript"));
-  m.el = h("section", { class: "meeting", "data-session": sid },
+  // head + actions + participants stay pinned while the transcript scrolls (CSS: .mstick is sticky)
+  m.peopleEl = h("div", { class: "mpeople", hidden: true });
+  m.stickEl = h("div", { class: "mstick" },
     h("header", { class: "mhead" },
       h("div", { class: "mhead-text" }, titleBtn,
         h("div", { class: "mmeta" }, h("span", { text: niceDate(info.started_at) }), m.durEl,
           info.archived ? h("button", { class: "badge-arch", type: "button", title: "Archived: hidden in the list. Click to unarchive.",
             onclick: () => guarded(() => archiveMeeting(info, S.sel, false)) }, icon("archive"), "Archived") : null)),
       more),
-    bar, m.jobEl, m.docsEl, linesHead, m.linesEl);
+    bar, m.peopleEl);
+  m.el = h("section", { class: "meeting", "data-session": sid }, m.stickEl, m.jobEl, m.docsEl, linesHead, m.linesEl);
   renderDocs(m);
   renderLines(m);
+  initPeople(m);
   updateJobLines(); updateButtons(); updateLive();
   return m.el;
 }
@@ -2005,6 +2035,98 @@ function syncEmptyNote(m) {
     m.linesEl.append(m.info.recording
       ? h("div", { class: "empty-meeting" }, h("span", { class: "spinner" }), "Listening. Lines appear a few seconds after someone speaks.")
       : h("div", { class: "empty-meeting", text: "Nothing was transcribed. Check the audio sources (the microphone icon next to Record) and try again." }));
+  }
+}
+
+// ---- participants: one chip per speaker in the pinned block (dot, name, number of lines)
+
+/* Speakers of the shown transcript in order of first appearance (so colours match the lines):
+   [{key, name, count, seg}]. `seg` is a line to name from (the first one that can be named), else null.
+   Lines are grouped by the name they show, like the colours. Lines without a name are left out. */
+function peopleOf(m) {
+  const by = new Map();
+  for (const seg of m.detail.segments) {
+    const name = String(seg.speaker || "").trim();
+    if (!name) continue;
+    let p = by.get(name);
+    if (!p) { p = { key: name, name, count: 0, seg: null }; by.set(name, p); speakerColor(m, name); }
+    p.count += 1;
+    if (!p.seg && canName(m, seg)) p.seg = seg;
+  }
+  return [...by.values()];
+}
+
+function personChip(m, p) {
+  const label = h("span", { class: "pc-name", text: p.name });
+  const count = h("span", { class: "pc-n", text: String(p.count) });
+  const kids = [h("i", { class: "pc-dot" }), label, h("span", { class: "pc-sep", "aria-hidden": "true", text: "·" }), count];
+  const lines = `${p.count} line${p.count === 1 ? "" : "s"}`;
+  const unknown = clusterNo(p.seg && p.seg.speaker_id) !== null && p.name === `Speaker ${clusterNo(p.seg.speaker_id)}`;
+  const chip = p.seg
+    ? h("button", { class: "pchip nameable", type: "button", title: `${p.name}: ${lines}. ${unknown ? "Click to name this speaker" : "Click to rename"}` }, ...kids)
+    : h("span", { class: "pchip", title: `${p.name}: ${lines}` }, ...kids);
+  chip.style.setProperty("--c", speakerColor(m, p.name));
+  if (p.seg) chip.addEventListener("click", () => openNamer(m, m.peopleEl, p.seg));
+  chip._count = count; chip._p = p;
+  return chip;
+}
+
+function initPeople(m) {
+  if (m.peopleRO) m.peopleRO.disconnect();
+  m.peopleKeys = ""; m.peopleOpen = !!m.peopleOpen;
+  updatePeople(m);
+  // chips that do not fit are folded into "+N": measured again whenever the row's width changes
+  if (typeof ResizeObserver === "function") {
+    let w = -1;
+    m.peopleRO = new ResizeObserver(() => {
+      const nw = m.peopleEl.offsetWidth;  // layout width: a running entry animation must not change it
+      if (nw === w) return;
+      w = nw; fitPeople(m);
+    });
+    m.peopleRO.observe(m.peopleEl);
+  }
+}
+
+function updatePeople(m) {
+  const box = m.peopleEl;
+  if (!box) return;
+  const list = peopleOf(m);
+  box.hidden = !list.length;
+  const keys = JSON.stringify(list.map((p) => [p.key, !!p.seg]));
+  if (keys === m.peopleKeys) {  // same speakers: only the counts moved
+    const chips = [...box.querySelectorAll(".pchip:not(.more)")];
+    list.forEach((p, i) => { chips[i]._count.textContent = String(p.count); chips[i]._p = p; });
+  } else {
+    m.peopleKeys = keys;
+    const more = h("button", { class: "pchip more", type: "button", hidden: true, onclick: () => { m.peopleOpen = !m.peopleOpen; fitPeople(m); } });
+    box.replaceChildren(...list.map((p) => personChip(m, p)), more);
+  }
+  fitPeople(m);
+}
+
+function fitPeople(m) {
+  const box = m.peopleEl;
+  if (!box || box.hidden || !box.isConnected) return;
+  const chips = [...box.querySelectorAll(".pchip:not(.more)")], more = box.querySelector(".more");
+  if (!more) return;
+  const rows = box.offsetWidth < 520 ? 1 : 2;  // narrow: one line, wider: two
+  const rowOf = (el) => Math.round(el.offsetTop / 8);
+  const fits = () => { const base = rowOf(chips[0]); return rowOf(more.hidden ? chips[chips.length - 1] : more) - base < rows; };
+  for (const c of chips) c.hidden = false;
+  more.hidden = true;
+  let hidden = 0;
+  if (!fits()) {
+    more.hidden = false;
+    while (hidden < chips.length - 1) {  // at least one chip stays
+      hidden += 1;
+      chips[chips.length - hidden].hidden = true;
+      more.textContent = `+${hidden}`;
+      if (fits()) break;
+    }
+    // collapsed it shows N more; expanded every chip is shown and the button folds them again
+    if (m.peopleOpen) { for (const c of chips) c.hidden = false; more.textContent = "Less"; more.title = "Show fewer"; }
+    else { more.title = `${hidden} more speaker${hidden === 1 ? "" : "s"}: click to show all`; }
+    more.setAttribute("aria-expanded", String(!!m.peopleOpen));
   }
 }
 
@@ -2047,6 +2169,7 @@ function appendSegment(m, seg, silent) {
   segs.push(seg);
   if (!m.linesEl) return;
   const row = segRow(m, seg, prev);
+  updatePeople(m);
   if (!silent) row.classList.add("enter");
   m.linesEl.append(row);
   syncEmptyNote(m);
@@ -2582,6 +2705,11 @@ function onScroll() {
   S.stick = f.scrollHeight - f.scrollTop - f.clientHeight < 60;
   if (S.stick) S.unseen = 0;
   renderJump();
+  // the pinned head gets a hairline underneath only while it covers the transcript
+  const m = S.feed.get(S.meeting);
+  if (m && m.stickEl && m.el && m.el.isConnected) {
+    m.stickEl.classList.toggle("stuck", m.stickEl.getBoundingClientRect().top > m.el.getBoundingClientRect().top + 0.5);
+  }
 }
 
 // ---------------------------------------------------------------- markdown (minimal; builds DOM, never HTML)
@@ -2969,6 +3097,7 @@ function init() {
   watchDay();
   $("nav-people").addEventListener("click", showPeople);
   $("nav-settings").addEventListener("click", showSettings);
+  $("settings-close").addEventListener("click", leaveSettings);
   document.querySelectorAll(".menu-btn").forEach((b) => b.addEventListener("click", menuButton));
   $("side-close").addEventListener("click", closeDrawer);
   $("side-hide").addEventListener("click", () => applySide(true));
