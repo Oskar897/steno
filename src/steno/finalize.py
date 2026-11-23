@@ -62,7 +62,7 @@ from typing import Any
 
 import numpy as np
 
-from steno import __version__, labels, transcript
+from steno import __version__, labels, participants, transcript
 from steno.asr import AsrResult, LongSegment
 from steno.config import ASR_MODES, Config
 from steno.diarize import (
@@ -679,6 +679,9 @@ def finalize_session(
     deps = deps or Deps()
     if num_speakers is not None and num_speakers < 1:
         raise FinalizeError("the number of speakers must be at least 1")
+    expected = participants.read(session_dir)  # who the meeting said it had (participants.json)
+    if num_speakers is None and expected.count:
+        num_speakers = expected.count  # an explicit number still wins
     drafts = transcript.read_segments(session_dir)
     if not drafts:
         raise FinalizeError("session has no transcript lines")
@@ -712,7 +715,8 @@ def finalize_session(
 
     # 1. diarization -------------------------------------------------------------------
     params = diarize_params(cfg)
-    matcher = ProfileMatcher(store.list(), cfg.speakers.accept_threshold, cfg.speakers.margin)
+    matcher = ProfileMatcher(participants.restrict(store.list(), expected),
+                             cfg.speakers.accept_threshold, cfg.speakers.margin)
     t_diar = time.perf_counter()
     if thorough:
         embedder, segmenter = deps.embedder, deps.segmenter

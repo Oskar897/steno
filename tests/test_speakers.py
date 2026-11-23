@@ -391,3 +391,84 @@ def test_profile_windows_get_the_profile_and_cluster_windows_the_rest():
     assert [x.label.speaker_id for x in turns] == [f"P:{alice.id}", "S1", f"P:{alice.id}"]
     assert [x.label.provisional for x in turns] == [False, True, False]
     assert turns[0].label.name == "Alice"
+
+
+# --------------------------------------------------------------------------- participants
+
+
+def three_people(store):
+    return {n: store.create(n, np.vstack([voice_vector(i, 0.05, s) for s in range(4)]))
+            for i, n in enumerate(["Alice", "Bob", "Carol"])}
+
+
+def test_participant_list_narrows_live_matching_and_follows_changes(tmp_path):
+    from steno import participants
+
+    store = ProfileStore()
+    people = three_people(store)
+    now = [0.0]
+    participants.write(tmp_path, participants.Participants((people["Bob"].id,)))
+    t = SpeakerTracker(FakeEmbedder(), cfg(), store, SessionLabels(tmp_path),
+                       clock=lambda: now[0], reload_interval_s=5.0, participants_dir=tmp_path)
+    # Alice is enrolled but not in the meeting: her voice is only a session cluster
+    assert t.identify("mic", speech(220.0)).speaker_id == "S1"
+    assert t.identify("mic", speech(330.0)).speaker_id == f"P:{people['Bob'].id}"
+    # the list changes during the meeting: picked up at the next reload, not before
+    participants.update(tmp_path, add=people["Alice"].id)
+    now[0] = 1.0
+    assert t.identify("mic", speech(220.0)).speaker_id == "S1"
+    now[0] = 6.0
+    assert t.identify("mic", speech(220.0)).speaker_id == f"P:{people['Alice'].id}"
+    # Carol is still outside the list
+    assert not t.identify("mic", speech(440.0)).speaker_id.startswith("P:")
+
+
+def test_missing_or_empty_participant_list_matches_everybody(tmp_path):
+    from steno import participants
+
+    store = ProfileStore()
+    people = three_people(store)
+    for write_empty in (False, True):  # no file at all, then an empty list
+        if write_empty:
+            participants.write(tmp_path, participants.Participants())
+        t = SpeakerTracker(FakeEmbedder(), cfg(), store, participants_dir=tmp_path)
+        assert t.identify("mic", speech(220.0)).speaker_id == f"P:{people['Alice'].id}"
+        assert t.identify("mic", speech(440.0)).speaker_id == f"P:{people['Carol'].id}"
+
+
+def test_participant_list_is_used_for_turns_too(tmp_path):
+    from steno import participants
+
+    store = ProfileStore()
+    people = three_people(store)
+    participants.write(tmp_path, participants.Participants((people["Alice"].id,)))
+    t = SpeakerTracker(FakeEmbedder(), turn_cfg(), store, participants_dir=tmp_path)
+    turns = t.identify_turns("mic", tones((220.0, 4.0), (330.0, 4.0)))
+    assert [x.label.speaker_id for x in turns] == [f"P:{people['Alice'].id}", "S1"]
+
+
+def test_expected_speaker_count_caps_the_session_clusters(tmp_path):
+    from steno import participants
+
+    now = [0.0]
+    t = SpeakerTracker(FakeEmbedder(), cfg(max_speakers=7), None, clock=lambda: now[0],
+                       reload_interval_s=5.0, participants_dir=tmp_path)
+    assert t.clusterer.max_speakers == 7  # no file: the config's upper bound
+    participants.write(tmp_path, participants.Participants((), 3))
+    now[0] = 6.0
+    t.identify("mic", speech(220.0))
+    assert t.clusterer.max_speakers == 3
+    participants.write(tmp_path, participants.Participants((), None))
+    now[0] = 12.0
+    t.identify("mic", speech(220.0))
+    assert t.clusterer.max_speakers == 7
+
+
+def test_damaged_participant_file_means_everybody(tmp_path):
+    from steno import participants
+
+    store = ProfileStore()
+    people = three_people(store)
+    (tmp_path / participants.NAME).write_text("{not json", encoding="utf-8")
+    t = SpeakerTracker(FakeEmbedder(), cfg(), store, participants_dir=tmp_path)
+    assert t.identify("mic", speech(220.0)).speaker_id == f"P:{people['Alice'].id}"

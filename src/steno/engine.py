@@ -50,7 +50,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from steno import paths
+from steno import participants, paths
 from steno.asr import AsrResult, Transcriber
 from steno.audio import SOURCE_LOOPBACK, SOURCE_MIC, AudioChunk, AudioSource, StreamRecorder
 from steno.config import Config
@@ -184,6 +184,8 @@ class Engine:
         self._embedder = embedder if config.speakers.enabled else None
         self._profile_store = profile_store
         self._tracker: SpeakerTracker | None = None
+        # Who is expected in the meeting (set before start(); written to participants.json)
+        self.participants: participants.Participants | None = None
         self._keep_audio = keep_audio
         self._recorders: dict[str, StreamRecorder] = {}
         self._subscribers: list[SegmentCallback] = []
@@ -289,6 +291,8 @@ class Engine:
                 "speakers": self._embedder.name if self._embedder is not None else None,
             },
         )
+        if self.participants is not None:
+            participants.write(self._writer.dir, self.participants)
         if self._embedder is not None:
             labels = SessionLabels(self._writer.dir)
             labels.init()
@@ -300,6 +304,7 @@ class Engine:
                 SessionEmbeddings(self._writer.dir),
                 SessionWindows(self._writer.dir),
                 profiles_cfg=self.config.profiles,
+                participants_dir=self._writer.dir,
             )
         if self._keep_audio:
             for name in self._streams:

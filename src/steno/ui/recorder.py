@@ -17,6 +17,7 @@ import numpy as np
 from steno import labels, projects
 from steno.config import Config
 from steno.engine import Engine
+from steno.participants import Participants
 from steno.transcript import Segment
 from steno.ui.events import EventBus
 
@@ -139,6 +140,8 @@ class Recorder:
         # Name the meeting from its transcript after Stop (only while the user typed no title).
         self.auto_title = False
         self._title: str | None = None
+        self._folder: str | None = None
+        self._participants: Participants | None = None
         self._mirror_dirty = False
         self._engine: Engine | None = None
         self._unsubscribe: Callable[[], None] | None = None
@@ -193,7 +196,7 @@ class Recorder:
     def start(self, *, keep_audio: bool, mic: bool, loopback: bool,
               project: projects.Project | None = None, title: str | None = None,
               mtype: str | None = None, auto_title: bool = False,
-              folder: str | None = None) -> None:
+              folder: str | None = None, participants: Participants | None = None) -> None:
         if not (mic or loopback):
             raise RecorderError("nothing to record: enable the microphone or system audio")
         with self._lock:
@@ -215,6 +218,8 @@ class Recorder:
             self.auto_title = auto_title and not title  # a typed title is never replaced
             self._title = title
             self._folder = folder  # an existing meeting folder to record into
+            # who is expected (written to participants.json when the session is created)
+            self._participants = participants
             self.last_segment_at = None
             self._t0 = None
             self._levels = {n: _Level() for n in self.sources}
@@ -229,6 +234,9 @@ class Recorder:
             engine = self._factory(self._cfg, keep_audio, mic, loopback)
             engine.sources = [_TappedSource(s, self._on_chunk, lambda: self.paused)
                               for s in engine.sources]
+            if self._participants is not None and (
+                    self._participants.profiles or self._participants.count):
+                engine.participants = self._participants
             self._engine = engine  # segment callbacks need it from the first line on
             self._unsubscribe = engine.subscribe(self._on_segment)
             if hasattr(engine, "subscribe_revisions"):

@@ -181,6 +181,7 @@ function showMenu(anchor, build, at, from) {
   const fill = () => {
     el.replaceChildren(...build().map((it) => {
       if (it === "-") return h("hr");
+      if (it.node) return it.node;  // a ready-made element (e.g. a stepper)
       if (it.header) return h("div", { class: "mh", text: it.header });
       const toggle = it.checked !== undefined;
       const b = h("button", {
@@ -1534,6 +1535,7 @@ function renderTop() {
   $("feed").parentElement.hidden = !$("empty").hidden;
   dock.hidden = !$("empty").hidden;
   renderAutoTitle();
+  renderPeopleBtn();
   renderStrip();
   updateButtons();
 }
@@ -1697,7 +1699,11 @@ function renderJobChip() {
 async function startRecording() {
   if (!S.sel || (curProject() || {}).archived) return;
   remember("steno-opts", JSON.stringify(S.opts));
+  await ensurePeople(0);  // the chosen people must still exist
   const body = { project: S.sel, mic: S.opts.mic, loopback: S.opts.loop, keep_audio: S.opts.keep, auto_title: S.autoTitle };
+  const chosen = recPeople();  // who is in the meeting (per subfolder, see the People button)
+  if (chosen.ids.length) body.participants = chosen.ids;
+  if (chosen.n) body.speakers = chosen.n;
   const type = S.sel !== "inbox" ? recType(S.sel) : "";
   if (type) body.type = type;
   const title = $("rec-title").value.trim();
@@ -1758,6 +1764,7 @@ async function fetchDetail(m) {
   catch (e) { if (!missing(e)) throw e; m.detail = m.detail || { segments: [], speakers: [] }; }
   m.detail.segments = m.detail.segments || [];
   m.detail.speakers = m.detail.speakers || [];
+  m.detail.participants = m.detail.participants || { profiles: [], count: null };
   await loadDocs(m);
 }
 
@@ -2038,35 +2045,60 @@ function syncEmptyNote(m) {
   }
 }
 
-// ---- participants: one chip per speaker in the pinned block (dot, name, number of lines)
+// ---- participants: one chip per speaker in the pinned block (dot, name, number of lines), then the people
+// chosen for the meeting who have not spoken yet (dimmed, 0 lines), "3 of 4" and "+ Person" at the end
 
-/* Speakers of the shown transcript in order of first appearance (so colours match the lines):
-   [{key, name, count, seg}]. `seg` is a line to name from (the first one that can be named), else null.
-   Lines are grouped by the name they show, like the colours. Lines without a name are left out. */
+/* Chips of the shown transcript: speakers in order of first appearance (so colours match the lines), then
+   expected people who have not spoken. [{kind: "speaker" | "waiting", key, name, count, seg, unknown, pid}].
+   `seg` is a line to name from (the first one that can be named), else null. `unknown`: not named yet
+   ("Speaker 3"). `pid`: the voice profile id when known. Lines are grouped by the name they show, like the
+   colours. Lines without a name are left out. */
 function peopleOf(m) {
   const by = new Map();
   for (const seg of m.detail.segments) {
     const name = String(seg.speaker || "").trim();
     if (!name) continue;
     let p = by.get(name);
-    if (!p) { p = { key: name, name, count: 0, seg: null }; by.set(name, p); speakerColor(m, name); }
+    if (!p) {
+      const n = clusterNo(seg.speaker_id);
+      p = { kind: "speaker", key: name, name, count: 0, seg: null, unknown: n !== null && name === `Speaker ${n}`, pid: null };
+      by.set(name, p);
+      speakerColor(m, name);
+    }
     p.count += 1;
     if (!p.seg && canName(m, seg)) p.seg = seg;
+    if (!p.pid && /^P:[0-9a-f]{8}$/.test(seg.speaker_id || "")) p.pid = seg.speaker_id.slice(2);
   }
-  return [...by.values()];
+  const list = [...by.values()];
+  const part = m.detail.participants || { profiles: [] };
+  for (const id of part.profiles) {
+    const person = personById(id);
+    if (!person) continue;  // deleted since, or the People list is not loaded yet
+    if (list.some((p) => p.pid === id || (p.kind === "speaker" && !p.unknown && sameName(p.name, person.name)))) continue;
+    list.push({ kind: "waiting", key: "w:" + id, name: person.name, count: 0, seg: null, unknown: false, pid: id });
+  }
+  return list;
 }
 
 function personChip(m, p) {
-  const label = h("span", { class: "pc-name", text: p.name });
   const count = h("span", { class: "pc-n", text: String(p.count) });
-  const kids = [h("i", { class: "pc-dot" }), label, h("span", { class: "pc-sep", "aria-hidden": "true", text: "·" }), count];
+  const kids = [h("i", { class: "pc-dot" }), h("span", { class: "pc-name", text: p.name })];
+  if (p.unknown) kids.push(h("span", { class: "pc-q", "aria-hidden": "true", text: "?" }));
+  kids.push(h("span", { class: "pc-sep", "aria-hidden": "true", text: "·" }), count);
   const lines = `${p.count} line${p.count === 1 ? "" : "s"}`;
-  const unknown = clusterNo(p.seg && p.seg.speaker_id) !== null && p.name === `Speaker ${clusterNo(p.seg.speaker_id)}`;
-  const chip = p.seg
-    ? h("button", { class: "pchip nameable", type: "button", title: `${p.name}: ${lines}. ${unknown ? "Click to name this speaker" : "Click to rename"}` }, ...kids)
-    : h("span", { class: "pchip", title: `${p.name}: ${lines}` }, ...kids);
+  let chip;
+  if (p.kind === "waiting") {
+    chip = h("span", { class: "pchip waiting", title: `${p.name} is in this meeting but has not been heard yet` }, ...kids,
+      h("button", { class: "pc-x", type: "button", title: `Take ${p.name} out of this meeting`, "aria-label": `Remove ${p.name}`,
+        onclick: () => guarded(() => changePeople(m, { remove: p.pid })) }, icon("x")));
+  } else if (p.seg) {
+    chip = h("button", { class: "pchip nameable" + (p.unknown ? " unknown" : ""), type: "button",
+      title: p.unknown ? `${p.name} is not named yet (${lines}). Click to say who this is` : `${p.name}: ${lines}. Click to rename` }, ...kids);
+    chip.addEventListener("click", () => openNamer(m, m.peopleEl, p.seg));
+  } else {
+    chip = h("span", { class: "pchip" + (p.unknown ? " unknown" : ""), title: `${p.name}: ${lines}` }, ...kids);
+  }
   chip.style.setProperty("--c", speakerColor(m, p.name));
-  if (p.seg) chip.addEventListener("click", () => openNamer(m, m.peopleEl, p.seg));
   chip._count = count; chip._p = p;
   return chip;
 }
@@ -2075,6 +2107,8 @@ function initPeople(m) {
   if (m.peopleRO) m.peopleRO.disconnect();
   m.peopleKeys = ""; m.peopleOpen = !!m.peopleOpen;
   updatePeople(m);
+  const box = m.peopleEl;  // names of the chosen people come from the People list: refresh it once, then redraw
+  ensurePeople().then(() => { if (m.peopleEl === box && box.isConnected) updatePeople(m); });
   // chips that do not fit are folded into "+N": measured again whenever the row's width changes
   if (typeof ResizeObserver === "function") {
     let w = -1;
@@ -2090,16 +2124,24 @@ function initPeople(m) {
 function updatePeople(m) {
   const box = m.peopleEl;
   if (!box) return;
+  const part = m.detail.participants || { profiles: [], count: null };
   const list = peopleOf(m);
-  box.hidden = !list.length;
-  const keys = JSON.stringify(list.map((p) => [p.key, !!p.seg]));
-  if (keys === m.peopleKeys) {  // same speakers: only the counts moved
-    const chips = [...box.querySelectorAll(".pchip:not(.more)")];
-    list.forEach((p, i) => { chips[i]._count.textContent = String(p.count); chips[i]._p = p; });
+  const spoken = list.filter((p) => p.kind === "speaker").length;
+  box.hidden = !(list.length || part.profiles.length || part.count || m.info.recording);
+  const keys = JSON.stringify([list.map((p) => [p.kind, p.key, !!p.seg, p.unknown]), part.count, spoken]);
+  if (keys === m.peopleKeys) {  // same chips: only the counts moved
+    const chips = [...box.querySelectorAll(".mp-chips .pchip:not(.more)")];
+    list.forEach((p, i) => { if (chips[i]) { chips[i]._count.textContent = String(p.count); chips[i]._p = p; } });
   } else {
     m.peopleKeys = keys;
     const more = h("button", { class: "pchip more", type: "button", hidden: true, onclick: () => { m.peopleOpen = !m.peopleOpen; fitPeople(m); } });
-    box.replaceChildren(...list.map((p) => personChip(m, p)), more);
+    const add = h("button", { class: "pchip add", type: "button", "aria-haspopup": "menu", title: "Add someone from People to this meeting" },
+      icon("plus"), h("span", { text: "Person" }));
+    add.addEventListener("click", () => ensurePeople().then(() => showMenu(add, () => addPersonMenu(m))));
+    const cnt = part.count ? h("button", { class: "pchip cnt", type: "button", "aria-haspopup": "menu",
+      title: `${spoken} of ${part.count} expected speakers heard. Click to change the expected number`, text: `${spoken} of ${part.count}` }) : null;
+    if (cnt) cnt.addEventListener("click", () => ensurePeople().then(() => showMenu(cnt, () => addPersonMenu(m))));
+    box.replaceChildren(h("div", { class: "mp-chips" }, ...list.map((p) => personChip(m, p)), more), h("div", { class: "mp-fixed" }, cnt, add));
   }
   fitPeople(m);
 }
@@ -2107,8 +2149,10 @@ function updatePeople(m) {
 function fitPeople(m) {
   const box = m.peopleEl;
   if (!box || box.hidden || !box.isConnected) return;
-  const chips = [...box.querySelectorAll(".pchip:not(.more)")], more = box.querySelector(".more");
-  if (!more) return;
+  const wrap = box.querySelector(".mp-chips");
+  if (!wrap) return;
+  const chips = [...wrap.querySelectorAll(".pchip:not(.more)")], more = wrap.querySelector(".more");
+  if (!more || !chips.length) return;
   const rows = box.offsetWidth < 520 ? 1 : 2;  // narrow: one line, wider: two
   const rowOf = (el) => Math.round(el.offsetTop / 8);
   const fits = () => { const base = rowOf(chips[0]); return rowOf(more.hidden ? chips[chips.length - 1] : more) - base < rows; };
@@ -2656,6 +2700,121 @@ function initDrag() {
   }
 }
 
+// ---------------------------------------------------------------- who is in the meeting
+
+/* Chosen before recording (the People button in the dock) or changed in the meeting head ("+ Person").
+   The server keeps it per meeting in participants.json: live recognition and Finalize then only match
+   these people; an empty list means everybody. See docs/app.md. */
+
+const MAX_SPEAKERS = 20;
+let peopleStamp = 0, peopleFetch = null;
+function ensurePeople(maxAge = 5000) {  // the People list (names for the chips), fetched when older than maxAge ms
+  if (peopleStamp && Date.now() - peopleStamp < maxAge) return Promise.resolve(S.people);
+  if (!peopleFetch) {
+    peopleFetch = api("GET", "/api/people")
+      .then((d) => { S.people = d.people; peopleStamp = Date.now(); return S.people; })
+      .catch(() => S.people)
+      .finally(() => { peopleFetch = null; });
+  }
+  return peopleFetch;
+}
+const personById = (id) => S.people.find((p) => p.id === id) || null;
+const sameName = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+
+/* A small "Speakers - 4 +" control for a menu. `set(n)` gets a number or null (not set); the shown
+   value follows the clicks at once, the caller saves it. */
+function stepper(start, set) {
+  let n = start;
+  const val = h("span", { class: "st-val" });
+  const minus = h("button", { class: "st-b", type: "button", "aria-label": "Fewer speakers", text: "−" });
+  const plus = h("button", { class: "st-b", type: "button", "aria-label": "More speakers", text: "+" });
+  const show = () => { val.textContent = n === null ? "any" : String(n); minus.disabled = n === null; plus.disabled = n === MAX_SPEAKERS; };
+  minus.addEventListener("click", () => { n = n === null || n <= 1 ? null : n - 1; show(); set(n); });
+  plus.addEventListener("click", () => { n = n === null ? 2 : Math.min(MAX_SPEAKERS, n + 1); show(); set(n); });
+  show();
+  return h("div", { class: "stepper", title: "How many people will speak, guests included. Steno will not invent more voices than this." },
+    h("span", { class: "st-l", text: "Speakers" }), minus, val, plus);
+}
+const menuHint = (text) => ({ node: h("div", { class: "mhint", text }) });
+
+// before recording: chosen people and expected speakers, remembered per subfolder (meeting type)
+const recPeopleKey = () => `steno-ppl-${S.sel}-${S.sel === "inbox" ? "" : recType(S.sel)}`;
+function recPeople() {
+  let v = null;
+  try { v = JSON.parse(remember(recPeopleKey()) || "null"); } catch (e) { /* bad prefs */ }
+  const ids = v && Array.isArray(v.p) ? v.p.filter((x) => typeof x === "string") : [];
+  const n = v && Number.isInteger(v.n) && v.n >= 1 && v.n <= MAX_SPEAKERS ? v.n : null;
+  return { ids: peopleStamp ? ids.filter((id) => personById(id)) : ids, n };
+}
+function setRecPeople(ids, n) {
+  remember(recPeopleKey(), ids.length || n ? JSON.stringify({ p: ids, n }) : null);
+  renderPeopleBtn();
+}
+
+function renderPeopleBtn() {
+  const btn = $("btn-people");
+  if (!btn || !S.sel) return;
+  const { ids, n } = recPeople();
+  const names = ids.map((id) => (personById(id) || {}).name).filter(Boolean);
+  const r = S.status.recorder || {}, st = r.state || "idle";
+  btn.disabled = st === "starting" || st === "recording" || st === "stopping" || (curProject() || {}).archived === true;
+  btn.classList.toggle("on", !!(ids.length || n));
+  const badge = $("people-n");
+  const text = n ? `${ids.length}/${n}` : ids.length ? String(ids.length) : "";
+  badge.hidden = !text;
+  if (badge.textContent !== text) badge.textContent = text;
+  btn.title = names.length || n
+    ? `In this meeting: ${names.join(", ") || "nobody chosen"}${n ? `; ${n} speakers expected` : ""}. Click to change.`
+    : "Who is in this meeting? Choose people so Steno only has to tell them apart (optional).";
+}
+
+function recPeopleMenu() {
+  const cur = recPeople();
+  const toggle = (id) => () => {
+    const now = recPeople();
+    setRecPeople(now.ids.includes(id) ? now.ids.filter((x) => x !== id) : [...now.ids, id], now.n);
+  };
+  return [
+    { header: "People in this meeting" },
+    ...(S.people.length
+      ? S.people.map((p) => ({ label: p.name, checked: cur.ids.includes(p.id), keep: true, onclick: toggle(p.id) }))
+      : [{ label: "No voice profiles yet", sub: "Add people in the People list first", disabled: true }]),
+    "-",
+    { node: stepper(cur.n, (n) => setRecPeople(recPeople().ids, n)) },
+    menuHint("Only the chosen people are recognised. Choose nobody to match everyone."),
+  ];
+}
+
+// in the meeting head
+async function changePeople(m, body) {
+  const res = await api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/participants`, body);
+  m.detail.participants = res.participants;
+  updatePeople(m);
+}
+
+async function addPerson(m, id) {
+  const part = m.detail.participants || { profiles: [] };
+  if (part.profiles.length) return changePeople(m, { add: id });
+  // The list was "everybody". Starting one narrows recognition to it, so the people already
+  // recognised in this meeting go in too (or they would stop being matched).
+  const known = peopleOf(m).filter((p) => p.kind === "speaker" && !p.unknown)
+    .map((p) => personById(p.pid) || S.people.find((x) => sameName(x.name, p.name))).filter(Boolean).map((x) => x.id);
+  return changePeople(m, { profiles: [...new Set([...known, id])] });
+}
+
+function addPersonMenu(m) {
+  const part = m.detail.participants || { profiles: [], count: null };
+  const inList = new Set(part.profiles);
+  const free = S.people.filter((p) => !inList.has(p.id));
+  const items = [{ header: "Add a person to this meeting" }];
+  if (!S.people.length) items.push({ label: "No voice profiles yet", sub: "Add people in the People list first", disabled: true });
+  else if (!free.length) items.push({ label: "Everyone is already here", disabled: true });
+  else items.push(...free.map((p) => ({ label: p.name, icon: "plus", onclick: () => guarded(() => addPerson(m, p.id)) })));
+  items.push("-", { node: stepper(part.count || null, (n) => guarded(() => changePeople(m, { count: n }))) });
+  if (!part.profiles.length) items.push(menuHint("Until someone is added, every saved voice can be recognised. Adding people limits it to them."));
+  return items;
+}
+
 // ---------------------------------------------------------------- naming speakers
 
 async function openNamer(m, row, seg) {
@@ -2663,6 +2822,21 @@ async function openNamer(m, row, seg) {
   const n = clusterNo(seg.speaker_id);
   const input = h("input", { class: "text", type: "text", list: "people-names", maxlength: "80", placeholder: `Name for Speaker ${n}`, "aria-label": "Speaker name", autocomplete: "off" });
   const save = h("input", { type: "checkbox" });
+  const saveText = h("span", { text: "Remember voice" });
+  let touched = false;  // the user decided about the box: stop choosing for them
+  // An existing person: the voice is added to their profile (Remember voice), the name stays spelled as theirs.
+  const sync = () => {
+    const match = S.people.find((p) => sameName(p.name, input.value));
+    saveText.textContent = match ? `Add voice to ${match.name}` : "Remember voice";
+    if (match && !touched) save.checked = true;
+  };
+  input.addEventListener("input", sync);
+  save.addEventListener("change", () => { touched = true; });
+  // people chosen for this meeting who have not been heard yet: one click puts their name in
+  const waiting = peopleOf(m).filter((p) => p.kind === "waiting");
+  const picks = waiting.length ? h("div", { class: "namer-pick" }, h("span", { class: "np-l", text: "Is it" }),
+    ...waiting.map((p) => h("button", { class: "pchip pick", type: "button", title: `Name this speaker ${p.name} and add the voice to their profile`,
+      onclick: () => { input.value = p.name; touched = false; sync(); input.focus(); } }, h("span", { class: "pc-name", text: p.name })))) : null;
   const form = h("form", { class: "namer", onsubmit: async (ev) => {
     ev.preventDefault();
     const name = input.value.trim();
@@ -2671,8 +2845,8 @@ async function openNamer(m, row, seg) {
     if (m.detail.speaker_space === "final") body.view = "final";  // finalize runs again afterwards
     const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/name`, body));
     if (res) { toast(res.message || "Speaker named"); await guarded(() => refreshMeeting(m.info.session)); }
-  } }, input,
-  h("label", { title: "Store a voice profile on this computer so future meetings recognise this person" }, save, "Remember voice"),
+  } }, input, picks,
+  h("label", { title: "Store a voice profile on this computer so future meetings recognise this person. An existing person gets this voice added." }, save, saveText),
   h("button", { class: "btn small primary", type: "submit", text: "Save" }),
   h("button", { class: "btn small ghost", type: "button", text: "Cancel", onclick: () => form.remove() }));
   row.after(form);
@@ -2680,7 +2854,9 @@ async function openNamer(m, row, seg) {
   input.addEventListener("keydown", (ev) => { if (ev.key === "Escape") form.remove(); });
   try {
     const d = await api("GET", "/api/people");
+    S.people = d.people; peopleStamp = Date.now();
     $("people-names").replaceChildren(...d.people.map((p) => h("option", { value: p.name })));
+    sync();
   } catch (e) { /* suggestions are optional */ }
 }
 
@@ -2756,6 +2932,7 @@ async function loadPeople() {
   let data;
   try { data = await api("GET", "/api/people"); } catch (e) { if (!missing(e)) throw e; data = { people: [] }; }
   S.people = data.people;
+  peopleStamp = Date.now();
   const box = $("people");
   const page = h("div", { class: "page" },
     h("div", { class: "people-head" },
@@ -2938,7 +3115,14 @@ function handleEvent(name, data) {
     if (m && m.detail) reviseSegment(m, data.seq, data.text);
   } else if (name === "job") {
     onJob(data);
+  } else if (name === "participants") {
+    const m = S.feed.get(data.session);
+    if (m && m.detail) {
+      api("GET", `/api/sessions/${encodeURIComponent(data.session)}/participants`)
+        .then((d) => { m.detail.participants = d.participants; updatePeople(m); }).catch(() => {});
+    }
   } else if (name === "names") {
+    peopleStamp = 0;  // a voice profile may have been made or renamed
     if (S.view === "people") guarded(loadPeople);
     if (data.session) guarded(() => refreshMeeting(data.session));
     else for (const id of S.feed.keys()) guarded(() => refreshMeeting(id));
@@ -3116,6 +3300,7 @@ function init() {
   $("rec-title").addEventListener("input", renderAutoTitle);
   window.addEventListener("focus", () => fetchLlm(false));  // cheap: the server keeps the answer for a minute
   $("rec-type").addEventListener("click", () => { if (S.sel && S.sel !== "inbox") showMenu($("rec-type"), typeMenuItems); });
+  $("btn-people").addEventListener("click", () => ensurePeople().then(() => showMenu($("btn-people"), recPeopleMenu)));
   $("rec-folder").addEventListener("click", recFolderClick);
   $("rec-title").addEventListener("keydown", (ev) => { if (ev.key === "Enter") startRecording(); });
   $("feed").addEventListener("scroll", onScroll, { passive: true });
@@ -3138,6 +3323,7 @@ function init() {
       if (typeof set.auto_title === "boolean") setAutoTitleDefault(set.auto_title);
     } catch (e) { /* defaults */ }
     fetchLlm(false);
+    ensurePeople().then(() => renderPeopleBtn());
   });
   connect();
 }

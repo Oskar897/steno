@@ -22,7 +22,7 @@ from steno import labels, llm, paths
 from steno.audio import ArraySource
 from steno.config import Config
 from steno.engine import Engine
-from steno.profiles import SessionEmbeddings
+from steno.profiles import ProfileStore, SessionEmbeddings
 from steno.transcript import SessionWriter
 from steno.ui.api import UiApp, default_runners
 from steno.ui.events import EventBus
@@ -684,3 +684,120 @@ def test_a_new_recording_never_reports_the_previous_session(make_ui):
     assert new != old
     c.post("/api/record/stop")
     wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")
+
+
+# --------------------------------------------------------------------------- participants
+
+
+def fake_person(name, voice):
+    return ProfileStore().create(name, np.vstack([voice_vector(voice, 0.05, s) for s in range(3)]))
+
+
+def test_participants_api_add_remove_count_and_validation(make_ui):
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    _, c = make_ui()
+    sid = writer.dir.name
+    alice, bob = fake_person("Alice", 0), fake_person("Bob", 1)
+    url = f"/api/sessions/{sid}/participants"
+    assert c.get(url) == (200, {"participants": {"profiles": [], "count": None}})
+    assert c.get(f"/api/sessions/{sid}")[1]["participants"] == {"profiles": [], "count": None}
+
+    status, res = c.post(url, {"add": alice.id})
+    assert status == 200 and res["participants"] == {"profiles": [alice.id], "count": None}
+    assert c.post(url, {"add": alice.id})[1]["participants"]["profiles"] == [alice.id]
+    res = c.post(url, {"add": bob.id, "count": 3})[1]
+    assert res["participants"] == {"profiles": [alice.id, bob.id], "count": 3}
+    assert c.post(url, {"remove": alice.id})[1]["participants"] == {
+        "profiles": [bob.id], "count": 3}
+    assert c.post(url, {"count": None})[1]["participants"] == {"profiles": [bob.id], "count": None}
+    assert c.get(url)[1]["participants"]["profiles"] == [bob.id]
+    data = json.loads((writer.dir / "participants.json").read_text(encoding="utf-8"))
+    assert data == {"v": 1, "profiles": [bob.id], "count": None}  # ids only, nothing biometric
+
+    res = c.post(url, {"profiles": [alice.id, bob.id, alice.id]})[1]  # replace the whole list
+    assert res["participants"] == {"profiles": [alice.id, bob.id], "count": None}
+    assert c.post(url, {"profiles": []})[1]["participants"]["profiles"] == []  # back to everybody
+    assert c.post(url, {"profiles": [alice.id, "deadbeef"]})[0] == 400
+    assert c.post(url, {"profiles": "alice"})[0] == 400
+    assert c.get(url)[1]["participants"]["profiles"] == []  # a refused change changed nothing
+    c.post(url, {"add": bob.id})
+    assert c.post(url, {})[0] == 400  # nothing to change
+    assert c.post(url, {"add": "deadbeef"})[0] == 400  # no such person
+    assert c.post(url, {"add": "not-an-id"})[0] == 400
+    assert c.post(url, {"add": 7})[0] == 400
+    assert c.post(url, {"remove": "../x"})[0] == 400
+    for bad in (0, 21, "3", True, 2.5):
+        assert c.post(url, {"count": bad})[0] == 400
+    assert c.post("/api/sessions/20200101-000000/participants", {"count": 2})[0] == 404
+    assert c.get("/api/sessions/20200101-000000/participants")[0] == 404
+    assert c.get(url, token=None)[0] == 401
+
+
+def test_record_start_writes_the_participants_and_validates_them(make_ui):
+    _, c = make_ui(engine_factory=fake_engine_factory(burst_audio()))
+    alice, bob = fake_person("Alice", 0), fake_person("Bob", 1)
+    for body in ({"participants": "alice"}, {"participants": [alice.id, 5]},
+                 {"participants": ["deadbeef"]}, {"participants": ["nope"]},
+                 {"speakers": 0}, {"speakers": "3"}, {"speakers": True}, {"speakers": 99},
+                 {"participants": [alice.id], "speakers": 1.5}):
+        assert c.post("/api/record/start", {"mic": True, "loopback": False, **body})[0] == 400
+    assert c.get("/api/status")[1]["recorder"]["state"] == "idle"  # nothing was started
+
+    status, _ = c.post("/api/record/start", {
+        "mic": True, "loopback": False, "participants": [alice.id, bob.id, alice.id],
+        "speakers": 4})
+    assert status == 200
+    sid = wait_for(lambda: c.get("/api/status")[1]["recorder"]["session"])
+    assert c.get(f"/api/sessions/{sid}/participants")[1]["participants"] == {
+        "profiles": [alice.id, bob.id], "count": 4}
+    # still changeable while the meeting runs
+    assert c.post(f"/api/sessions/{sid}/participants", {"remove": bob.id})[0] == 200
+    c.post("/api/record/stop")
+    wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")
+
+
+def test_record_start_without_participants_writes_no_file(make_ui):
+    _, c = make_ui(engine_factory=fake_engine_factory(burst_audio()))
+    assert c.post("/api/record/start", {"mic": True, "loopback": False})[0] == 200
+    sid = wait_for(lambda: c.get("/api/status")[1]["recorder"]["session"])
+    assert not (paths.sessions_dir() / sid / "participants.json").exists()
+    assert c.get(f"/api/sessions/{sid}/participants")[1]["participants"] == {
+        "profiles": [], "count": None}
+    c.post("/api/record/stop")
+    wait_for(lambda: c.get("/api/status")[1]["recorder"]["state"] == "idle")
+
+
+def test_naming_a_speaker_as_a_person_joins_a_participant_list(make_ui):
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    emb = SessionEmbeddings(writer.dir)
+    for seq in (1, 2, 3):
+        emb.add(seq, voice_vector(seq % 2, noise=0.05, seed=seq))
+    emb.close()
+    _, c = make_ui()
+    sid = writer.dir.name
+    alice = fake_person("Alice", 0)
+
+    # no list yet (everybody): naming must not create one, that would narrow matching
+    res = c.post(f"/api/sessions/{sid}/name",
+                 {"speaker": "S2", "name": "Carol", "save_profile": True})[1]
+    assert "created" in res["message"]
+    assert c.get(f"/api/sessions/{sid}/participants")[1]["participants"]["profiles"] == []
+
+    # with a list: the named person is added; an existing person extends their profile
+    c.post(f"/api/sessions/{sid}/participants", {"add": alice.id})
+    status, res = c.post(f"/api/sessions/{sid}/name",
+                         {"speaker": "S1", "name": "alice", "save_profile": True})
+    assert status == 200 and "extended" in res["message"]  # same person, voice added
+    assert [p["name"] for p in c.get("/api/people")[1]["people"]] == ["Alice", "Carol"]
+    carol = next(p for p in c.get("/api/people")[1]["people"] if p["name"] == "Carol")
+    c.post(f"/api/sessions/{sid}/participants", {"remove": alice.id})
+    c.post(f"/api/sessions/{sid}/participants", {"add": carol["id"]})
+    res = c.post(f"/api/sessions/{sid}/name",
+                 {"speaker": "S1", "name": "Alice", "save_profile": True})[1]
+    assert "extended" in res["message"]
+    assert set(c.get(f"/api/sessions/{sid}/participants")[1]["participants"]["profiles"]) == {
+        carol["id"], alice.id}
+    # a label-only name stores no profile, so the list stays as it is
+    before = c.get(f"/api/sessions/{sid}/participants")[1]
+    c.post(f"/api/sessions/{sid}/name", {"speaker": "S2", "name": "Visitor"})
+    assert c.get(f"/api/sessions/{sid}/participants")[1] == before

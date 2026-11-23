@@ -15,7 +15,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from steno import __version__, labels, llm, projects, settings, transcript
+from steno import __version__, labels, llm, participants, projects, settings, transcript
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
@@ -327,13 +327,38 @@ class UiApp:
                 raise ApiError(400, str(exc)) from exc
             mtype, folder = (kind.name if kind else None), str(path)
             title = title or own_title  # named after the folder: never auto-titled
+        people = self._participants_from(body)
         try:
             self.recorder.start(keep_audio=keep, mic=mic, loopback=loopback, project=project,
                                 title=title, mtype=mtype, auto_title=auto_title,
-                                folder=folder)
+                                folder=folder, participants=people)
         except RecorderError as exc:
             raise ApiError(409, str(exc)) from exc
         return {"recorder": self.recorder.snapshot()}
+
+    def _participants_from(self, body: dict[str, Any]) -> participants.Participants | None:
+        """``participants`` (profile ids that exist) and ``speakers`` of a record/start body."""
+        ids = body.get("participants")
+        count = body.get("speakers")
+        if ids is None and count is None:
+            return None
+        ids = self._id_list(ids, "participants") if ids is not None else []
+        count = self._speaker_count(count) if count is not None else None
+        self._known_people(ids)
+        return participants.Participants(tuple(ids), count)
+
+    @staticmethod
+    def _id_list(value: Any, what: str) -> list[str]:
+        if (not isinstance(value, list) or len(value) > participants.MAX_PROFILES
+                or not all(isinstance(i, str) for i in value)):
+            raise ApiError(400, f"{what} must be a list of person ids")
+        return list(dict.fromkeys(value))
+
+    @staticmethod
+    def _speaker_count(value: Any) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_SPEAKERS:
+            raise ApiError(400, f"speakers must be a whole number 1-{MAX_SPEAKERS}")
+        return value
 
     def record_pause(self) -> dict[str, Any]:
         try:
@@ -807,6 +832,7 @@ class UiApp:
             # the labels of the text it was made from
             "speaker_space": "final" if use_final else "live",
             "speakers": self._speakers(d, segments, "final" if use_final else "live"),
+            "participants": participants.read(d).to_json(),
             "summary": _read_text(d / llm.SUMMARY_NAME),
             "todo": _read_text(d / llm.TODO_MD_NAME),
             # which text the clean-up sends, and which one summary / to-do would send (text only)
@@ -846,6 +872,54 @@ class UiApp:
         out.sort(key=lambda e: -e["seconds"])
         return out
 
+    # -- participants ---------------------------------------------------------------
+
+    def participants_get(self, session_id: str) -> dict[str, Any]:
+        d = self._session_dir(session_id)
+        return {"participants": participants.read(d).to_json()}
+
+    def _known_people(self, ids: list[str]) -> None:
+        """400 unless every id is a person that exists."""
+        if not ids:
+            return
+        known = {p.id for p in self._store_call(lambda: self._store_factory().list())}
+        for pid in ids:
+            if not _PROFILE_ID_RE.match(pid) or pid not in known:
+                raise ApiError(400, f"no such person: {pid}")
+
+    def participants_set(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Replace the list (``profiles``), add or remove one person and/or set the expected
+        number of speakers; also while recording (live matching re-reads the file every few
+        seconds)."""
+        d = self._session_dir(session_id)
+        add, remove, profiles = body.get("add"), body.get("remove"), body.get("profiles")
+        for value in (add, remove):
+            if value is not None and (not isinstance(value, str)
+                                      or not _PROFILE_ID_RE.match(value)):
+                raise ApiError(400, "add and remove must be a person id")
+        if profiles is not None:
+            profiles = self._id_list(profiles, "profiles")
+        self._known_people(([add] if add else []) + (profiles or []))
+        count, clear = None, False
+        if "count" in body:
+            if body["count"] is None:
+                clear = True
+            else:
+                count = self._speaker_count(body["count"])
+        if add is None and remove is None and profiles is None and count is None and not clear:
+            raise ApiError(400, "nothing to change: send profiles, add, remove or count")
+        current = participants.update(d, profiles=profiles, add=add, remove=remove, count=count,
+                                      clear_count=clear)
+        self.bus.publish("participants", {"session": session_id})
+        return {"participants": current.to_json()}
+
+    def _note_participant(self, session_dir: Path, profile_id: str | None) -> None:
+        """A speaker was named as a person: join the meeting's list when it has one (an empty
+        list means everybody, so adding one person would wrongly narrow it)."""
+        if profile_id and participants.read(session_dir).restricts:
+            participants.update(session_dir, add=profile_id)
+            self.bus.publish("participants", {"session": session_dir.name})
+
     def name_speaker(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
         from steno import ops
 
@@ -866,6 +940,7 @@ class UiApp:
                     lambda: ops.name_cluster(d, cluster, name, self._store_factory()))
                 note = (f"{name}: voice profile {'created' if res.created else 'extended'} "
                         f"from {res.used} segment(s)")
+                self._note_participant(d, res.profile.id)
             else:  # label only, this session, nothing biometric stored
                 session_labels = labels.SessionLabels(d)
                 root = session_labels.resolve_root(cluster)
@@ -892,6 +967,7 @@ class UiApp:
                 d, final_id, name, self._store_factory() if save else None, save_profile=save))
         except ops.OpsError as exc:
             raise ApiError(400, str(exc)) from exc
+        self._note_participant(d, res.profile.id if res.profile is not None else None)
         note = f"{name}: " + (
             f"voice profile {'created' if res.created else 'extended'} ({res.windows} windows)"
             if res.profile is not None else "named in this meeting")

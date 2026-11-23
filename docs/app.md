@@ -34,11 +34,12 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/projects/<id>/folder` `{folder}` | can the next recording go into this existing folder? `{folder, name, type, title}` or 400 with the reason (`projects.check_existing_folder`) |
 | POST | `/api/inbox/delete` | delete every inbox meeting the app shows (not the archived ones) |
 | GET | `/api/projects/<id>/meetings` | oldest first (`folder` empty = kept in Steno); id `inbox` = sessions that belong to no project |
-| POST | `/api/record/start` `{project?, type?, title?, folder?, mic, loopback, keep_audio, auto_title?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it. `folder`: record into that existing meeting folder (its subfolder decides the type; the title defaults to the folder name without its date, so it is never auto-titled) |
+| POST | `/api/record/start` `{project?, type?, title?, folder?, mic, loopback, keep_audio, auto_title?, participants?, speakers?}`, `/api/record/pause`, `/resume`, `/stop` | `auto_title` defaults to the setting; the recorder snapshot carries it. `folder`: record into that existing meeting folder (its subfolder decides the type; the title defaults to the folder name without its date, so it is never auto-titled). `participants`: list of voice profile ids that exist (else 400), `speakers`: expected number of speakers (whole number 1-20, else 400); both go to `participants.json` of the new session (see "Participants") |
 | POST | `/api/record/auto_title` `{enabled}` | switch the automatic title of the meeting being recorded (409 when not recording) |
 | GET | `/api/llm/status` (`?refresh=1`) | `{llm: {state, method, plan, detail, login_running}}`, see "AI status" |
 | POST | `/api/llm/login`, `/api/llm/install` | open `claude auth login` in a visible console / open the Claude Code install page in the default browser (a fixed address) |
-| GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text |
+| GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text, `participants` |
+| GET/POST | `/api/sessions/<id>/participants` | `{participants: {profiles: [ids], count}}`. POST `{profiles?, add?, remove?, count?}`: replace the list / add or remove one person (must exist, else 400) / set the expected number of speakers (`null` clears it); works while recording and afterwards; sends the SSE event `participants` |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
 | POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (no `type` = in the project without a folder, Steno's files leave the old folder; `project: "inbox"` = back to the inbox, see below) |
 | POST | `/api/meetings/<id>/save` `{folder}` | Save to… an existing meeting folder that lies in a subfolder of any project (an untitled meeting takes the folder's name) |
@@ -53,7 +54,7 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/people/enroll/cancel` | finish early: processes what was recorded if >= 10 s, else cancels |
 
 SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{session, seq, text}`
-(refined text of a line: swap in place), `job`, `names`, `sessions`, `projects`, `settings`, `llm` (Claude status may have changed: ask `/api/llm/status` again), `enroll` (the enrolment state above, about 4 times a second while recording).
+(refined text of a line: swap in place), `job`, `names`, `participants` `{session}` (the list of a meeting changed: ask `/api/sessions/<id>/participants`), `sessions`, `projects`, `settings`, `llm` (Claude status may have changed: ask `/api/llm/status` again), `enroll` (the enrolment state above, about 4 times a second while recording).
 
 ## Speakers and kept audio
 
@@ -66,6 +67,32 @@ SSE events: `hello`, `status`, `segment` `{session, segment}`, `revision` `{sess
   recording stays in the session dir in the data dir, e.g. to compare speech models later.
 - Pressing Record clears the recorder's session id until the new one exists, and the page only
   opens a session that is recording and differs from the previous one.
+
+## Participants (who is in the meeting)
+
+`src/steno/participants.py`, file format in [formats](formats.md) (`participants.json`: profile ids
+and an expected speaker count, no biometric data).
+
+- Before recording: the dock's People button (`#btn-people`, icon + count badge such as `2` or
+  `2/4`) opens a menu with a check item per person in People and a "Speakers - n +" stepper
+  (`stepper`, `recPeopleMenu` in app.js). The choice is remembered per project subfolder
+  (`steno-ppl-<project>-<subfolder>` in `localStorage`, same idea as the subfolder memory) and
+  sent as `participants` / `speakers` with `record/start`. Choosing nobody means everybody is
+  matched; the menu says so.
+- Recording: `Recorder.start(participants=...)` hands it to the engine (`Engine.participants`),
+  which writes the file right after the session dir is created, before the `SpeakerTracker`
+  exists. The tracker (`participants_dir`) re-reads the file in `_maybe_reload` (every 5 s, the
+  profiles only when mtime/size changed) and filters the profiles given to both matchers
+  (windows and cluster centroids) to the list; `count` is applied to
+  `SessionClusterer.max_speakers`. A cluster already bound to a person stays bound when that
+  person is taken out of the list.
+- After the meeting: `finalize_session` uses `count` as `num_speakers` when none is given and
+  restricts its `ProfileMatcher` to the list. `ops.refine_session` (`steno refine`) does not
+  use the list.
+- Naming a speaker as a person (`POST /api/sessions/<id>/name` with `save_profile`; a typed name
+  that equals an existing person adds the voice to that profile, `ops.name_cluster` /
+  `name_final_speaker` use `find_by_name`) adds the person to the list when it is not empty
+  (`UiApp._note_participant`). Naming never starts a list: that would narrow matching.
 
 ## AI status (Claude Code)
 
@@ -241,6 +268,18 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
   speaker can be named (`canName`), else a plain label. Chips that do not fit are folded into a
   "+N" chip (one line when the row is narrower than 520 px, else two) that expands to all and then
   reads "Less"; measured by a `ResizeObserver` on the row.
+  The row has two parts: `.mp-chips` (the folding chips) and `.mp-fixed` (never folded). Beyond
+  the speakers it shows the people chosen for the meeting (`participants` in the session
+  payload) who have not spoken as dimmed chips with 0 lines and a small x that takes them out
+  (`.pchip.waiting`); a speaker who is not named yet ("Speaker 3") is a dashed chip with a
+  hollow dot and a "?" (`.pchip.unknown`, still a button for the namer); "3 of 4" (heard
+  speakers of the expected number, only when a number is set) and "+ Person" sit in
+  `.mp-fixed`. Both open a menu: people not in the meeting yet, and the speaker-count stepper.
+  Adding the first person to an "everybody" list also puts in the people already recognised in
+  the meeting (`addPerson`), otherwise they would stop matching. The row shows while recording
+  even before the first line. The namer (`openNamer`) offers the expected-but-silent people as
+  quick picks ("Is it ..."); typing or picking an existing person's name switches the box to
+  "Add voice to <name>" and ticks it.
 - Settings has an X (top right, `#settings-close`) and Esc closes it (in a text field the first
   Esc only leaves the field); both go back to where it was opened from (`S.back`: the project and
   meeting with the scroll position, or the People list).
@@ -280,7 +319,7 @@ on by default; the dock has a per-meeting "Auto title" switch that starts from i
 
 ## Testing
 
-`tests/test_ui.py` (server, API, recorder with a fake engine), `tests/test_projects.py` (meeting folders, moves between subfolders/projects/inbox, `folder_to_open`),
+`tests/test_ui.py` (server, API, recorder with a fake engine, participants API), `tests/test_participants.py` and `tests/test_speakers.py` (participant list in live matching, finalize), `tests/test_projects.py` (meeting folders, moves between subfolders/projects/inbox, `folder_to_open`),
 `tests/test_settings.py`, `tests/test_shortcuts.py`, `tests/test_ai_status.py` (Claude status, login, readable CLI errors, automatic title). For a manual run against an empty data
 dir: set `STENO_DATA_DIR` to a temp folder (link its `models/` to the real models folder) and
 start `steno ui --no-browser` or `steno app`.

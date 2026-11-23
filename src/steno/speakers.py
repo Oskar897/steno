@@ -44,9 +44,10 @@ from typing import Protocol
 
 import numpy as np
 
-from steno import paths
+from steno import participants, paths
 from steno.config import ProfilesConfig, SpeakersConfig
 from steno.labels import PROFILE_PREFIX, UNKNOWN_ID, UNKNOWN_NAME, SessionLabels
+from steno.participants import Participants
 from steno.profiles import Profile, ProfileStore, SessionEmbeddings, SessionWindows
 from steno.windows import (
     cut_turns,
@@ -509,8 +510,10 @@ class SpeakerTracker:
         reload_interval_s: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         profiles_cfg: ProfilesConfig | None = None,
+        participants_dir: Path | None = None,
     ):
         self.embedder = embedder
+        self.participants_dir = participants_dir
         self.cfg = cfg
         self.profiles_cfg = profiles_cfg
         self.store = store
@@ -543,14 +546,23 @@ class SpeakerTracker:
     # -- profiles ------------------------------------------------------------------
 
     def _maybe_reload(self, force: bool = False) -> None:
-        """Pick up profiles created meanwhile, e.g. by ``steno name`` during a meeting."""
-        if self.store is None:
-            return
+        """Pick up profiles created meanwhile (e.g. by ``steno name`` during a meeting) and
+        changes of the session's participant list (``participants.json``)."""
         now = self._clock()
         if not force and now < self._next_reload:
             return
         self._next_reload = now + self._reload_interval
-        signature = self.store.signature()
+        part = Participants()
+        part_sig: object = None
+        if self.participants_dir is not None:
+            part_sig = participants.signature(self.participants_dir)
+            if part_sig is not None:
+                part = participants.read(self.participants_dir)
+        # Expected number of speakers caps the session clusters; without it the config does.
+        self.clusterer.max_speakers = part.count or self.cfg.max_speakers
+        if self.store is None:
+            return
+        signature = (self.store.signature(), part_sig)
         if not force and signature == self._signature:
             return
         self._signature = signature
@@ -559,6 +571,7 @@ class SpeakerTracker:
         except Exception:
             log.exception("Could not load voice profiles")
             return
+        profiles = participants.restrict(profiles, part)  # a non-empty list narrows matching
         self._matcher = ProfileMatcher(profiles, self.cfg.accept_threshold, self.cfg.margin)
         self._cluster_matcher = ProfileMatcher(
             profiles, self.cfg.cluster_match_threshold, self.cfg.cluster_match_margin
