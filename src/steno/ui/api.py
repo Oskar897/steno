@@ -15,7 +15,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from steno import __version__, labels, llm, participants, projects, settings, transcript
+from steno import (
+    __version__,
+    labels,
+    llm,
+    participants,
+    profile_updates,
+    projects,
+    settings,
+    transcript,
+)
 from steno.config import Config
 from steno.profiles import ProfileError, ProfileStore
 from steno.secure import SecureStorageError
@@ -833,6 +842,7 @@ class UiApp:
             "speaker_space": "final" if use_final else "live",
             "speakers": self._speakers(d, segments, "final" if use_final else "live"),
             "participants": participants.read(d).to_json(),
+            "profile_updates": profile_updates.summary(d),
             "summary": _read_text(d / llm.SUMMARY_NAME),
             "todo": _read_text(d / llm.TODO_MD_NAME),
             # which text the clean-up sends, and which one summary / to-do would send (text only)
@@ -912,6 +922,46 @@ class UiApp:
                                       clear_count=clear)
         self.bus.publish("participants", {"session": session_id})
         return {"participants": current.to_json()}
+
+    # -- voice profile updates after the meeting -------------------------------------
+
+    def profile_updates_get(self, session_id: str) -> dict[str, Any]:
+        """The people this meeting could teach the voice profiles (see ``steno.profile_updates``):
+        ``[{id, name, samples, seconds}]``, no biometric data. Not while recording."""
+        d = self._session_dir(session_id)
+        if session_id == self.recorder.active_session():
+            return {"updates": []}
+        return {"updates": self._store_call(
+            lambda: profile_updates.prune(d, self._store_factory()))}
+
+    def profile_updates_set(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """``{"apply": [ids] | "all", "skip": [ids] | "all"}``: add the pending samples of the
+        ``apply`` people to their profiles and discard those of the ``skip`` people. Whatever
+        is not mentioned stays pending."""
+        d = self._session_dir(session_id)
+        if session_id == self.recorder.active_session():
+            raise ApiError(409, "the meeting is still being recorded")
+        pending = [r["id"] for r in profile_updates.summary(d)]
+        chosen: dict[str, list[str]] = {}
+        for key in ("apply", "skip"):
+            value = body.get(key)
+            if value is None:
+                chosen[key] = []
+            elif value == "all":
+                chosen[key] = pending
+            else:
+                chosen[key] = self._id_list(value, key)
+        if not body.get("apply") and not body.get("skip"):
+            raise ApiError(400, "nothing to do: send apply or skip (a list of person ids or all)")
+        if set(chosen["apply"]) & set(chosen["skip"]):
+            raise ApiError(400, "a person cannot be both applied and skipped")
+        added = self._store_call(lambda: profile_updates.resolve(
+            d, self._store_factory(), apply=chosen["apply"], skip=chosen["skip"]))
+        if added:
+            self.bus.publish("names", {"session": session_id})
+        return {"applied": added,
+                "updates": self._store_call(
+                    lambda: profile_updates.prune(d, self._store_factory()))}
 
     def _note_participant(self, session_dir: Path, profile_id: str | None) -> None:
         """A speaker was named as a person: join the meeting's list when it has one (an empty

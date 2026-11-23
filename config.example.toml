@@ -94,12 +94,16 @@ enroll_hop_s = 1.0
 enroll_outlier_sigma = 2.0
 
 [profiles]
-# A profile only changes for a person you enrolled or named. With auto_update a finished
-# session adds up to auto_update_max new voice samples (diverse, never near-duplicates; the
-# profile keeps at most 30) of every enrolled person it recognised, so the profile follows
-# your microphone and room. Encrypted like the rest of the profile; false = only `steno enroll`
-# and `steno name` change profiles.
-auto_update = true
+# A profile only changes for a person you enrolled or named. A finished session may learn
+# the voices it recognised: up to auto_update_max new samples per person (diverse, never
+# near-duplicates; the profile keeps at most 30), so the profile follows your microphone and
+# room. Samples are encrypted like the rest of the profile. update =
+#   "ask"   the session only keeps the candidates (encrypted, in its folder); the app asks
+#           "Update voice profiles from this meeting?" and applies them when you confirm
+#   "auto"  add them to the profiles as soon as the session ends (wrong recognition is learnt)
+#   "off"   meetings never change a profile; only `steno enroll` and naming a speaker do
+# (An older `auto_update = false` is still read as update = "off".)
+update = "ask"
 auto_update_min_s = 15.0        # speech recognised as the person needed in the session
 auto_update_min_score = 0.6     # the session's voice must match the profile this well
 auto_update_max = 5

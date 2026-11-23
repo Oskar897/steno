@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from steno import labels, llm, paths
+from steno import labels, llm, paths, profile_updates
 from steno.audio import ArraySource
 from steno.config import Config
 from steno.engine import Engine
@@ -801,3 +801,70 @@ def test_naming_a_speaker_as_a_person_joins_a_participant_list(make_ui):
     before = c.get(f"/api/sessions/{sid}/participants")[1]
     c.post(f"/api/sessions/{sid}/name", {"speaker": "S2", "name": "Visitor"})
     assert c.get(f"/api/sessions/{sid}/participants")[1] == before
+
+
+# --------------------------------------------------------------------------- profile updates
+
+
+def test_profile_updates_api_apply_skip_and_delete_with_the_meeting(make_ui):
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    _, c = make_ui()
+    sid = writer.dir.name
+    alice, bob = fake_person("Alice", 0), fake_person("Bob", 1)
+    url = f"/api/sessions/{sid}/profile-updates"
+    assert c.get(url) == (200, {"updates": []})
+    assert c.get(f"/api/sessions/{sid}")[1]["profile_updates"] == []
+
+    profile_updates.write(writer.dir, [
+        profile_updates.Pending(alice.id, "Alice", 185.0, np.vstack(
+            [voice_vector(0, 0.2, 40 + s) for s in range(4)])),
+        profile_updates.Pending(bob.id, "Bob", 70.0, np.vstack(
+            [voice_vector(1, 0.2, 50 + s) for s in range(2)]))])
+    status, res = c.get(url)
+    assert status == 200 and res["updates"] == [
+        {"id": alice.id, "name": "Alice", "samples": 4, "seconds": 185.0},
+        {"id": bob.id, "name": "Bob", "samples": 2, "seconds": 70.0}]
+    assert c.get(f"/api/sessions/{sid}")[1]["profile_updates"] == res["updates"]
+    assert "embedding" not in json.dumps(res)
+
+    for bad in ({}, {"apply": "none"}, {"apply": [5]}, {"apply": [alice.id], "skip": [alice.id]},
+                {"skip": "alice"}):
+        assert c.post(url, bad)[0] == 400
+    assert c.post("/api/sessions/20200101-000000/profile-updates", {"apply": "all"})[0] == 404
+    assert c.get(url, token=None)[0] == 401
+    assert len(ProfileStore().get(alice.id).embeddings) == 3  # refused calls changed nothing
+
+    status, res = c.post(url, {"apply": [alice.id]})  # Bob stays pending
+    assert status == 200 and res["applied"] == {alice.id: 4}
+    assert [u["id"] for u in res["updates"]] == [bob.id]
+    assert len(ProfileStore().get(alice.id).embeddings) == 7
+    assert len(ProfileStore().get(bob.id).embeddings) == 3
+
+    status, res = c.post(url, {"skip": "all"})
+    assert status == 200 and res == {"applied": {}, "updates": []}
+    assert len(ProfileStore().get(bob.id).embeddings) == 3
+    assert not (writer.dir / profile_updates.DATA_NAME).exists()
+    assert not (writer.dir / profile_updates.SUMMARY_NAME).exists()
+
+    profile_updates.write(writer.dir, [profile_updates.Pending(
+        alice.id, "Alice", 60.0, np.vstack([voice_vector(0, 0.2, 60)]))])
+    assert c.post(url, {"apply": "all"})[1]["applied"] == {alice.id: 1}
+
+
+def test_profile_updates_of_a_deleted_person_are_dropped_and_deleting_the_meeting_removes_them(
+        make_ui):
+    writer = make_session("2026-01-01T10:00:00", LINES)
+    _, c = make_ui()
+    sid = writer.dir.name
+    alice = fake_person("Alice", 0)
+    profile_updates.write(writer.dir, [profile_updates.Pending(
+        alice.id, "Alice", 60.0, np.vstack([voice_vector(0, 0.2, 70)]))])
+    ProfileStore().delete("Alice")
+    assert c.get(f"/api/sessions/{sid}/profile-updates")[1]["updates"] == []
+    assert not (writer.dir / profile_updates.DATA_NAME).exists()
+
+    carol = fake_person("Carol", 2)
+    profile_updates.write(writer.dir, [profile_updates.Pending(
+        carol.id, "Carol", 60.0, np.vstack([voice_vector(2, 0.2, 71)]))])
+    assert c.call("DELETE", f"/api/meetings/{sid}")[0] == 200
+    assert not writer.dir.exists()  # the pending files went with the session dir

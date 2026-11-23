@@ -214,6 +214,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.session(segs[1], (query.get("view") or [None])[0])
             if n == 3 and segs[0] == "sessions" and segs[2] == "participants":
                 return app.participants_get(segs[1])
+            if n == 3 and segs[0] == "sessions" and segs[2] == "profile-updates":
+                return app.profile_updates_get(segs[1])
             if segs == ["jobs"]:
                 return app.job_list()
             if segs == ["people"]:
@@ -281,6 +283,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return app.start_job(segs[1], body)
             if n == 3 and segs[0] == "sessions" and segs[2] == "participants":
                 return app.participants_set(segs[1], body)
+            if n == 3 and segs[0] == "sessions" and segs[2] == "profile-updates":
+                return app.profile_updates_set(segs[1], body)
             if segs == ["people", "enroll"]:
                 return app.enroll_start(body)
             if segs == ["people", "enroll", "cancel"]:

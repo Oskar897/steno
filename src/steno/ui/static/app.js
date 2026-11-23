@@ -1765,6 +1765,7 @@ async function fetchDetail(m) {
   m.detail.segments = m.detail.segments || [];
   m.detail.speakers = m.detail.speakers || [];
   m.detail.participants = m.detail.participants || { profiles: [], count: null };
+  m.detail.profile_updates = m.detail.profile_updates || [];
   await loadDocs(m);
 }
 
@@ -2018,7 +2019,9 @@ function buildMeeting(m) {
             onclick: () => guarded(() => archiveMeeting(info, S.sel, false)) }, icon("archive"), "Archived") : null)),
       more),
     bar, m.peopleEl);
-  m.el = h("section", { class: "meeting", "data-session": sid }, m.stickEl, m.jobEl, m.docsEl, linesHead, m.linesEl);
+  m.updatesEl = h("div", { class: "vupdate", hidden: true });
+  m.el = h("section", { class: "meeting", "data-session": sid }, m.stickEl, m.jobEl, m.updatesEl, m.docsEl, linesHead, m.linesEl);
+  renderUpdates(m);
   renderDocs(m);
   renderLines(m);
   initPeople(m);
@@ -2319,6 +2322,49 @@ function renderDocs(m) {
     det.addEventListener("toggle", () => { m.open[kind] = det.open; });
     m.docsEl.append(det);
   }
+}
+
+/* "Update voice profiles from this meeting?": after a recording the live recognition keeps the voice samples
+   it would add to the people it recognised (encrypted, pending); nothing changes until the user confirms.
+   Switches pick the people, Update applies those and discards the rest, Skip discards all. */
+function speechLength(sec) {
+  if (sec < 90) return `${Math.max(1, Math.round(sec))} s`;
+  return `${Math.round(sec / 60)} min`;
+}
+
+function renderUpdates(m) {
+  const box = m.updatesEl;
+  if (!box) return;
+  const list = (m.detail.profile_updates || []);
+  box.hidden = !list.length || !!m.info.recording;
+  box.replaceChildren();
+  if (box.hidden) return;
+  const checks = list.map((u) => h("input", { class: "switch", type: "checkbox", checked: true, "aria-label": `Learn ${u.name}'s voice from this meeting` }));
+  const rows = list.map((u, i) => h("label", { class: "vu-row" }, checks[i],
+    h("span", { class: "vu-name", text: u.name }),
+    h("span", { class: "vu-sub", text: `${u.samples} sample${u.samples === 1 ? "" : "s"} · ${speechLength(u.seconds)}` })));
+  const update = h("button", { class: "btn small primary", type: "button", text: "Update" });
+  const skip = h("button", { class: "btn small", type: "button", text: "Skip" });
+  const sync = () => { update.disabled = !checks.some((c) => c.checked); };
+  checks.forEach((c) => c.addEventListener("change", sync));
+  const send = async (applyAll) => {
+    update.disabled = skip.disabled = true;
+    const apply = list.filter((u, i) => applyAll && checks[i].checked).map((u) => u.id);
+    const drop = list.filter((u) => !apply.includes(u.id)).map((u) => u.id);
+    const res = await guarded(() => api("POST", `/api/sessions/${encodeURIComponent(m.info.session)}/profile-updates`, { apply, skip: drop }));
+    if (!res) { update.disabled = skip.disabled = false; sync(); return; }
+    m.detail.profile_updates = res.updates || [];
+    const n = Object.keys(res.applied || {}).length;
+    if (n) { peopleStamp = 0; toast(`Voice profile${n === 1 ? "" : "s"} updated`); } else toast("Voice profiles left as they were");
+    renderUpdates(m);
+  };
+  update.addEventListener("click", () => send(true));
+  skip.addEventListener("click", () => send(false));
+  box.append(
+    h("div", { class: "vu-title", text: "Update voice profiles from this meeting?" }),
+    h("div", { class: "vu-hint", text: "Steno recognised these people. If a name is wrong, switch it off so a wrong voice is not learnt." }),
+    ...rows,
+    h("div", { class: "vu-btns" }, skip, update));
 }
 
 function renameMeeting(m, btn) {

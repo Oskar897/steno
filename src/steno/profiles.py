@@ -240,6 +240,25 @@ class ProfileStore:
             self._save(profile)
             return profile
 
+    def candidates(
+        self,
+        profile_id: str,
+        pool: np.ndarray,
+        *,
+        min_score: float = 0.6,
+        max_new: int = 5,
+        dup: float = 0.93,
+    ) -> np.ndarray:
+        """What ``grow`` would add from ``pool`` (see ``select_growth``), without adding it:
+        an ``(k, dim)`` array, empty for an unknown profile."""
+        with self._lock:
+            profile = self.get(profile_id)
+            if profile is None:
+                return np.zeros((0, pool.shape[1] if pool.ndim == 2 else 0), dtype=np.float32)
+            return select_growth(
+                profile.embeddings, pool, min_score=min_score, max_new=max_new, dup=dup
+            )
+
     def grow(
         self,
         profile_id: str,

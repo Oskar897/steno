@@ -24,8 +24,9 @@ Pipeline for one finished VAD segment (see ``SpeakerTracker.identify_turns``):
 
 ``identify`` is the older whole-segment path (one embedding, one label) that remains
 available with ``window_s = 0``. The tracker never enrols anyone; a profile only grows
-(``[profiles] auto_update``, see ``ProfileStore.grow``) when the session recognised that
-enrolled person, and only after the session ends. All thresholds are uncalibrated
+(``[profiles] update``, see ``ProfileStore.grow``; by default only after the user confirmed,
+see ``steno.profile_updates``) when the session recognised that enrolled person, and only
+after the session ends. All thresholds are uncalibrated
 defaults (see ``[speakers]``).
 """
 
@@ -44,7 +45,7 @@ from typing import Protocol
 
 import numpy as np
 
-from steno import participants, paths
+from steno import participants, paths, profile_updates
 from steno.config import ProfilesConfig, SpeakersConfig
 from steno.labels import PROFILE_PREFIX, UNKNOWN_ID, UNKNOWN_NAME, SessionLabels
 from steno.participants import Participants
@@ -824,33 +825,50 @@ class SpeakerTracker:
         if self.embeddings is not None and label.embedding is not None:
             self.embeddings.add(seq, label.embedding)
 
-    def _session_tag(self) -> str:
+    def _session_dir(self) -> Path | None:
         for holder in (self.labels, self.embeddings, self.windows):
             path = getattr(holder, "path", None)
             if path is not None:
-                return f"auto:{Path(path).parent.name}"
-        return "auto"
+                return Path(path).parent
+        return self.participants_dir
+
+    def _session_tag(self) -> str:
+        d = self._session_dir()
+        return f"auto:{d.name}" if d is not None else "auto"
 
     def _grow_profiles(self) -> None:
-        """``[profiles] auto_update``: add a few diverse samples of every enrolled person
-        this session recognised (never creates a profile, never touches anyone else's)."""
+        """``[profiles] update``: what the session learnt about every enrolled person it
+        recognised (never creates a profile, never touches anyone else's). ``auto`` adds a few
+        diverse samples now; ``ask`` only stores them as pending updates that the user confirms
+        (``steno.profile_updates``); ``off`` does nothing."""
         cfg = self.profiles_cfg
-        if cfg is None or not cfg.auto_update or self.store is None:
+        if cfg is None or cfg.update == "off" or self.store is None:
             return
+        ask = cfg.update == "ask"
+        session_dir = self._session_dir()
+        if ask and session_dir is None:
+            return  # nowhere to keep the candidates
+        pending: list[profile_updates.Pending] = []
+        names = {p.id: p.name for p in self.store.list()} if ask else {}
         for key, pool in self._pools.items():
             if not key.startswith(PROFILE_PREFIX) or pool.seconds < cfg.auto_update_min_s:
                 continue
-            added = self.store.grow(
-                key[len(PROFILE_PREFIX):],
-                np.vstack(pool.embs),
-                self._session_tag(),
-                min_score=cfg.auto_update_min_score,
-                max_new=cfg.auto_update_max,
-                dup=cfg.auto_update_dup,
-            )
+            pid = key[len(PROFILE_PREFIX):]
+            kwargs = {"min_score": cfg.auto_update_min_score, "max_new": cfg.auto_update_max,
+                      "dup": cfg.auto_update_dup}
+            if ask:
+                new = self.store.candidates(pid, np.vstack(pool.embs), **kwargs)
+                if len(new) and pid in names:
+                    pending.append(profile_updates.Pending(pid, names[pid], pool.seconds, new))
+                continue
+            added = self.store.grow(pid, np.vstack(pool.embs), self._session_tag(), **kwargs)
             if added:
-                log.info("Profile %s: added %d voice sample(s) from this session",
-                         key[len(PROFILE_PREFIX):], added)
+                log.info("Profile %s: added %d voice sample(s) from this session", pid, added)
+        if ask:
+            profile_updates.write(session_dir, pending)
+            if pending:
+                log.info("Voice profile update waits for confirmation: %d person(s)",
+                         len(pending))
 
     def close(self) -> None:
         """Merge speakers that never got enough evidence, then flush the stores."""

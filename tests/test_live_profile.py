@@ -11,7 +11,7 @@ from datetime import datetime
 
 import numpy as np
 
-from steno import labels, ops, transcript
+from steno import labels, ops, profile_updates, transcript
 from steno.config import ProfilesConfig, SpeakersConfig
 from steno.labels import PROFILE_PREFIX, SessionLabels
 from steno.profiles import ProfileStore, SessionEmbeddings, select_growth
@@ -337,7 +337,7 @@ def test_store_grow_leaves_the_file_alone_when_there_is_nothing_to_add():
 
 def test_tracker_grows_the_recognised_profile_only_when_enabled(tmp_path):
     rng = np.random.default_rng(15)
-    pcfg = ProfilesConfig(auto_update_min_s=5.0)
+    pcfg = ProfilesConfig(update="auto", auto_update_min_s=5.0)
 
     def session(sub, profiles_cfg):
         store = ProfileStore()
@@ -361,7 +361,7 @@ def test_tracker_grows_the_recognised_profile_only_when_enabled(tmp_path):
     assert all(float(e @ basis(6)) < 0.5 for e in grown.embeddings)  # nobody else's voice
 
     (tmp_path / "off").mkdir()
-    store, alice = session("off", ProfilesConfig(auto_update=False, auto_update_min_s=5.0))
+    store, alice = session("off", ProfilesConfig(update="off", auto_update_min_s=5.0))
     assert len(store.get(alice.id).embeddings) == 3
     (tmp_path / "none").mkdir()
     store, alice = session("none", None)
@@ -373,8 +373,57 @@ def test_tracker_does_not_grow_a_profile_after_too_little_speech(tmp_path):
     store = ProfileStore()
     alice = alice_profile(store, rng)
     tracker, emb, _ = tracker_for(tmp_path, store, accept_threshold=0.5)
-    tracker.profiles_cfg = ProfilesConfig(auto_update_min_s=30.0)
+    tracker.profiles_cfg = ProfilesConfig(update="auto", auto_update_min_s=30.0)
     for _ in range(3):
         say(tracker, emb, [noisy(mix(basis(0), basis(1), 0.8), 0.3, rng) for _ in range(3)])
     tracker.close()
     assert len(store.get(alice.id).embeddings) == 3
+
+
+def test_tracker_in_ask_mode_keeps_pending_candidates_and_changes_no_profile(tmp_path):
+    rng = np.random.default_rng(17)
+    store = ProfileStore()
+    alice = alice_profile(store, rng)
+    stamp = store.get(alice.id).updated
+    tracker, emb, _ = tracker_for(tmp_path, store, accept_threshold=0.5)
+    tracker.profiles_cfg = ProfilesConfig(auto_update_min_s=5.0)  # default mode: ask
+    for _ in range(6):
+        say(tracker, emb, [noisy(mix(basis(0), basis(1), 0.8), 0.3, rng) for _ in range(3)])
+    for _ in range(2):  # somebody else: no candidates for anyone
+        say(tracker, emb, [noisy(basis(6), 0.1, rng) for _ in range(3)])
+    tracker.close()
+
+    assert store.get(alice.id).updated == stamp and len(store.get(alice.id).embeddings) == 3
+    rows = profile_updates.summary(tmp_path)
+    assert [(r["id"], r["name"]) for r in rows] == [(alice.id, "Alice")]
+    assert 1 <= rows[0]["samples"] <= 5 and rows[0]["seconds"] >= 5.0
+    # the encrypted file holds the same samples, none of them close to the other speaker
+    (item,) = profile_updates.load(tmp_path)
+    assert item.samples == rows[0]["samples"]
+    assert all(float(e @ basis(6)) < 0.5 for e in item.embeddings)
+    # the plain summary carries no embedding
+    assert "embeddings" not in (tmp_path / profile_updates.SUMMARY_NAME).read_text(encoding="utf-8")
+
+    # the candidates are what "auto" would have added
+    assert profile_updates.resolve(tmp_path, store, apply=[alice.id]) == {alice.id: item.samples}
+    grown = store.get(alice.id)
+    assert len(grown.embeddings) == 3 + item.samples
+    assert all(t == f"auto:{tmp_path.name}" for t in grown.tags[3:])
+    assert profile_updates.summary(tmp_path) == []
+    assert not (tmp_path / profile_updates.DATA_NAME).exists()
+
+
+def test_tracker_ask_mode_stores_nothing_without_enough_speech_or_in_off_mode(tmp_path):
+    rng = np.random.default_rng(18)
+    store = ProfileStore()
+    alice_profile(store, rng)
+    for sub, cfg in (("short", ProfilesConfig(auto_update_min_s=30.0)),
+                     ("off", ProfilesConfig(update="off", auto_update_min_s=5.0))):
+        (tmp_path / sub).mkdir()
+        tracker, emb, _ = tracker_for(tmp_path / sub, store, accept_threshold=0.5)
+        tracker.profiles_cfg = cfg
+        for _ in range(6):
+            say(tracker, emb, [noisy(mix(basis(0), basis(1), 0.8), 0.3, rng) for _ in range(3)])
+        tracker.close()
+        assert profile_updates.summary(tmp_path / sub) == []
+        assert not (tmp_path / sub / profile_updates.DATA_NAME).exists()

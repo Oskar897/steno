@@ -20,6 +20,8 @@ system) can consume Steno output without importing Steno.
   final.json           # metadata of the finalize run: speakers, counts, parameters
   clean.jsonl          # optional `steno clean`: the text with Claude's validated corrections
   clean.md, clean.json # human-readable mirror; counts, model and the edits of the run
+  profile-updates.bin  # ENCRYPTED optional: voice samples a finished meeting proposes for profiles (biometric)
+  profile-updates.json # plain summary of those, without embeddings (see below)
   summary.md           # optional `steno summary`
   todo.md, todo.json   # optional `steno todo`
   embeddings.bin       # ENCRYPTED speaker embeddings, seq -> vector (biometric)
@@ -430,10 +432,21 @@ encryption is unavailable and Steno refuses to store them, unless
   name, created/updated timestamps, and a per-embedding origin tag (session id or
   `enroll:<timestamp>`). `steno enroll` stores 2.5 s windows (1 s hop) of the
   recording, without outliers (cosine to the mean more than 2 sigma below the average);
-  at least 30 s of speech is recommended. With `[profiles] auto_update` (default on) the
-  live engine adds up to 5 diverse window embeddings of an already enrolled person at the end
-  of a session in which they were recognised (tag `auto:<session id>`); it never creates a
-  profile or touches anyone who was not recognised.
+  at least 30 s of speech is recommended. What a finished meeting learns is set by
+  `[profiles] update`: `ask` (default) keeps the candidates as pending updates until the user
+  confirms (`profile-updates.*` below), `auto` adds them at once, `off` never. Either way it is
+  at most 5 diverse window embeddings of an already enrolled person who was recognised for
+  at least `auto_update_min_s` (tag `auto:<session id>`); it never creates a profile or
+  touches anyone who was not recognised. (An older `auto_update = false` reads as `off`.)
+- `profile-updates.bin` / `profile-updates.json`: written when a session ends with
+  `update = "ask"` and at least one person has candidates (else neither file exists). The
+  `.bin` is encrypted like a profile (`npz`: `emb_<profile id>` float32 rows, JSON `meta` with
+  per person `name` and `seconds`); the `.json` is plain text for the app's notice and holds no
+  voiceprint: `{"v": 1, "profiles": [{"id", "name", "samples", "seconds"}]}` (`seconds` = speech
+  recognised as that person). `POST /api/sessions/<id>/profile-updates` adds the stored rows to
+  the profile (`ProfileStore.add_embeddings`, tag `auto:<session id>`) or discards them, and
+  deletes the data of everyone it handled; data of a deleted person is dropped, and deleting the
+  meeting deletes both files with the session folder.
 - `embeddings.bin`: seq -> embedding for each line that was long enough to embed
   (`min_embed_s`; the normalised mean of the line's window embeddings), flushed every
   20 lines and at the end of the session. `steno name` learns from these.

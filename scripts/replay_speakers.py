@@ -19,7 +19,7 @@ import argparse
 import sys
 import tempfile
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -117,9 +117,8 @@ def replay(
     embedder = ReplayEmbedder([e for g in groups for e in g.emb])
     labels = lab.SessionLabels(session_dir)
     labels.init()
-    tracker = SpeakerTracker(
-        embedder, cfg.speakers, store, labels, profiles_cfg=cfg.profiles if grow else None
-    )
+    profiles_cfg = replace(cfg.profiles, update="auto") if grow else None
+    tracker = SpeakerTracker(embedder, cfg.speakers, store, labels, profiles_cfg=profiles_cfg)
     raw: list[tuple[float, float, str]] = []
     for g in groups:
         audio = np.zeros(int(round((g.t1 - g.t0) * SAMPLE_RATE)), dtype=np.float32)

@@ -40,6 +40,7 @@ All JSON, all need the token header. Errors: `{"error": "..."}` with a 4xx/5xx s
 | POST | `/api/llm/login`, `/api/llm/install` | open `claude auth login` in a visible console / open the Claude Code install page in the default browser (a fixed address) |
 | GET | `/api/sessions/<id>` | segments (clean text when fresh, else final, else best live), speakers, title, project, summary/todo text, `participants` |
 | GET/POST | `/api/sessions/<id>/participants` | `{participants: {profiles: [ids], count}}`. POST `{profiles?, add?, remove?, count?}`: replace the list / add or remove one person (must exist, else 400) / set the expected number of speakers (`null` clears it); works while recording and afterwards; sends the SSE event `participants` |
+| GET/POST | `/api/sessions/<id>/profile-updates` | voice profile update after the meeting (see "Voice profile update"). GET: `{updates: [{id, name, samples, seconds}]}` (no biometric data; empty while recording). POST `{apply?, skip?}` (each a list of person ids or `"all"`): apply adds the pending samples to those profiles, skip discards them; both delete what they handled. Returns `{applied: {id: n}, updates: [...still pending]}`; 400 for no choice / a person in both lists, 409 while recording. `GET /api/sessions/<id>` carries the same list as `profile_updates` |
 | GET | `/api/sessions/<id>/doc/summary`, `/doc/todo` | `{markdown}` |
 | POST | `/api/meetings/<id>/rename` `{title}`, `/api/meetings/<id>/move` `{project, type?}` | renames/moves the meeting folder (no `type` = in the project without a folder, Steno's files leave the old folder; `project: "inbox"` = back to the inbox, see below) |
 | POST | `/api/meetings/<id>/save` `{folder}` | Save to… an existing meeting folder that lies in a subfolder of any project (an untitled meeting takes the folder's name) |
@@ -93,6 +94,27 @@ and an expected speaker count, no biometric data).
   that equals an existing person adds the voice to that profile, `ops.name_cluster` /
   `name_final_speaker` use `find_by_name`) adds the person to the list when it is not empty
   (`UiApp._note_participant`). Naming never starts a list: that would narrow matching.
+
+## Voice profile update (confirmed after the meeting)
+
+`src/steno/profile_updates.py`, files in [formats](formats.md) (`profile-updates.bin` encrypted,
+`profile-updates.json` plain summary). A meeting can teach the voice profiles of the people it
+recognised, but a wrong recognition would teach a wrong voice, so `[profiles] update` defaults to
+`"ask"` (`"auto"` = add at once, `"off"` = never; the old `auto_update = false` reads as `off`).
+There is no switch in Settings: it is `config.toml` only.
+
+- `SpeakerTracker.close` (`_grow_profiles`) computes the same candidates `ProfileStore.grow` would
+  add (`ProfileStore.candidates` -> `select_growth`: min speech, min score, diversity, at most
+  `auto_update_max` per person) and in `ask` mode stores them with the speech seconds instead.
+  Naming a speaker (`ops.name_cluster`, `name_final_speaker`) is an explicit action and still adds
+  its voice immediately.
+- The finished meeting shows a notice under the pinned head (`m.updatesEl`, `renderUpdates` in
+  app.js): "Update voice profiles from this meeting?", one switch per person with
+  "n samples · duration", and Update (applies the switched-on people, discards the rest) / Skip
+  (discards all). It disappears once nothing is pending.
+- `profile_updates.prune` (used by GET) drops people who no longer exist and shows current names;
+  `resolve` applies with `add_embeddings` (the profile keeps at most 30 samples), tag
+  `auto:<session id>`. The session dir holds the files, so deleting the meeting deletes them.
 
 ## AI status (Claude Code)
 

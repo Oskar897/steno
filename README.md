@@ -81,7 +81,8 @@ after a few seconds of speech, so a cough does not become "Speaker 6".
 
 Voice profiles and session embeddings are biometric data: stored encrypted with
 Windows DPAPI (current user), never auto-enrolled from the live stream, never in
-this repository. Only enrol people who agreed. All thresholds in `[speakers]`
+this repository. A profile only learns from a meeting after you confirm it ("Update voice
+profiles from this meeting?" in the app; `[profiles] update`, `ask` by default). Only enrol people who agreed. All thresholds in `[speakers]`
 are uncalibrated defaults; tune them on your own microphone and rooms.
 `--keep-audio` stores raw per-stream FLAC in the session folder (sensitive).
 

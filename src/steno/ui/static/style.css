@@ -397,6 +397,16 @@ h1 { margin: 0; font-family: var(--display); font-size: 14px; font-weight: 600; 
 .bar i { position: absolute; inset: 0 auto 0 0; width: 100%; border-radius: 2px; background: var(--text); transform-origin: left; transition: transform 0.4s var(--ease); }
 .bar.indet i { width: 35%; animation: indet 1.3s ease-in-out infinite; }
 
+/* confirm the voice profile update after a meeting */
+.vupdate { margin-top: 8px; padding: 10px 12px; border-radius: var(--r-md); border: 1px solid var(--line-hi); animation: fade-in 0.3s var(--ease); }
+.vupdate[hidden] { display: none; }
+.vu-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.vu-hint { margin-top: 2px; font-size: 12px; line-height: 1.4; color: var(--faint); }
+.vu-row { display: flex; align-items: center; gap: 10px; min-height: 30px; margin-top: 4px; cursor: pointer; font-size: 13px; }
+.vu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.vu-sub { flex: none; color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+.vu-btns { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
+
 /* summary / to-do: a list divided by hairlines, not boxes */
 .docs { display: flex; flex-direction: column; margin-top: 8px; border-top: 1px solid var(--line); }
 .docs:empty { display: none; }

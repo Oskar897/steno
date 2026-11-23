@@ -81,3 +81,15 @@ def test_speakers_section_defaults_and_override():
     assert cfg.speakers.enabled is False and cfg.speakers.accept_threshold == 1.0
     with pytest.raises(ConfigError):
         config_from_dict({"speakers": {"min_embed_s": "long"}})
+
+
+def test_profiles_update_mode_default_values_and_old_auto_update_key():
+    assert Config().profiles.update == "ask"
+    assert config_from_dict({"profiles": {"update": "auto"}}).profiles.update == "auto"
+    assert config_from_dict({"profiles": {"auto_update": False}}).profiles.update == "off"
+    assert config_from_dict({"profiles": {"auto_update": True}}).profiles.update == "ask"
+    both = {"profiles": {"auto_update": False, "update": "auto"}}
+    assert config_from_dict(both).profiles.update == "auto"  # the new key wins
+    assert config_from_dict({"profiles": {"auto_update_max": 3}}).profiles.auto_update_max == 3
+    with pytest.raises(ConfigError):
+        config_from_dict({"profiles": {"update": "sometimes"}})

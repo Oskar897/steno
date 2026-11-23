@@ -135,13 +135,18 @@ class SpeakersConfig:
     enroll_outlier_sigma: float = 2.0
 
 
+PROFILE_UPDATE_MODES = ("ask", "auto", "off")
+
+
 @dataclass(frozen=True)
 class ProfilesConfig:
     """Voice profiles. A profile only ever changes for a person who was enrolled or named
-    by you; ``auto_update`` lets a finished session add a few new voice samples to the
-    profile that was recognised in it (encrypted like the rest of the profile)."""
+    by you. ``update`` says what a finished session does with the voices it recognised:
+    ``"ask"`` stores them as pending samples that you confirm or skip in the meeting (the app
+    asks; ``steno`` never applies them on its own), ``"auto"`` adds them at once, ``"off"``
+    never learns from meetings. All samples are encrypted like the rest of the profile."""
 
-    auto_update: bool = True
+    update: str = "ask"
     auto_update_min_s: float = 15.0  # speech recognised as the person needed in the session
     auto_update_min_score: float = 0.6  # the session's voice must match the profile this well
     auto_update_max: int = 5  # at most this many new embeddings per session and person
@@ -288,7 +293,21 @@ def _apply_section(section: str, obj: Any, data: Any) -> Any:
     return replace(obj, **updates)
 
 
+def _legacy_profiles(data: dict[str, Any]) -> dict[str, Any]:
+    """Older configs had ``[profiles] auto_update`` (bool): false meant "never learn" = ``off``;
+    true was the default and now means the default, ``ask`` (an explicit ``update`` wins)."""
+    section = data.get("profiles")
+    if not isinstance(section, dict) or "auto_update" not in section:
+        return data
+    section = dict(section)
+    old = section.pop("auto_update")
+    if old is False and "update" not in section:
+        section["update"] = "off"
+    return {**data, "profiles": section}
+
+
 def config_from_dict(data: dict[str, Any]) -> Config:
+    data = _legacy_profiles(data)
     cfg = Config()
     updates: dict[str, Any] = {}
     for key, value in data.items():
@@ -299,6 +318,11 @@ def config_from_dict(data: dict[str, Any]) -> Config:
     cfg = replace(cfg, **updates)
     if cfg.asr.language not in {"sv", "en", "auto"} and len(cfg.asr.language) != 2:
         raise ConfigError(f"[asr] language: unsupported value {cfg.asr.language!r}")
+    if cfg.profiles.update not in PROFILE_UPDATE_MODES:
+        raise ConfigError(
+            f"[profiles] update: expected one of {', '.join(PROFILE_UPDATE_MODES)}, "
+            f"got {cfg.profiles.update!r}"
+        )
     if cfg.post.asr_mode not in ASR_MODES:
         raise ConfigError(
             f"[post] asr_mode: expected one of {', '.join(ASR_MODES)}, got {cfg.post.asr_mode!r}"
