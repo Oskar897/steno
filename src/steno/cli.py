@@ -672,8 +672,18 @@ def _llm_command(args: argparse.Namespace, action) -> int:
         return 1
 
 
+def _clean_first(session_dir, cfg: Config) -> None:
+    """Summary and to-do read the cleaned text: run `steno clean` first when it is missing."""
+    from steno import clean
+
+    note = clean.ensure_clean(session_dir, cfg.llm)
+    if note:
+        print(f"({note})", file=sys.stderr)
+
+
 def cmd_summary(args: argparse.Namespace, cfg: Config) -> int:
     def run(session_dir, llm) -> int:
+        _clean_first(session_dir, cfg)
         path, kind = llm.summarize(session_dir, cfg.llm)
         print(f"({kind} transcript; saved as {path.name})", file=sys.stderr)
         print(path.read_text(encoding="utf-8"), end="")
@@ -684,8 +694,10 @@ def cmd_summary(args: argparse.Namespace, cfg: Config) -> int:
 
 def cmd_todo(args: argparse.Namespace, cfg: Config) -> int:
     def run(session_dir, llm) -> int:
+        _clean_first(session_dir, cfg)
         items, dropped, kind = llm.extract_todos(session_dir, cfg.llm, person=args.person)
-        print(f"({kind} transcript; {len(items)} item(s), {dropped} dropped without evidence; "
+        print(f"({kind} transcript; {len(items)} item(s), {dropped} dropped (no evidence, "
+              f"unsure or duplicate); "
               f"saved as {llm.TODO_MD_NAME} and {llm.TODO_JSON_NAME})", file=sys.stderr)
         print((session_dir / llm.TODO_MD_NAME).read_text(encoding="utf-8"), end="")
         return 0

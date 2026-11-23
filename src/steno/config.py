@@ -221,11 +221,14 @@ class LlmConfig:
     """Summary / to-do through the Claude Code CLI (text only; audio never leaves)."""
 
     command: str = "claude"  # the Claude Code executable
-    model: str = "haiku"  # alias or full model name
+    model: str = "haiku"  # alias or full model name (clean-up, fix, title)
+    # Summary and to-do read the whole meeting and judge what was decided: a stronger model.
+    summary_model: str = "sonnet"  # "" = same as `model`
     effort: str = "medium"  # low, medium, high, xhigh, max; "" = CLI default
     language: str = "sv"  # output language; "auto" = the language of the meeting
-    timeout_s: int = 300
+    timeout_s: int = 600
     fix_max_edit: float = 0.3  # `finalize --llm-fix`: largest accepted edit (share of the line)
+    todo_min_confidence: float = 0.5  # to-do items the model is less sure of are dropped
 
 
 @dataclass(frozen=True)

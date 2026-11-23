@@ -310,18 +310,25 @@ previous clean text, and replaces the three files.
 
 `steno summary` and `steno todo` use `clean.jsonl` while `source_sha256` still matches the
 current source text (for example not after a new `steno finalize`), with the current speaker
-names; otherwise they use `final.jsonl`, else the live transcript. Their output files end with
-a line `_Text used: clean transcript (clean.jsonl)._` (or `final` / `live`); `todo.json` stays
-a plain array.
+names; otherwise they use `final.jsonl`, else the live transcript. When there is no fresh
+`clean.jsonl`, `steno summary`, `steno todo` and the app run the clean-up first (a failed
+clean-up is reported and the uncleaned text is used). Their output files end with a line
+`_Text used: clean transcript (clean.jsonl), model sonnet._` (or `final` / `live`);
+`todo.json` stays a plain array.
 
 ## Summary and to-do (`steno summary`, `steno todo`)
 
 Both send transcript *text* (never audio) to the Claude Code CLI (`claude -p`, the user's
-own login, no API key) and are described by prompts in `src/steno/prompts/`.
+own login, no API key) and are described by prompts in `src/steno/prompts/`. They use
+`[llm] summary_model` (default `sonnet`; `model`, default `haiku`, is for clean-up, fix and
+the title). Before the transcript they send a short context block: the meeting date, its
+title, the speaker labels and the glossary from the app's settings.
 
-`summary.md`: Markdown with an overview, decisions and open questions, headings and text in
-`[llm] language` (Swedish: Översikt, Beslut, Öppna frågor). Personal follow-up tasks belong in
-the to-do list, not under decisions.
+`summary.md`: Markdown with an overview, key points, decisions, tentative items and open
+questions, headings and text in `[llm] language` (Swedish: Översikt, Huvudpunkter, Beslut,
+Preliminärt, Öppna frågor), each point with its `[mm:ss]`. Hedged or conditional plans go
+under Preliminärt, never under Beslut. Personal follow-up tasks belong in the to-do list, not
+under decisions.
 
 `todo.json` (and the same content as `todo.md`, grouped by owner): a JSON array of
 
@@ -334,7 +341,8 @@ the to-do list, not under decisions.
 (taken from the line that contains the quote). Only explicit commitments are listed, extracted
 from the transcript and never from the summary; an item whose `evidence_quote` does not
 occur verbatim in the transcript (whole words, compared case-, punctuation- and
-whitespace-insensitively) is discarded. `steno todo --person NAME` writes only that person's items (and so replaces a full list; run
+whitespace-insensitively) is discarded, and so are items below `[llm] todo_min_confidence`
+(default 0.5) and a second item with the same owner and the same task or quote. `steno todo --person NAME` writes only that person's items (and so replaces a full list; run
 it without `--person` to get everyone's again).
 
 ## Speaker label layer

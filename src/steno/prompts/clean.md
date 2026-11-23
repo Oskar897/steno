@@ -22,9 +22,10 @@ Fix only these things:
 
 Do NOT: paraphrase, shorten, summarise, translate, reorder, fix grammar or style, change
 dialect or spoken forms, remove filler words ("eh", "liksom", "alltså", "you know"), remove
-or add content, merge or split lines, or touch speaker labels. Never change a number, a date
-or a person's name; if a name looks misspelt, leave it. When unsure, leave the text as it
-is. Fewer, certain edits are better than many guesses.
+or add content, merge or split lines, or touch speaker labels. Never change a number or a
+date. Never change a person's name, except to the spelling of a name in the user's term list
+below when the text clearly means that person; any other misspelt-looking name stays as it
+is. When unsure, leave the text as it is. Fewer, certain edits are better than many guesses.
 
 Answer with a single JSON array and nothing else (no prose, no code fence). Each item is an
 object with exactly these keys:

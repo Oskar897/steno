@@ -89,6 +89,8 @@ def test_summary_and_todo_commands_use_the_llm_module(monkeypatch, capsys):
     calls = []
 
     def fake_run(system, text, cfg, runner=None):
+        if "clean up" in system:  # summary runs the clean-up first: nothing to correct here
+            return "[]"
         calls.append((system, text))
         if "commitments" in system:
             return json.dumps([{"owner": "Remote", "task": "Svara", "due": None,

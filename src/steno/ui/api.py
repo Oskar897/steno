@@ -78,20 +78,30 @@ def default_runners(cfg: Config, store_factory: Callable[[], ProfileStore]) -> d
         res = clean.clean_session(session_dir, cfg.llm, progress=progress)
         return f"{clean.summary_line(res.meta)} ({res.meta['source']} text)"
 
+    def cleaned_first(session_dir: Path, progress: Progress) -> str:
+        """Summary and to-do read the cleaned text: clean up first when it is missing."""
+        from steno import clean
+
+        note = clean.ensure_clean(session_dir, cfg.llm, progress=progress)
+        return f"; {note}" if note else ""
+
     def run_summary(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
         from steno import llm
 
+        note = cleaned_first(session_dir, progress)
         progress("waiting for Claude", 0, 0)
         _, kind = llm.summarize(session_dir, cfg.llm)
-        return f"summary saved ({kind} transcript)"
+        return f"summary saved ({kind} transcript){note}"
 
     def run_todo(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
         from steno import llm
 
+        note = cleaned_first(session_dir, progress)
         progress("waiting for Claude", 0, 0)
         items, dropped, kind = llm.extract_todos(
             session_dir, cfg.llm, person=params.get("person"))
-        return f"{len(items)} to-do item(s) ({kind} transcript), {dropped} dropped without evidence"
+        return (f"{len(items)} to-do item(s) ({kind} transcript), {dropped} dropped "
+                f"(no evidence, unsure or duplicate){note}")
 
     def run_title(session_dir: Path, params: dict[str, Any], progress: Progress) -> str:
         """Name an untitled meeting from its transcript; a title the user gave stays."""

@@ -115,7 +115,8 @@ def glossary_section(terms: list[str]) -> str:
     listed = "\n".join(f"- {t}" for t in terms)
     return ("\n\nTerms used in these meetings (the user's own list). When the text has a "
             "misrecognised form that clearly means one of them (for example a phonetic "
-            "spelling or a split word), replace it with the term spelled exactly like this:\n"
+            "spelling, a split word or a person's name spelled the way it sounds, "
+            "\"Jonathan\" for \"Jonatan\"), replace it with the term spelled exactly like this:\n"
             f"{listed}\n")
 
 
@@ -397,6 +398,31 @@ def clean_session(
     if not dry_run:
         write_clean(session_dir, out, meta)
     return CleanResult(out, meta, not dry_run)
+
+
+def ensure_clean(
+    session_dir: Path,
+    cfg: LlmConfig,
+    progress: Progress | None = None,
+    runner: Runner | None = None,
+) -> str | None:
+    """Run the clean-up first when the session has no fresh ``clean.jsonl`` (summary, to-do).
+
+    Returns a short note of what happened, or None when the clean text was already fresh. A
+    failed clean-up is logged and the caller goes on with the uncleaned text; only a missing
+    login is raised, since the next call would fail the same way.
+    """
+    _, kind = llm.load_transcript(session_dir)
+    if kind == "clean":
+        return None
+    try:
+        res = clean_session(session_dir, cfg, progress=progress, runner=runner)
+    except llm.LlmAuthError:
+        raise
+    except LlmError as exc:
+        log.warning("clean-up before summary/to-do failed: %s", exc)
+        return f"clean-up failed ({exc}), used the {kind} text"
+    return f"cleaned first: {summary_line(res.meta)}"
 
 
 def write_clean(session_dir: Path, segments: list[Segment], meta: dict[str, Any]) -> None:

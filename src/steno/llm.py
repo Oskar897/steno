@@ -353,13 +353,69 @@ def load_transcript(session_dir: Path) -> tuple[list[Segment], str]:
 TEXT_FILES = {"clean": "clean.jsonl", "final": "final.jsonl", "live": "transcript.jsonl"}
 
 
-def text_note(kind: str) -> str:
-    """The line at the end of ``summary.md`` / ``todo.md`` saying which text was used."""
-    return f"_Text used: {kind} transcript ({TEXT_FILES.get(kind, kind)})._"
+def text_note(kind: str, model: str | None = None) -> str:
+    """The line at the end of ``summary.md`` / ``todo.md``: which text (and model) was used."""
+    by = f", model {model}" if model else ""
+    return f"_Text used: {kind} transcript ({TEXT_FILES.get(kind, kind)}){by}._"
 
 
 def render_for_llm(segments: list[Segment]) -> str:
     return "\n".join(f"[{format_clock(s.t_start)}] {s.speaker}: {s.text}" for s in segments)
+
+
+def summary_config(cfg: LlmConfig) -> LlmConfig:
+    """``cfg`` with the model for summary and to-do (``[llm] summary_model``, else ``model``)."""
+    return replace(cfg, model=cfg.summary_model.strip() or cfg.model)
+
+
+def _meeting_date(session_dir: Path) -> str | None:
+    try:
+        data = json.loads((Path(session_dir) / "session.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    started = data.get("started_at") if isinstance(data, dict) else None
+    return started[:10] if isinstance(started, str) and len(started) >= 10 else None
+
+
+def _meeting_title(session_dir: Path) -> str | None:
+    try:
+        from steno import projects
+
+        title = projects.meeting_title(Path(session_dir))
+    except Exception:  # noqa: BLE001 - the title is a hint only, never a reason to fail
+        return None
+    return None if title == projects.DEFAULT_TITLE else title
+
+
+def meeting_context(
+    session_dir: Path, segments: list[Segment], glossary: list[str] | None = None
+) -> str:
+    """The facts sent before the transcript: date, title, speaker labels, the user's terms."""
+    if glossary is None:
+        from steno import settings
+
+        glossary = settings.load().glossary
+    lines = ["Meeting context (metadata, not part of what was said):"]
+    if date := _meeting_date(session_dir):
+        lines.append(f"- Date: {date}")
+    if title := _meeting_title(session_dir):
+        lines.append(f"- Title: {title}")
+    speakers = list(dict.fromkeys(s.speaker for s in segments if s.speaker))
+    if speakers:
+        lines.append(f"- Speaker labels in the transcript: {', '.join(speakers)}")
+    terms = [t.strip() for t in glossary if t.strip()]
+    if terms:
+        lines.append("- Correct spelling of names and terms used in these meetings: "
+                     + ", ".join(terms))
+    return "\n".join(lines)
+
+
+def llm_input(
+    session_dir: Path, segments: list[Segment], glossary: list[str] | None = None
+) -> str:
+    """What summary and to-do send on stdin: the meeting context, then the transcript."""
+    return (f"{meeting_context(session_dir, segments, glossary)}\n\nTranscript:\n"
+            f"{render_for_llm(segments)}")
 
 
 # --------------------------------------------------------------------------- JSON replies
@@ -421,11 +477,13 @@ def summarize(
     segments, kind = load_transcript(session_dir)
     if not segments:
         raise LlmError("the session has no transcript text")
-    reply = run_claude(load_prompt("summary", cfg.language), render_for_llm(segments), cfg, runner)
+    cfg = summary_config(cfg)
+    reply = run_claude(load_prompt("summary", cfg.language), llm_input(session_dir, segments),
+                       cfg, runner)
     if not reply.strip():
         raise LlmError("the model returned an empty summary")
     path = Path(session_dir) / SUMMARY_NAME
-    atomic_write_text(path, f"{reply.strip()}\n\n{text_note(kind)}\n")
+    atomic_write_text(path, f"{reply.strip()}\n\n{text_note(kind, cfg.model)}\n")
     return path, kind
 
 
@@ -518,13 +576,15 @@ class TodoItem:
 
 
 def filter_todos(
-    raw: list[Any], segments: list[Segment]
+    raw: list[Any], segments: list[Segment], min_confidence: float = 0.0
 ) -> tuple[list[TodoItem], list[dict[str, str]]]:
     """Keep the items whose ``evidence_quote`` occurs in the transcript.
 
     The quote is searched (normalised) in the lines' texts joined by spaces, so it may
     span two lines. ``t`` is taken from the line where the quote starts, not from the
-    model. Returns ``(kept, dropped)`` where each dropped entry says why.
+    model. Items below ``min_confidence`` are dropped, and so is a later item with the same
+    owner and the same task or the same evidence. Returns ``(kept, dropped)`` where each
+    dropped entry says why.
     """
     bodies = [normalise(s.text) for s in segments]
     starts: list[int] = []
@@ -534,6 +594,7 @@ def filter_todos(
         joined += body + " "
     kept: list[TodoItem] = []
     dropped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for item in raw:
         if not isinstance(item, dict):
             dropped.append({"reason": "not an object"})
@@ -553,13 +614,24 @@ def filter_todos(
             conf = float(item.get("confidence", 0.5))
         except (TypeError, ValueError):
             conf = 0.5
+        conf = min(1.0, max(0.0, conf))
+        if conf < min_confidence:
+            dropped.append({"reason": "low confidence", "task": task})
+            continue
+        owner = str(item.get("owner") or "").strip() or "TBD"
+        who = normalise(owner)
+        keys = {(who, "task:" + normalise(task)), (who, "quote:" + quote)}
+        if keys & seen:
+            dropped.append({"reason": "duplicate", "task": task})
+            continue
+        seen |= keys
         due = item.get("due")
         kept.append(
             TodoItem(
-                owner=str(item.get("owner") or "").strip() or "TBD",
+                owner=owner,
                 task=task,
                 due=str(due).strip() if due not in (None, "") else None,
-                confidence=min(1.0, max(0.0, conf)),
+                confidence=conf,
                 evidence_quote=str(item.get("evidence_quote")).strip(),
                 t=segments[index].t_start,
             )
@@ -610,13 +682,16 @@ def extract_todos(
     segments, kind = load_transcript(session_dir)
     if not segments:
         raise LlmError("the session has no transcript text")
-    reply = run_claude(load_prompt("todo", cfg.language), render_for_llm(segments), cfg, runner)
-    items, dropped = filter_todos(parse_json_array(reply), segments)
+    cfg = summary_config(cfg)
+    reply = run_claude(load_prompt("todo", cfg.language), llm_input(session_dir, segments),
+                       cfg, runner)
+    items, dropped = filter_todos(parse_json_array(reply), segments, cfg.todo_min_confidence)
     if person:
         items = filter_person(items, person)
     session_dir = Path(session_dir)
     title = f"To-do: {person}" if person else "To-do"
-    atomic_write_text(session_dir / TODO_MD_NAME, render_todo_md(items, title, text_note(kind)))
+    atomic_write_text(session_dir / TODO_MD_NAME,
+                      render_todo_md(items, title, text_note(kind, cfg.model)))
     atomic_write_text(
         session_dir / TODO_JSON_NAME,
         json.dumps([i.as_dict() for i in items], indent=2, ensure_ascii=False) + "\n",

@@ -178,8 +178,10 @@ merge_gap_s = 1.0            # same-speaker lines closer than this are joined
 # `steno summary` / `steno todo` / `steno clean` / `steno finalize --llm-fix` call the Claude Code CLI
 # (`claude -p`, your own login, no API key here). Only text is sent, never audio.
 command = "claude"
-model = "haiku"              # alias or full model name
+model = "haiku"              # alias or full model name (clean-up, --llm-fix, auto title)
+summary_model = "sonnet"     # summary and to-do (whole meeting, judgement); "" = same as model
 effort = "medium"             # low, medium, high, xhigh, max; "" = CLI default
 language = "sv"              # output language; "auto" = the language of the meeting
-timeout_s = 300
+timeout_s = 600
 fix_max_edit = 0.3           # --llm-fix and `steno clean`: largest accepted correction (share of the line)
+todo_min_confidence = 0.5    # to-do items below this confidence are dropped

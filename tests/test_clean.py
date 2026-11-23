@@ -326,7 +326,7 @@ def test_summary_and_todo_use_the_clean_text_and_say_so(tmp_path):
     assert "Anna: vi kör" in sent
     text = path.read_text(encoding="utf-8")
     assert text.startswith("## Översikt\nKort.") and text.rstrip().endswith(
-        "_Text used: clean transcript (clean.jsonl)._")
+        "_Text used: clean transcript (clean.jsonl), model sonnet._")
 
     todo = Recorder(json.dumps([{
         "owner": "Anna", "task": "Deploya", "due": "fredag", "confidence": 0.8,
@@ -335,7 +335,7 @@ def test_summary_and_todo_use_the_clean_text_and_say_so(tmp_path):
     assert kind == "clean" and len(items) == 1 and dropped == 0  # quote is in the clean text
     assert "Docker container" in todo.calls[0][1]["input"]
     md = (session / "todo.md").read_text(encoding="utf-8")
-    assert md.rstrip().endswith("_Text used: clean transcript (clean.jsonl)._")
+    assert md.rstrip().endswith("_Text used: clean transcript (clean.jsonl), model sonnet._")
 
 
 def test_without_clean_text_the_old_behaviour_stays_and_the_note_names_the_text(tmp_path):
@@ -344,7 +344,7 @@ def test_without_clean_text_the_old_behaviour_stays_and_the_note_names_the_text(
     path, kind = llm.summarize(session, CFG, rec)
     assert kind == "live" and "dokker" in rec.calls[0][1]["input"]
     assert path.read_text(encoding="utf-8").endswith("_Text used: live transcript "
-                                                     "(transcript.jsonl)._\n")
+                                                     "(transcript.jsonl), model sonnet._\n")
 
 
 def test_stale_clean_text_is_ignored(tmp_path):
@@ -408,3 +408,19 @@ def test_cli_reports_llm_errors_without_a_traceback(monkeypatch, capsys):
     assert cli.main(["clean"]) == 1
     assert "the Claude CLI failed" in capsys.readouterr().err
     assert not (w.dir / "clean.jsonl").exists()
+
+
+def test_ensure_clean_runs_the_clean_up_only_when_the_clean_text_is_missing(tmp_path):
+    session = make_session(tmp_path)
+    rec = Recorder(reply(*GOOD))
+    note = clean.ensure_clean(session, CFG, runner=rec)
+    assert note is not None and note.startswith("cleaned first:") and len(rec.calls) == 1
+    assert llm.load_transcript(session)[1] == "clean"
+    assert clean.ensure_clean(session, CFG, runner=rec) is None and len(rec.calls) == 1
+
+
+def test_a_failed_clean_up_before_summary_is_reported_not_raised(tmp_path):
+    session = make_session(tmp_path)
+    note = clean.ensure_clean(session, CFG, runner=Recorder("no json here"))
+    assert note is not None and "clean-up failed" in note and "live" in note
+    assert llm.load_transcript(session)[1] == "live"

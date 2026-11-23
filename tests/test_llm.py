@@ -188,8 +188,27 @@ def test_evidence_must_match_whole_words():
 
 
 def test_confidence_is_clamped_and_defaults_when_garbage():
-    kept, _ = llm.filter_todos([item(confidence=7), item(confidence="high")], SEGMENTS)
+    other = {"owner": "Bob", "task": "Ta budgeten", "evidence_quote": "då tar jag budgeten"}
+    kept, _ = llm.filter_todos([item(confidence=7), item(confidence="high", **other)], SEGMENTS)
     assert [k.confidence for k in kept] == [1.0, 0.5]
+
+
+def test_items_below_the_confidence_floor_are_dropped():
+    other = {"owner": "Bob", "task": "Ta budgeten", "evidence_quote": "då tar jag budgeten"}
+    kept, dropped = llm.filter_todos(
+        [item(confidence=0.45), item(confidence=0.6, **other)], SEGMENTS, min_confidence=0.5)
+    assert [k.owner for k in kept] == ["Bob"]
+    assert dropped == [{"reason": "low confidence", "task": "Skicka rapporten"}]
+
+
+def test_same_task_or_same_evidence_for_one_owner_is_kept_once():
+    same_quote = item(task="Mejla rapporten")
+    same_task = item(evidence_quote="rapporten till er på fredag")
+    other_owner = item(owner="Bob")  # someone else committing to the same is not a duplicate
+    kept, dropped = llm.filter_todos([item(), same_quote, same_task, other_owner], SEGMENTS)
+    assert [(k.owner, k.task) for k in kept] == [("Alice", "Skicka rapporten"),
+                                                 ("Bob", "Skicka rapporten")]
+    assert [d["reason"] for d in dropped] == ["duplicate", "duplicate"]
 
 
 def test_person_filter_and_markdown_grouping():
@@ -251,7 +270,7 @@ def test_summary_uses_the_final_transcript_when_it_exists(tmp_path):
     rec = Recorder("## Översikt\nKort.")
     path, kind = llm.summarize(session, CFG, rec)
     assert kind == "live" and path.read_text(encoding="utf-8") == (
-        "## Översikt\nKort.\n\n_Text used: live transcript (transcript.jsonl)._\n")
+        "## Översikt\nKort.\n\n_Text used: live transcript (transcript.jsonl), model sonnet._\n")
     assert "Alice: Jag skickar" in rec.calls[0][1]["input"]
 
     final = [seg(1, 5.0, "Anna (final)", "Slutlig text.")]
@@ -365,3 +384,34 @@ def test_claude_runs_without_a_console_window(monkeypatch):
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         assert seen["creationflags"] & subprocess.CREATE_NO_WINDOW
         assert seen["startupinfo"].wShowWindow == 0
+
+
+# --------------------------------------------------------------------------- context, model
+
+
+def test_summary_and_todo_use_the_summary_model_and_send_the_meeting_context(tmp_path):
+    from steno import settings
+
+    settings.save(settings.AppSettings(glossary=["Bertil", "GitHub"]))
+    session = make_session(tmp_path)
+    cfg = LlmConfig(model="haiku", summary_model="sonnet")
+    rec = Recorder("ok")
+    llm.summarize(session, cfg, rec)
+    cmd, kw = rec.calls[0]
+    assert cmd[cmd.index("--model") + 1] == "sonnet"
+    stdin = kw["input"]
+    assert stdin.startswith("Meeting context")
+    assert "- Date: 2026-01-01" in stdin
+    assert "- Speaker labels in the transcript: Alice, Bob" in stdin
+    assert "Bertil, GitHub" in stdin
+    assert stdin.index("Transcript:\n[00:05] Alice:") > stdin.index("Bertil")
+
+    rec2 = Recorder("[]")
+    llm.extract_todos(session, cfg, runner=rec2)
+    cmd2, kw2 = rec2.calls[0]
+    assert cmd2[cmd2.index("--model") + 1] == "sonnet"
+    assert kw2["input"].startswith("Meeting context")
+
+
+def test_empty_summary_model_falls_back_to_the_main_model():
+    assert llm.summary_config(LlmConfig(model="haiku", summary_model=" ")).model == "haiku"
